@@ -125,9 +125,10 @@ Do not push a regression to main.
 The user may have unrelated Word documents open while automation runs.
 
 Requirements:
-- create a dedicated Word COM instance for each automation run where feasible;
-- track the process/window/COM instance that the automation owns;
-- on timeout or crash, terminate only the automation-owned Word process if process ownership can be proven;
+- every automation run must create and use its own dedicated Microsoft Word COM application instance;
+- the automation must record the process/window/COM ownership metadata for that instance before reconstruction starts;
+- on timeout or crash, terminate only the automation-owned Word process and only when ownership has been positively established;
+- if ownership cannot be established, leave the process untouched and stop with a fail-safe error;
 - never issue global commands such as `taskkill /IM WINWORD.EXE /F`;
 - never alter or close unrelated user documents;
 - enforce one active Golden Word run at a time.
@@ -135,7 +136,7 @@ Requirements:
 ## Diagnostics architecture
 Diagnostics stay local by default.
 
-Every run should create a machine-readable summary such as `golden_report.json` containing:
+Every run must create `golden_report.json` containing:
 - run id;
 - source hash;
 - commit SHA;
@@ -204,7 +205,7 @@ The autonomous loop must stop and require review if any of the following occurs:
 4. the second run does not introduce new warnings or structural drift;
 5. the source Golden hash is unchanged between the two runs.
 
-After promotion, the stable commit is tagged/versioned according to the project's versioning convention.
+After promotion, increment the existing WordReplica semantic patch version unless the change requires a minor or major version bump under the project's release rules.
 
 ## Future expansion
 Only after Golden #1 is stable:
