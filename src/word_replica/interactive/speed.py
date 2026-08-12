@@ -43,9 +43,9 @@ class SpeedController:
             return 1.0 / 25.0
         return 1.0 / self._custom_rate
 
-    def delay_after(self, event_type: str) -> None:
-        if event_type == "InsertCharacter":
-            delay = self._character_delay()
+    def delay_after(self, event_type: str, *, character_count: int = 1) -> None:
+        if event_type in {"InsertCharacter", "InsertText"}:
+            delay = self._character_delay() * max(1, int(character_count))
         elif event_type in _OBJECT_EVENTS:
             delay = self._object_delay
         else:

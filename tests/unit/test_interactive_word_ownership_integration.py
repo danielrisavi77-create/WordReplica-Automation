@@ -38,7 +38,7 @@ def test_interactive_controller_records_and_clears_owned_word(monkeypatch):
     monkeypatch.setitem(sys.modules, "win32com.client", fake_client)
 
     calls = []
-    monkeypatch.setattr(interactive_word, "record_owned_word", lambda app, role: calls.append(("record", role)) or 777, raising=False)
+    monkeypatch.setattr(interactive_word, "record_owned_word", lambda app, role, **kwargs: calls.append(("record", role)) or 777, raising=False)
     monkeypatch.setattr(interactive_word, "clear_owned_word", lambda pid: calls.append(("clear", pid)), raising=False)
 
     controller = interactive_word.InteractiveWordController()

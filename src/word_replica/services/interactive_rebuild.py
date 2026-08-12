@@ -103,6 +103,8 @@ class _InteractiveServiceObserver:
         elif et in {"EndHeader", "EndFooter", "EndFootnoteStory", "EndEndnoteStory"}: self._current_story = "body"
         elif et == "InsertCharacter" and self._current_story == "body":
             self._expected_body_text.append(str(event.payload.get("character", "")))
+        elif et == "InsertText" and self._current_story == "body":
+            self._expected_body_text.append(str(event.payload.get("text", "")))
         elif et == "InsertTab" and self._current_story == "body": self._expected_body_text.append("\t")
         elif et in {"InsertLineBreak", "InsertPageBreak"} and self._current_story == "body": self._expected_body_text.append("\n")
         elif et == "CreateField" and self._current_story == "body":

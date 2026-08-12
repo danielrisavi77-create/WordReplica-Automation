@@ -9,7 +9,7 @@ from word_replica.domain.reconstruction import ExecutionOutcome, ReconstructionB
 from word_replica.interactive.speed import SpeedController
 from word_replica.config import InteractiveOptions
 from word_replica.interactive.verification import state_snapshots_match
-from word_replica.renderers.word_ownership import clear_owned_word, record_owned_word
+from word_replica.renderers.word_ownership import clear_owned_word, record_owned_word, word_process_pids
 
 
 WD_COLLAPSE_END = 0
@@ -29,7 +29,7 @@ def _is_rejected_com_call(exc: Exception) -> bool:
     return hresult == RPC_E_CALL_REJECTED
 
 
-def _retry_rejected_com_call(operation, *, attempts: int = 60, delay_seconds: float = 0.1):
+def _retry_rejected_com_call(operation, *, attempts: int = 300, delay_seconds: float = 0.1):
     last = None
     for attempt in range(attempts):
         try:
@@ -92,10 +92,13 @@ class InteractiveWordController:
         import pythoncom
         import win32com.client
 
+        existing_word_pids = word_process_pids()
         pythoncom.CoInitialize()
         self._owns_com = True
         self.application = win32com.client.DispatchEx("Word.Application")
-        self._owned_word_pid = record_owned_word(self.application, role="interactive")
+        self._owned_word_pid = record_owned_word(
+            self.application, role="interactive", existing_word_pids=existing_word_pids
+        )
         self.application.Visible = True
         self.document = self.application.Documents.Add()
         self.active_range = self.document.Range(0, 0)
@@ -105,10 +108,13 @@ class InteractiveWordController:
         import pythoncom
         import win32com.client
 
+        existing_word_pids = word_process_pids()
         pythoncom.CoInitialize()
         self._owns_com = True
         self.application = win32com.client.DispatchEx("Word.Application")
-        self._owned_word_pid = record_owned_word(self.application, role="interactive")
+        self._owned_word_pid = record_owned_word(
+            self.application, role="interactive", existing_word_pids=existing_word_pids
+        )
         self.application.Visible = True
         self.document = self.application.Documents.Open(
             str(Path(path).resolve()), ReadOnly=False, AddToRecentFiles=False
@@ -526,8 +532,17 @@ class InteractiveWordController:
         character = event.payload.get("character")
         if not isinstance(character, str) or len(character) != 1:
             raise ValueError("InsertCharacter payload must contain exactly one character")
+        self._insert_text(character)
+
+    def _event_InsertText(self, event: ReconstructionEvent) -> None:
+        text = event.payload.get("text")
+        if not isinstance(text, str) or not text:
+            raise ValueError("InsertText payload must contain non-empty text")
+        self._insert_text(text)
+
+    def _insert_text(self, text: str) -> None:
         target = self._require_range()
-        _retry_rejected_com_call(lambda: target.InsertAfter(character))
+        _retry_rejected_com_call(lambda: target.InsertAfter(text))
         self._collapse_end()
         self._page_break_continuation_pending = False
 
@@ -1091,7 +1106,8 @@ class InteractiveWordRenderer:
                 halt_status = getattr(observer, "halt_status", None)
                 if halt_status:
                     return ExecutionOutcome(str(halt_status), index, min(blueprint.total_events, index + 1))
-            self.speed.delay_after(event.event_type)
+            character_count = len(str(event.payload.get("text", ""))) if event.event_type == "InsertText" else 1
+            self.speed.delay_after(event.event_type, character_count=character_count)
         return ExecutionOutcome.completed(blueprint.total_events)
 
     def resume_state_snapshot(self) -> dict[str, Any]:

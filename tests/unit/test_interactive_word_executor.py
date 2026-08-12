@@ -40,6 +40,14 @@ def test_insert_character_rejects_multi_character_payload():
         controller.execute_event(ReconstructionEvent("InsertCharacter", "r1", {"character": "AB"}))
 
 
+def test_insert_text_uses_one_word_call_for_a_contiguous_span():
+    fake = FakeWordRange()
+    controller = InteractiveWordController.for_testing(active_range=fake)
+    controller.execute_event(ReconstructionEvent("InsertText", "r1", {"text": "ABC"}))
+    assert fake.insert_after_calls == ["ABC"]
+    assert fake.collapse_calls == [0]
+
+
 def test_semantic_tab_and_breaks_are_dedicated_atomic_calls():
     fake = FakeWordRange()
     controller = InteractiveWordController.for_testing(active_range=fake)
@@ -773,11 +781,11 @@ def test_default_word2010_retry_budget_survives_more_than_one_second_busy_burst(
     attempts = {"count": 0}
     def operation():
         attempts["count"] += 1
-        if attempts["count"] <= 25:
+        if attempts["count"] <= 61:
             raise RejectedCall("Word 2010 busy")
         return "ok"
     assert module._retry_rejected_com_call(operation) == "ok"
-    assert attempts["count"] == 26
+    assert attempts["count"] == 62
 
 
 class RejectOnceSections:

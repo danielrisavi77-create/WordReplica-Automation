@@ -107,7 +107,7 @@ def test_resume_opens_partial_restores_range_and_continues_after_checkpoint(tmp_
         interactive=InteractiveOptions(checkpoint_event_interval=999))
     paths=store.create_project(source, options)
     model=DocxParser().parse(source); bp=BlueprintCompiler().compile(model)
-    first_char = next(i for i,e in enumerate(bp.events) if e.event_type == "InsertCharacter")
+    first_char = next(i for i,e in enumerate(bp.events) if e.event_type == "InsertText")
     output=paths.output_dir/"partial.docx"; output.write_bytes(b"partial")
     settings=asdict(options.interactive)
     settings["speed_mode"]=options.interactive.speed_mode.value; settings["fidelity"]=options.interactive.fidelity.value

@@ -297,18 +297,31 @@ class BlueprintCompiler:
 
     def _compile_legacy_run_content(self, run: Run, events: list[ReconstructionEvent]) -> None:
         break_types = iter(run.properties.get("break_types", []))
+        text: list[str] = []
+
+        def flush_text() -> None:
+            if text:
+                events.append(ReconstructionEvent("InsertText", run.element_id, {"text": "".join(text)}))
+                text.clear()
+
         for character in run.text:
-            if character == "\t": events.append(ReconstructionEvent("InsertTab", run.element_id, {}))
+            if character == "\t":
+                flush_text()
+                events.append(ReconstructionEvent("InsertTab", run.element_id, {}))
             elif character == "\n":
+                flush_text()
                 kind = next(break_types, "line")
                 events.append(ReconstructionEvent("InsertPageBreak" if kind == "page" else "InsertLineBreak", run.element_id, {}))
-            else: events.append(ReconstructionEvent("InsertCharacter", run.element_id, {"character": character}))
+            else:
+                text.append(character)
+        flush_text()
 
     def _compile_token(self, token, run: Run, events: list[ReconstructionEvent], location: SemanticLocation) -> None:
         kind = token.get("kind")
         if kind == "text":
-            for character in str(token.get("value", "")):
-                events.append(ReconstructionEvent("InsertCharacter", run.element_id, {"character": character}))
+            text = str(token.get("value", ""))
+            if text:
+                events.append(ReconstructionEvent("InsertText", run.element_id, {"text": text}))
         elif kind == "tab": events.append(ReconstructionEvent("InsertTab", run.element_id, {}))
         elif kind == "line_break": events.append(ReconstructionEvent("InsertLineBreak", run.element_id, {}))
         elif kind == "page_break": events.append(ReconstructionEvent("InsertPageBreak", run.element_id, {}))
@@ -349,4 +362,3 @@ class BlueprintCompiler:
         events.append(ReconstructionEvent("SetImageCrop", drawing.element_id, {"crop": drawing.crop}))
         events.append(ReconstructionEvent("SetImageRotation", drawing.element_id, {"rotation_degrees": drawing.rotation_degrees}))
         events.append(ReconstructionEvent("SetImageZOrder", drawing.element_id, {"z_order": drawing.z_order}))
-

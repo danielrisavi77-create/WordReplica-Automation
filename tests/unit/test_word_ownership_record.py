@@ -8,6 +8,12 @@ class FakeApplication:
     Hwnd = 123
 
 
+class FakeApplicationWithoutHwnd:
+    @property
+    def Hwnd(self):
+        raise AttributeError("Word.Application.Hwnd")
+
+
 def test_record_owned_word_writes_exact_pid_owner_and_role(tmp_path, monkeypatch):
     record = tmp_path / "owned.json"
     monkeypatch.setenv("WORD_REPLICA_WORD_OWNERSHIP_FILE", str(record))
@@ -24,6 +30,26 @@ def test_record_owned_word_writes_exact_pid_owner_and_role(tmp_path, monkeypatch
 
     clear_owned_word(4567)
     assert not record.exists()
+
+
+def test_record_owned_word_uses_new_word_process_when_application_has_no_hwnd(tmp_path, monkeypatch):
+    record = tmp_path / "owned.json"
+    monkeypatch.setenv("WORD_REPLICA_WORD_OWNERSHIP_FILE", str(record))
+
+    pid = record_owned_word(
+        FakeApplicationWithoutHwnd(),
+        role="interactive",
+        existing_word_pids={1001},
+        word_process_pids_resolver=lambda: {1001, 4567},
+        process_identity_resolver=lambda process_pid: 987654321,
+        owner_pid=111,
+    )
+
+    assert pid == 4567
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    assert payload["pid"] == 4567
+    assert payload["hwnd"] == 0
+    assert payload["owner_process_pid"] == 111
 
 
 def test_clear_does_not_remove_record_for_different_pid(tmp_path, monkeypatch):

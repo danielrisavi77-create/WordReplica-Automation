@@ -35,7 +35,7 @@ def test_pdf_export_records_and_clears_owned_word(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "win32com.client", fake_client)
 
     calls = []
-    monkeypatch.setattr(word_render, "record_owned_word", lambda app, role: calls.append(("record", role)) or 888, raising=False)
+    monkeypatch.setattr(word_render, "record_owned_word", lambda app, role, **kwargs: calls.append(("record", role)) or 888, raising=False)
     monkeypatch.setattr(word_render, "clear_owned_word", lambda pid: calls.append(("clear", pid)), raising=False)
 
     word_render.export_docx_to_pdf_with_word(tmp_path / "a.docx", tmp_path / "a.pdf")

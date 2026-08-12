@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import csv
 import json
+import io
 import os
 from pathlib import Path
+import subprocess
 from typing import Callable
 
 
@@ -56,6 +59,27 @@ def _default_pid_resolver(hwnd: int) -> int:
     return int(pid)
 
 
+def word_process_pids() -> set[int]:
+    """Return the currently running WINWORD.EXE process IDs."""
+    if os.name != "nt":
+        raise RuntimeError("Windows Word process discovery is unavailable")
+    result = subprocess.run(
+        ["tasklist", "/FI", "IMAGENAME eq WINWORD.EXE", "/FO", "CSV", "/NH"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    pids: set[int] = set()
+    for row in csv.reader(io.StringIO(result.stdout)):
+        if len(row) >= 2 and row[0].upper() == "WINWORD.EXE":
+            try:
+                pids.add(int(row[1]))
+            except ValueError:
+                continue
+    return pids
+
+
 def _record_path() -> Path | None:
     raw = os.environ.get(ENV_OWNERSHIP_FILE)
     return Path(raw).resolve() if raw else None
@@ -97,13 +121,29 @@ def list_owned_words() -> list[dict]:
 
 def record_owned_word(application, *, role: str, pid_resolver: Callable[[int], int] | None = None,
                       process_identity_resolver: Callable[[int], int] | None = None,
-                      owner_pid: int | None = None) -> int | None:
+                      owner_pid: int | None = None, existing_word_pids: set[int] | None = None,
+                      word_process_pids_resolver: Callable[[], set[int]] | None = None) -> int | None:
     path = _record_path()
     if path is None:
         return None
-    hwnd = int(getattr(application, "Hwnd"))
-    resolver = pid_resolver or _default_pid_resolver
-    pid = int(resolver(hwnd))
+    try:
+        hwnd = int(getattr(application, "Hwnd"))
+    except (AttributeError, TypeError, ValueError):
+        if existing_word_pids is None:
+            raise RuntimeError(
+                "Cannot prove the automation-owned Word process without a pre-DispatchEx process snapshot"
+            )
+        current_word_pids = (word_process_pids_resolver or word_process_pids)()
+        candidates = set(current_word_pids) - set(existing_word_pids)
+        if len(candidates) != 1:
+            raise RuntimeError(
+                "Cannot prove the automation-owned Word process: expected exactly one new WINWORD.EXE PID"
+            )
+        hwnd = 0
+        pid = int(next(iter(candidates)))
+    else:
+        resolver = pid_resolver or _default_pid_resolver
+        pid = int(resolver(hwnd))
     identity_resolver = process_identity_resolver or process_creation_filetime
     started_filetime = int(identity_resolver(pid))
     entry = {

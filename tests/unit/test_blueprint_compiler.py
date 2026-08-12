@@ -7,15 +7,27 @@ from word_replica.parser.parser import parse_run
 from word_replica.parser.text import W_NS
 
 
-def test_compiler_emits_one_insert_character_event_per_character():
+def test_compiler_legacy_character_assertion_is_superseded_by_text_batching():
     model = DocumentModel(
         source_sha256="a" * 64,
         body=[Paragraph("p1", [Run("r1", "Až B", {"bold": True})])],
     )
     blueprint = BlueprintCompiler().compile(model)
-    chars = [e.payload["character"] for e in blueprint.events if e.event_type == "InsertCharacter"]
-    assert chars == ["A", "ž", " ", "B"]
-    assert not any("text" in e.payload and len(str(e.payload["text"])) > 1 for e in blueprint.events)
+    text_events = [event for event in blueprint.events if event.event_type == "InsertText"]
+    assert [event.payload["text"] for event in text_events] == [model.body[0].runs[0].text]
+    assert not any(event.event_type == "InsertCharacter" for event in blueprint.events)
+
+
+def test_compiler_batches_contiguous_text_within_a_run_for_word_insertion():
+    model = DocumentModel(
+        source_sha256="a" * 64,
+        body=[Paragraph("p1", [Run("r1", "AÅ¾ B", {"bold": True})])],
+    )
+    events = BlueprintCompiler().compile(model).events
+    assert [(event.event_type, event.payload) for event in events if event.source_element_id == "r1"] == [
+        ("ApplyRunProperties", {"bold": True}),
+        ("InsertText", {"text": "AÅ¾ B"}),
+    ]
 
 
 def test_run_properties_precede_first_character_of_each_run():
@@ -33,13 +45,13 @@ def test_run_properties_precede_first_character_of_each_run():
     trace = [
         (event.event_type, event.source_element_id, event.payload)
         for event in events
-        if event.event_type in {"ApplyRunProperties", "InsertCharacter"}
+        if event.event_type in {"ApplyRunProperties", "InsertText"}
     ]
     assert trace == [
         ("ApplyRunProperties", "r1", {"bold": False}),
-        ("InsertCharacter", "r1", {"character": "A"}),
+        ("InsertText", "r1", {"text": "A"}),
         ("ApplyRunProperties", "r2", {"bold": True}),
-        ("InsertCharacter", "r2", {"character": "B"}),
+        ("InsertText", "r2", {"text": "B"}),
     ]
 
 
@@ -65,9 +77,9 @@ def test_tabs_and_breaks_use_semantic_events_in_source_order():
         if event.event_type.startswith("Insert")
     ]
     assert trace == [
-        ("InsertCharacter", {"character": "A"}),
+        ("InsertText", {"text": "A"}),
         ("InsertTab", {}),
-        ("InsertCharacter", {"character": "B"}),
+        ("InsertText", {"text": "B"}),
         ("InsertLineBreak", {}),
         ("InsertPageBreak", {}),
     ]
@@ -126,7 +138,7 @@ def test_section_transition_occurs_at_canonical_boundary_not_before_body(tmp_pat
     events = BlueprintCompiler().compile(model).events
     begin_sections = [i for i,e in enumerate(events) if e.event_type == "BeginSection"]
     assert len(begin_sections) == 2
-    first_text = next(i for i,e in enumerate(events) if e.event_type == "InsertCharacter")
+    first_text = next(i for i,e in enumerate(events) if e.event_type == "InsertText")
     assert begin_sections[0] < first_text
     # second section is not pre-created; it follows the first section's content/boundary.
     assert begin_sections[1] > first_text
@@ -142,8 +154,8 @@ def test_header_footer_stories_use_same_character_events(tmp_path):
     assert any(e.event_type == "BeginFooter" for e in events)
     header_start = next(i for i,e in enumerate(events) if e.event_type == "BeginHeader")
     header_end = next(i for i,e in enumerate(events) if e.event_type == "EndHeader")
-    header_chars = [e.payload["character"] for e in events[header_start:header_end] if e.event_type == "InsertCharacter"]
-    assert "".join(header_chars) == "Header"
+    header_text = [e.payload["text"] for e in events[header_start:header_end] if e.event_type == "InsertText"]
+    assert "".join(header_text) == "Header"
 
 
 def test_list_paragraph_emits_list_binding_without_literal_marker(tmp_path):
@@ -152,7 +164,7 @@ def test_list_paragraph_emits_list_binding_without_literal_marker(tmp_path):
     model = DocxParser().parse(build_lists(tmp_path / "lists.docx"))
     events = BlueprintCompiler().compile(model).events
     assert sum(1 for e in events if e.event_type == "CreateListBinding") == 5
-    chars = "".join(e.payload["character"] for e in events if e.event_type == "InsertCharacter")
+    chars = "".join(e.payload["text"] for e in events if e.event_type == "InsertText")
     assert "First" in chars and "Alpha" in chars
     assert not chars.startswith("1.")
 
@@ -166,7 +178,7 @@ def test_notes_compile_at_reference_with_note_story_characters(tmp_path):
     assert any(e.event_type == "CreateEndnote" and e.payload["note_id"] == "1" for e in events)
     f0 = next(i for i,e in enumerate(events) if e.event_type == "BeginFootnoteStory")
     f1 = next(i for i,e in enumerate(events) if e.event_type == "EndFootnoteStory")
-    assert "".join(e.payload["character"] for e in events[f0:f1] if e.event_type == "InsertCharacter") == "Footnote evidence"
+    assert "".join(e.payload["text"] for e in events[f0:f1] if e.event_type == "InsertText") == "Footnote evidence"
 
 
 def test_field_result_is_not_typed_as_static_text_when_semantic_field_is_compiled(tmp_path):
@@ -177,7 +189,7 @@ def test_field_result_is_not_typed_as_static_text_when_semantic_field_is_compile
     fields = [e for e in events if e.event_type == "CreateField"]
     assert any("TOC" in e.payload["instruction"] for e in fields)
     # Result text comes from Word field update, not a static character replay.
-    chars = "".join(e.payload["character"] for e in events if e.event_type == "InsertCharacter")
+    chars = "".join(e.payload["text"] for e in events if e.event_type == "InsertText")
     assert "Chapter One .... 1" not in chars
 
 

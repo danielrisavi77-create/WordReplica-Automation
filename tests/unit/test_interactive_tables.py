@@ -44,10 +44,10 @@ def test_blueprint_builds_structure_and_merges_before_cell_characters():
     model = DocumentModel(source_sha256="a"*64, body=[table])
     events = BlueprintCompiler().compile(model).events
     types = [e.event_type for e in events]
-    first_char = types.index("InsertCharacter")
+    first_char = types.index("InsertText")
     assert types.index("BeginTable") < types.index("SetTableProperties") < types.index("MergeCells") < types.index("EnterCell") < first_char
-    chars = [e.payload["character"] for e in events if e.event_type == "InsertCharacter"]
-    assert chars == ["A", "1"]
+    chars = [e.payload["text"] for e in events if e.event_type == "InsertText"]
+    assert chars == ["A1"]
 
 
 def test_word_table_property_executor_applies_modeled_width_margins_shading_and_borders():

@@ -53,6 +53,8 @@ class InteractiveProgressTracker:
         self.source_element_id = event.source_element_id
         if event.event_type == "InsertCharacter":
             self.completed_characters += 1
+        elif event.event_type == "InsertText":
+            self.completed_characters += len(str(event.payload.get("text", "")))
         elif event.event_type == "BeginSection":
             self.section_index = int(event.payload.get("section_index", self.section_index))
             self.completed_sections += 1

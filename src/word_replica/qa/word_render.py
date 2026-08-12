@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import suppress
 from pathlib import Path
 
-from word_replica.renderers.word_ownership import clear_owned_word, record_owned_word
+from word_replica.renderers.word_ownership import clear_owned_word, record_owned_word, word_process_pids
 
 WD_EXPORT_FORMAT_PDF = 17
 
@@ -37,10 +37,13 @@ def export_docx_to_pdf_with_word(docx_path: Path, pdf_path: Path, visible: bool 
 
     application = None
     owned_word_pid = None
+    existing_word_pids = word_process_pids()
     pythoncom.CoInitialize()
     try:
         application = win32com.client.DispatchEx("Word.Application")
-        owned_word_pid = record_owned_word(application, role="pdf-export")
+        owned_word_pid = record_owned_word(
+            application, role="pdf-export", existing_word_pids=existing_word_pids
+        )
         application.Visible = bool(visible)
         with suppress(Exception):
             application.DisplayAlerts = 0
