@@ -1,0 +1,27 @@
+.worktrees/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+.venv_harness/
+
+# Local Codex/Golden data must never enter Git.
+golden/
+work/
+diagnostics/
+archive/
+state/
+*.docx
+!tests/fixtures/**/*.docx
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.zip
+event_trace.jsonl
+golden_report.json
+
+# Build/install outputs.
+build/
+dist/
+*.spec

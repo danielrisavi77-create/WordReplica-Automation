@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: word-replica
+Version: 0.1.0
+Requires-Python: >=3.12
+Requires-Dist: lxml<7,>=5
+Requires-Dist: python-docx<2,>=1.1
+Requires-Dist: platformdirs<5,>=4
+Requires-Dist: pypdfium2<6,>=4
+Requires-Dist: Pillow<13,>=10
+Requires-Dist: Jinja2<4,>=3.1
+Requires-Dist: pywin32>=306; sys_platform == "win32"
+Provides-Extra: test
+Requires-Dist: pytest<10,>=8; extra == "test"
+Requires-Dist: pytest-cov<8,>=5; extra == "test"
+Provides-Extra: gui
+Requires-Dist: PySide6<7,>=6.8; extra == "gui"
+Provides-Extra: build
+Requires-Dist: pyinstaller<8,>=6; extra == "build"

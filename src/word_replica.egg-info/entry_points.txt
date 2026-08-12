@@ -1,0 +1,4 @@
+[console_scripts]
+word-replica = word_replica.cli:main
+word-replica-desktop = word_replica.desktop:main
+word-replica-gui = word_replica.gui.app:main

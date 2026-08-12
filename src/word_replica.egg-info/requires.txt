@@ -1,0 +1,19 @@
+lxml<7,>=5
+python-docx<2,>=1.1
+platformdirs<5,>=4
+pypdfium2<6,>=4
+Pillow<13,>=10
+Jinja2<4,>=3.1
+
+[:sys_platform == "win32"]
+pywin32>=306
+
+[build]
+pyinstaller<8,>=6
+
+[gui]
+PySide6<7,>=6.8
+
+[test]
+pytest<10,>=8
+pytest-cov<8,>=5

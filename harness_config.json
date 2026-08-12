@@ -1,0 +1,9 @@
+{
+  "setup_timeout_seconds": 300,
+  "static_timeout_seconds": 120,
+  "instant_timeout_seconds": 600,
+  "interactive_timeout_seconds": 1800,
+  "l4_timeout_seconds": 600,
+  "minimum_free_space_mb": 750,
+  "logs_only": false
+}
