@@ -77,6 +77,11 @@ class RecordingObject:
             object.__setattr__(self, name, value)
 
 
+class ResettableRecordingObject(RecordingObject):
+    def Reset(self):
+        self._log.append((f"{self._prefix}.Reset", None))
+
+
 class FormattingRange(FakeWordRange):
     def __init__(self):
         super().__init__()
@@ -88,6 +93,67 @@ class FormattingRange(FakeWordRange):
     def InsertAfter(self, value):
         self.log.append(("insert", value))
         super().InsertAfter(value)
+
+
+def test_repeated_run_properties_reuse_the_current_formatting_context():
+    fake = FormattingRange()
+    fake.Font = ResettableRecordingObject(fake.log, "font")
+    controller = InteractiveWordController.for_testing(active_range=fake)
+    properties = {"bold": True, "font_ascii": "Aptos", "size_half_points": "24"}
+    controller.execute_event(ReconstructionEvent("ApplyRunProperties", "r1", properties))
+    controller.execute_event(ReconstructionEvent("InsertText", "r1", {"text": "A"}))
+    controller.execute_event(ReconstructionEvent("ApplyRunProperties", "r2", properties))
+
+    assert [name for name, _ in fake.log if name == "font.Reset"] == ["font.Reset"]
+    assert [name for name, _ in fake.log if name == "font.Bold"] == ["font.Bold"]
+
+
+def test_repeated_paragraph_style_definition_is_configured_once():
+    from types import SimpleNamespace
+
+    log = []
+
+    class FakeStyle:
+        def __init__(self, name):
+            self.NameLocal = name
+            self.Font = ResettableRecordingObject(log, f"style.{name}.font")
+            self.ParagraphFormat = RecordingObject(log, f"style.{name}.paragraph")
+
+    style = FakeStyle("ReplicaBody")
+
+    class Styles:
+        def __call__(self, key):
+            if key != "ReplicaBody":
+                raise RuntimeError("missing style")
+            return style
+
+    document = SimpleNamespace(Styles=Styles())
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = document
+    definition = {
+        "style_id": "ReplicaBody", "name": "ReplicaBody", "type": "paragraph",
+        "run_properties": {"font_ascii": "Arial", "size_half_points": "22"},
+        "paragraph_properties": {},
+    }
+    payload = {"style_id": "ReplicaBody", "style_definition": definition}
+    controller.execute_event(ReconstructionEvent("ApplyParagraphProperties", "p1", payload))
+    controller.execute_event(ReconstructionEvent("BeginParagraph", "p2", {}))
+    controller.execute_event(ReconstructionEvent("ApplyParagraphProperties", "p2", payload))
+
+    assert [name for name, _ in log if name == "style.ReplicaBody.font.Name"] == ["style.ReplicaBody.font.Name"]
+
+
+def test_repeated_paragraph_properties_are_not_reset_after_new_paragraph_inherits_them():
+    fake = FormattingRange()
+    fake.ParagraphFormat = ResettableRecordingObject(fake.log, "paragraph")
+    controller = InteractiveWordController.for_testing(active_range=fake)
+    properties = {"alignment": "center", "spacing_after": "120"}
+    controller.execute_event(ReconstructionEvent("ApplyParagraphProperties", "p1", properties))
+    controller.execute_event(ReconstructionEvent("BeginParagraph", "p2", {}))
+    controller.execute_event(ReconstructionEvent("ApplyParagraphProperties", "p2", properties))
+
+    assert [name for name, _ in fake.log if name == "paragraph.Reset"] == ["paragraph.Reset"]
+    assert [name for name, _ in fake.log if name == "paragraph.Alignment"] == ["paragraph.Alignment"]
 
 
 def test_run_formatting_is_applied_before_first_character():
@@ -470,6 +536,28 @@ def test_controller_applies_descriptive_metadata_without_touching_lifecycle_fiel
     assert custom.values["StudyId"] == "42"
 
 
+def test_custom_document_property_add_uses_word_compatible_positional_arguments():
+    from types import SimpleNamespace
+
+    class Custom:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, name):
+            raise RuntimeError("missing")
+
+        def Add(self, *args):
+            self.calls.append(args)
+
+    custom = Custom()
+    controller = InteractiveWordController.for_testing(active_range=SimpleNamespace())
+    controller.document = SimpleNamespace(CustomDocumentProperties=custom)
+
+    controller.set_custom_property("WordReplicaActualSaveCount", 1)
+
+    assert custom.calls == [("WordReplicaActualSaveCount", False, 4, "1")]
+
+
 def test_create_field_seeds_cached_result_without_refreshing_mid_reconstruction():
     from types import SimpleNamespace
 
@@ -541,6 +629,29 @@ def test_insert_character_does_not_duplicate_character_when_only_collapse_is_tem
     assert fake.insert_after_calls == ["A"]
     assert fake.collapse_calls == [0]
     assert fake._collapse_attempts == 2
+
+
+class RangeWithoutCollapse:
+    """Word can leave a usable story range whose Collapse member is unavailable."""
+
+    def __init__(self, position=156534):
+        self.Start = position
+        self.End = position
+        self.insert_after_calls = []
+
+    def InsertAfter(self, value):
+        self.insert_after_calls.append(value)
+        self.End += len(value)
+
+
+def test_insert_text_collapses_by_coordinates_when_word_range_loses_collapse_member():
+    target = RangeWithoutCollapse()
+    controller = InteractiveWordController.for_testing(active_range=target)
+
+    controller.execute_event(ReconstructionEvent("InsertText", "run", {"text": "4"}))
+
+    assert target.insert_after_calls == ["4"]
+    assert target.Start == target.End == 156535
 
 class RejectOncePropertyRange(FormattingRange):
     def __init__(self):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from pathlib import Path
+import json
 import time
 from typing import Any
 
@@ -57,7 +58,8 @@ def _retry_setattr(target: Any, name: str, value: Any) -> None:
 
 
 class InteractiveWordController:
-    def __init__(self) -> None:
+    def __init__(self, *, visible: bool = True) -> None:
+        self.visible = bool(visible)
         self.application: Any | None = None
         self.document: Any | None = None
         self.active_range: Any | None = None
@@ -81,6 +83,11 @@ class InteractiveWordController:
         self._image_transaction_active = False
         self._floating_images: list[tuple[int, Any]] = []
         self._owned_word_pid: int | None = None
+        self._formatting_context_generation = 0
+        self._last_run_properties_key: tuple[int, str, int] | None = None
+        self._paragraph_format_context_generation = 0
+        self._last_paragraph_properties_key: tuple[int, str, int] | None = None
+        self._paragraph_style_cache: dict[tuple[str, str], Any] = {}
 
     @classmethod
     def for_testing(cls, *, active_range: Any) -> "InteractiveWordController":
@@ -99,7 +106,7 @@ class InteractiveWordController:
         self._owned_word_pid = record_owned_word(
             self.application, role="interactive", existing_word_pids=existing_word_pids
         )
-        self.application.Visible = True
+        self.application.Visible = self.visible
         self.document = self.application.Documents.Add()
         self.active_range = self.document.Range(0, 0)
         self._paragraph_started = False
@@ -115,7 +122,7 @@ class InteractiveWordController:
         self._owned_word_pid = record_owned_word(
             self.application, role="interactive", existing_word_pids=existing_word_pids
         )
-        self.application.Visible = True
+        self.application.Visible = self.visible
         self.document = self.application.Documents.Open(
             str(Path(path).resolve()), ReadOnly=False, AddToRecentFiles=False
         )
@@ -237,13 +244,27 @@ class InteractiveWordController:
 
     def _collapse_end(self) -> None:
         target = self._require_range()
-        _retry_rejected_com_call(lambda: target.Collapse(WD_COLLAPSE_END))
+        collapse = _retry_getattr(target, "Collapse", None)
+        if callable(collapse):
+            _retry_rejected_com_call(lambda: collapse(WD_COLLAPSE_END))
+            return
+        end = _retry_getattr(target, "End", None)
+        if end is None:
+            raise AttributeError("Word range exposes neither Collapse nor End")
+        _retry_setattr(target, "Start", end)
 
     def execute_event(self, event: ReconstructionEvent) -> None:
         handler = getattr(self, f"_event_{event.event_type}", None)
         if handler is None:
             # Structural/property events are implemented progressively by later tasks.
             return
+        text_events = {"InsertCharacter", "InsertText", "InsertTab", "InsertLineBreak"}
+        if event.event_type not in {"ApplyRunProperties", *text_events}:
+            self._formatting_context_generation += 1
+            self._last_run_properties_key = None
+        if event.event_type not in {"ApplyRunProperties", "ApplyParagraphProperties", "BeginParagraph", "EndParagraph", *text_events}:
+            self._paragraph_format_context_generation += 1
+            self._last_paragraph_properties_key = None
         handler(event)
 
     @staticmethod
@@ -365,8 +386,12 @@ class InteractiveWordController:
 
     def _event_ApplyRunProperties(self, event: ReconstructionEvent) -> None:
         target = self._require_range()
-        font = _retry_getattr(target, "Font")
         props = event.payload
+        properties_key = json.dumps(props, sort_keys=True, ensure_ascii=False, default=str)
+        cache_key = (id(target), properties_key, self._formatting_context_generation)
+        if cache_key == self._last_run_properties_key:
+            return
+        font = _retry_getattr(target, "Font")
         reset = _retry_getattr(font, "Reset", None)
         if callable(reset):
             _retry_rejected_com_call(reset)
@@ -424,10 +449,17 @@ class InteractiveWordController:
         if props.get("language") in language_ids:
             with suppress(Exception):
                 font.LanguageID = language_ids[props["language"]]
+        self._last_run_properties_key = cache_key
 
     def _ensure_paragraph_style(self, definition: dict[str, Any] | None, style_id: str | None):
         if self.document is None or not style_id:
             return None
+        cache_key = (
+            str(style_id),
+            json.dumps(definition or {}, sort_keys=True, ensure_ascii=False, default=str),
+        )
+        if cache_key in self._paragraph_style_cache:
+            return self._paragraph_style_cache[cache_key]
         styles = _retry_getattr(self.document, "Styles", None)
         if styles is None:
             return None
@@ -478,11 +510,16 @@ class InteractiveWordController:
         next_style = (definition or {}).get("next_style")
         if next_style:
             with suppress(Exception): style.NextParagraphStyle = styles(str(next_style))
+        self._paragraph_style_cache[cache_key] = style
         return style
 
     def _event_ApplyParagraphProperties(self, event: ReconstructionEvent) -> None:
         target = self._require_range()
         props = event.payload
+        properties_key = json.dumps(props, sort_keys=True, ensure_ascii=False, default=str)
+        cache_key = (id(target), properties_key, self._paragraph_format_context_generation)
+        if cache_key == self._last_paragraph_properties_key:
+            return
         if props.get("style_id"):
             style = self._ensure_paragraph_style(props.get("style_definition"), str(props["style_id"]))
             _retry_setattr(target, "Style", style if style is not None else props["style_id"])
@@ -527,6 +564,7 @@ class InteractiveWordController:
                         Alignment=tab_align.get(tab.get("val"), 0),
                         Leader=tab_leader.get(tab.get("leader"), 0),
                     ))
+        self._last_paragraph_properties_key = cache_key
 
     def _event_InsertCharacter(self, event: ReconstructionEvent) -> None:
         character = event.payload.get("character")
@@ -972,7 +1010,7 @@ class InteractiveWordController:
         with suppress(Exception):
             properties(name).Delete()
         # Office MsoDocProperties.msoPropertyTypeString = 4
-        properties.Add(Name=name, LinkToContent=False, Type=4, Value=str(value))
+        properties.Add(name, False, 4, str(value))
 
     def apply_metadata(self, policy: dict[str, str]) -> None:
         if self.document is None:

@@ -46,3 +46,23 @@ def test_interactive_controller_records_and_clears_owned_word(monkeypatch):
     controller.close()
 
     assert calls == [("record", "interactive"), ("clear", 777)]
+
+
+def test_interactive_controller_honors_background_visibility(monkeypatch):
+    fake_pythoncom = SimpleNamespace(CoInitialize=lambda: None, CoUninitialize=lambda: None)
+    application = FakeApplication()
+    application.Visible = True
+    fake_client = SimpleNamespace(DispatchEx=lambda _name: application)
+    fake_win32com = SimpleNamespace(client=fake_client)
+    monkeypatch.setitem(sys.modules, "pythoncom", fake_pythoncom)
+    monkeypatch.setitem(sys.modules, "win32com", fake_win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", fake_client)
+    monkeypatch.setattr(interactive_word, "record_owned_word", lambda *args, **kwargs: 777)
+    monkeypatch.setattr(interactive_word, "clear_owned_word", lambda _pid: None)
+
+    controller = interactive_word.InteractiveWordController(visible=False)
+    controller.open_blank()
+    try:
+        assert application.Visible is False
+    finally:
+        controller.close()

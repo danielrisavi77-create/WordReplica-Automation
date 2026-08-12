@@ -44,12 +44,18 @@ def read_owned_word_process(path: Path) -> OwnedWordProcess | None:
 
 
 def may_terminate_owned_word(
-    record: OwnedWordProcess | None, *, expected_owner_pid: int, image_name: str, live_started_filetime: int
+    record: OwnedWordProcess | None, *, expected_owner_pid: int | None = None,
+    expected_owner_pids: Iterable[int] | None = None, image_name: str, live_started_filetime: int
 ) -> bool:
     if record is None:
         return False
+    allowed_owners = (
+        {int(pid) for pid in expected_owner_pids}
+        if expected_owner_pids is not None
+        else ({int(expected_owner_pid)} if expected_owner_pid is not None else set())
+    )
     return (
-        record.owner_process_pid == int(expected_owner_pid)
+        record.owner_process_pid in allowed_owners
         and image_name.upper() == "WINWORD.EXE"
         and record.started_filetime > 0
         and int(live_started_filetime) == record.started_filetime
@@ -91,7 +97,8 @@ def _windows_kill_pid(pid: int) -> None:
 def terminate_owned_word_processes(
     records: Iterable[OwnedWordProcess],
     *,
-    expected_owner_pid: int,
+    expected_owner_pid: int | None = None,
+    expected_owner_pids: Iterable[int] | None = None,
     image_resolver: Callable[[int], str] | None = None,
     identity_resolver: Callable[[int], int] | None = None,
     killer: Callable[[int], None] | None = None,
@@ -109,6 +116,7 @@ def terminate_owned_word_processes(
         if not may_terminate_owned_word(
             record,
             expected_owner_pid=expected_owner_pid,
+            expected_owner_pids=expected_owner_pids,
             image_name=image,
             live_started_filetime=live_started_filetime,
         ):

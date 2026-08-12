@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from word_replica.config import InteractiveOptions, RebuildOptions
-from word_replica.domain.enums import ReconstructionMode, RunStatus
+from word_replica.domain.enums import ReconstructionMode, RunStatus, VisibilityMode
 from word_replica.services.audit import AuditLog
 from word_replica.services.interactive_rebuild import InteractiveRebuildService
 from word_replica.services.project_store import ProjectStore
@@ -27,13 +27,22 @@ def test_blocked_preflight_never_creates_word_controller(tmp_path):
 
 def test_ready_start_executes_blueprint_and_writes_truthful_checkpoint(tmp_path):
     from word_replica.interactive.control import InteractiveRunControl
+    from word_replica.qa.render import RenderQaResult
     source=build_plain_text(tmp_path/"source.docx")
     store=ProjectStore(tmp_path/"projects")
     options=RebuildOptions(reconstruction_mode=ReconstructionMode.INTERACTIVE,
         interactive=InteractiveOptions(checkpoint_event_interval=1))
     paths=store.create_project(source, options)
     audit=AuditLog(paths.logs_dir/"audit.jsonl")
-    service=InteractiveRebuildService(word_probe=lambda:True, project_store=store)
+    def exporter(docx, pdf, visible=False):
+        Path(pdf).write_bytes(b"pdf")
+        return Path(pdf)
+    def comparer(source_pdf, rebuilt_pdf, qa_dir):
+        return RenderQaResult(True, True, True, 1, 1, [], [])
+    service=InteractiveRebuildService(
+        word_probe=lambda:True, project_store=store,
+        pdf_exporter=exporter, pdf_comparer=comparer,
+    )
     prepared=service.prepare(source, options, paths, audit)
 
     class FakeController:
@@ -43,6 +52,7 @@ def test_ready_start_executes_blueprint_and_writes_truthful_checkpoint(tmp_path)
         def execute_event(self,event):
             self.events.append(event.event_type)
             if event.event_type == "InsertCharacter": self.range += 1
+            if event.event_type == "InsertText": self.range += len(event.payload["text"])
         def save(self,path):
             import shutil
             shutil.copy2(source, path)
@@ -57,6 +67,58 @@ def test_ready_start_executes_blueprint_and_writes_truthful_checkpoint(tmp_path)
     assert result.save_count > 0
     assert (paths.logs_dir/"interactive_checkpoint.json").exists()
     assert store.get_project(paths.project_id)["status"] in {"VERIFYING","COMPLETED"}
+
+
+def test_default_controller_receives_background_visibility(tmp_path, monkeypatch):
+    import shutil
+    from word_replica.qa.render import RenderQaResult
+    from word_replica.services import interactive_rebuild as service_module
+
+    source = build_plain_text(tmp_path / "source.docx")
+    store = ProjectStore(tmp_path / "projects")
+    options = RebuildOptions(
+        reconstruction_mode=ReconstructionMode.INTERACTIVE,
+        visibility=VisibilityMode.BACKGROUND,
+        interactive=InteractiveOptions(checkpoint_event_interval=9999),
+    )
+    paths = store.create_project(source, options)
+    audit = AuditLog(paths.logs_dir / "audit.jsonl")
+    seen_visibility = []
+
+    class FakeController:
+        def __init__(self, *, visible):
+            seen_visibility.append(visible)
+            self.position = 0
+        def open_blank(self): pass
+        def set_asset_resolver(self, resolver): self.resolver = resolver
+        def execute_event(self, event):
+            if event.event_type == "InsertText":
+                self.position += len(event.payload["text"])
+        def save(self, path): shutil.copy2(source, path)
+        def current_state_snapshot(self):
+            return {"story": "body", "range_start": self.position, "range_end": self.position,
+                    "paragraph_started": True}
+        def set_custom_property(self, name, value): pass
+        def close(self): pass
+
+    monkeypatch.setattr(service_module, "InteractiveWordController", FakeController)
+    def exporter(docx, pdf, visible=False):
+        Path(pdf).write_bytes(b"pdf")
+        return Path(pdf)
+
+    service = InteractiveRebuildService(
+        word_probe=lambda: True,
+        project_store=store,
+        pdf_exporter=exporter,
+        pdf_comparer=lambda source_pdf, rebuilt_pdf, qa_dir: RenderQaResult(
+            True, True, True, 1, 1, [], []
+        ),
+    )
+    prepared = service.prepare(source, options, paths, audit)
+
+    service.start(prepared)
+
+    assert seen_visibility == [False]
 
 
 def test_resume_rejects_changed_source_before_opening_word(tmp_path):
@@ -164,6 +226,7 @@ def test_completed_interactive_run_requires_final_l0_l3_and_l4_before_pass(tmp_p
         def set_asset_resolver(self,resolver): pass
         def execute_event(self,event):
             if event.event_type=="InsertCharacter": self.pos+=1
+            if event.event_type=="InsertText": self.pos+=len(event.payload["text"])
         def current_state_snapshot(self): return {"document_identity":"d","story":"body","range_start":self.pos,"range_end":self.pos,"section_index":0,"table_element_id":None,"cell_element_id":None}
         def save(self,path): shutil.copy2(source,path)
         def set_custom_property(self,name,value): self.props[name]=value
@@ -224,6 +287,7 @@ def test_live_verification_mismatch_pauses_at_saved_table_boundary(tmp_path):
         def execute_event(self, event):
             self.events.append(event.event_type)
             if event.event_type == "InsertCharacter": self.pos += 1
+            if event.event_type == "InsertText": self.pos += len(event.payload["text"])
         def current_state_snapshot(self):
             return {"document_identity":"d","story":"body","range_start":self.pos,"range_end":self.pos,
                     "section_index":0,"table_element_id":None,"cell_element_id":None}

@@ -83,7 +83,7 @@ def _options_for(stage: str) -> RebuildOptions:
     return RebuildOptions(
         reconstruction_mode=ReconstructionMode.INTERACTIVE,
         renderer=RendererChoice.WORD,
-        visibility=VisibilityMode.VISIBLE,
+        visibility=VisibilityMode.BACKGROUND,
         interactive=InteractiveOptions(
             speed_mode=InteractiveSpeedMode.MAXIMUM,
             object_step_delay_ms=0,

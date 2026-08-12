@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Callable
 
 from word_replica.config import InteractiveOptions, RebuildOptions
-from word_replica.domain.enums import InteractiveFidelity, InteractiveSpeedMode, MetadataMode, ReconstructionMode, RunStatus
+from word_replica.domain.enums import InteractiveFidelity, InteractiveSpeedMode, MetadataMode, ReconstructionMode, RunStatus, VisibilityMode
 from word_replica.domain.reconstruction import PreparedInteractiveRun
 from word_replica.domain.results import RunResult, WarningItem
 from word_replica.interactive.blueprint import BlueprintCompiler
@@ -262,6 +262,7 @@ class InteractiveRebuildService:
     def _run_settings_dict(cls, options: RebuildOptions) -> dict:
         data = cls._settings_dict(options.interactive)
         data["metadata_mode"] = options.metadata.value
+        data["visibility"] = options.visibility.value
         data["preserve_author_fields"] = bool(options.preserve_author_fields)
         data["custom_metadata_allowlist"] = list(options.custom_metadata_allowlist)
         return data
@@ -279,6 +280,7 @@ class InteractiveRebuildService:
         interactive = cls._options_from_settings(settings)
         return RebuildOptions(
             reconstruction_mode=ReconstructionMode.INTERACTIVE,
+            visibility=VisibilityMode(settings.get("visibility", VisibilityMode.BACKGROUND.value)),
             interactive=interactive,
             metadata=MetadataMode(settings.get("metadata_mode", MetadataMode.FRESH.value)),
             preserve_author_fields=bool(settings.get("preserve_author_fields", False)),
@@ -491,7 +493,11 @@ class InteractiveRebuildService:
                 project_id=prepared.paths.project_id,
                 reasons=list(prepared.preflight.blocking_reasons),
             )
-        controller_factory = controller_factory or InteractiveWordController
+        controller_factory = controller_factory or (
+            lambda: InteractiveWordController(
+                visible=prepared.options.visibility is VisibilityMode.VISIBLE
+            )
+        )
         control = control or InteractiveRunControl()
         if control.state.value == "CREATED":
             control.start()
@@ -531,7 +537,11 @@ class InteractiveRebuildService:
         if not preflight.can_proceed:
             return RunResult(RunStatus.FAIL, None, None, project_id=project_id, reasons=list(preflight.blocking_reasons))
         prepared = PreparedInteractiveRun(str(source.resolve()), model, blueprint, preflight, paths, options)
-        controller_factory = controller_factory or InteractiveWordController
+        controller_factory = controller_factory or (
+            lambda: InteractiveWordController(
+                visible=prepared.options.visibility is VisibilityMode.VISIBLE
+            )
+        )
         return self._execute(
             prepared,
             controller_factory=controller_factory,
