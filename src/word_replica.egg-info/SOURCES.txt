@@ -51,6 +51,7 @@ src/word_replica/renderers/base.py
 src/word_replica/renderers/interactive_word.py
 src/word_replica/renderers/pure_docx.py
 src/word_replica/renderers/word_com.py
+src/word_replica/renderers/word_ownership.py
 src/word_replica/services/__init__.py
 src/word_replica/services/audit.py
 src/word_replica/services/checkpoints.py

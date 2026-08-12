@@ -1,0 +1,11 @@
+{
+  "local_root": "C:\\WordReplica-Automation",
+  "golden_filename": "Glavna verzija rektorova (grupno)(1).docx",
+  "reconstruction_timeout_seconds": 7200,
+  "audit_timeout_seconds": 1800,
+  "keep_success_runs": 1,
+  "keep_failure_runs": 2,
+  "visual_dpi": 144,
+  "changed_pixel_tolerance": 0.001,
+  "mae_tolerance": 0.25
+}

@@ -9,6 +9,7 @@ from word_replica.domain.reconstruction import ExecutionOutcome, ReconstructionB
 from word_replica.interactive.speed import SpeedController
 from word_replica.config import InteractiveOptions
 from word_replica.interactive.verification import state_snapshots_match
+from word_replica.renderers.word_ownership import clear_owned_word, record_owned_word
 
 
 WD_COLLAPSE_END = 0
@@ -79,6 +80,7 @@ class InteractiveWordController:
         self._active_cell_element_id: str | None = None
         self._image_transaction_active = False
         self._floating_images: list[tuple[int, Any]] = []
+        self._owned_word_pid: int | None = None
 
     @classmethod
     def for_testing(cls, *, active_range: Any) -> "InteractiveWordController":
@@ -93,6 +95,7 @@ class InteractiveWordController:
         pythoncom.CoInitialize()
         self._owns_com = True
         self.application = win32com.client.DispatchEx("Word.Application")
+        self._owned_word_pid = record_owned_word(self.application, role="interactive")
         self.application.Visible = True
         self.document = self.application.Documents.Add()
         self.active_range = self.document.Range(0, 0)
@@ -105,6 +108,7 @@ class InteractiveWordController:
         pythoncom.CoInitialize()
         self._owns_com = True
         self.application = win32com.client.DispatchEx("Word.Application")
+        self._owned_word_pid = record_owned_word(self.application, role="interactive")
         self.application.Visible = True
         self.document = self.application.Documents.Open(
             str(Path(path).resolve()), ReadOnly=False, AddToRecentFiles=False
@@ -994,6 +998,8 @@ class InteractiveWordController:
             with suppress(Exception):
                 self.application.Quit()
             self.application = None
+        clear_owned_word(self._owned_word_pid)
+        self._owned_word_pid = None
         self.active_range = None
         if self._owns_com:
             with suppress(Exception):
