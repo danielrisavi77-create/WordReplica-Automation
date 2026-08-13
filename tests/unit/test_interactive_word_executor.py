@@ -204,6 +204,9 @@ class FakeCell:
         self.row, self.col, self.log = row, col, log
         self.Range = FormattingRange()
         self.VerticalAlignment = None
+        self.Width = None
+        self.PreferredWidthType = None
+        self.PreferredWidth = None
     def Merge(self, other):
         self.log.append(("merge", self.row, self.col, other.row, other.col))
 
@@ -272,6 +275,22 @@ def test_table_structure_and_merges_happen_before_cell_typing_without_postmerge_
     assert log.index(("lookup",1,2)) < merge_index
     assert [x for x in log[merge_index+1:] if x and x[0] == "lookup"] == []
     assert controller.active_range.insert_after_calls == ["A", "1"]
+
+
+def test_cell_dxa_width_is_preferred_width_and_does_not_move_table_grid():
+    log = []
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = FakeDocument(log)
+    controller.execute_event(ReconstructionEvent("BeginTable", "t", {"rows": 1, "columns": 2}))
+    controller.execute_event(ReconstructionEvent(
+        "SetCellProperties", "c2",
+        {"row": 1, "column": 2, "properties": {"width": "6236", "width_type": "dxa"}},
+    ))
+
+    cell = controller._table_stack[-1]["cells"][(1, 2)]
+    assert cell.PreferredWidthType == 3
+    assert cell.PreferredWidth == 311.8
+    assert cell.Width is None
 
 
 class FakeInlineImage:

@@ -935,7 +935,9 @@ class InteractiveWordController:
             if props["vertical_alignment"] in mapping:
                 cell.VerticalAlignment = mapping[props["vertical_alignment"]]
         if props.get("width") is not None and props.get("width_type") in {None, "dxa"}:
-            with suppress(Exception): cell.Width = self._twips_to_points(props["width"])
+            with suppress(Exception):
+                cell.PreferredWidthType = 3
+                cell.PreferredWidth = self._twips_to_points(props["width"])
         self._apply_padding(cell, props.get("cell_margins"))
         self._apply_shading(cell, props.get("shading_fill"))
         self._apply_borders(cell, props.get("borders"))
