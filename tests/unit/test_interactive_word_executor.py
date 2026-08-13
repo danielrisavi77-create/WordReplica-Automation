@@ -104,8 +104,8 @@ def test_repeated_run_properties_reuse_the_current_formatting_context():
     controller.execute_event(ReconstructionEvent("InsertText", "r1", {"text": "A"}))
     controller.execute_event(ReconstructionEvent("ApplyRunProperties", "r2", properties))
 
-    assert [name for name, _ in fake.log if name == "font.Reset"] == ["font.Reset"]
-    assert [name for name, _ in fake.log if name == "font.Bold"] == ["font.Bold"]
+    assert [name for name, _ in fake.log if name == "font.Reset"] == ["font.Reset", "font.Reset"]
+    assert [name for name, _ in fake.log if name == "font.Bold"] == ["font.Bold", "font.Bold"]
 
 
 def test_repeated_paragraph_style_definition_is_configured_once():
@@ -174,6 +174,39 @@ def test_run_formatting_is_applied_before_first_character():
     assert fake.Font.Bold == -1
     assert fake.Font.Name == "Aptos"
     assert fake.Font.Size == 12.0
+
+
+def test_inserted_text_receives_run_formatting_after_word_expands_the_range():
+    class WordLikeFont:
+        def __init__(self, owner):
+            object.__setattr__(self, "owner", owner)
+            object.__setattr__(self, "Bold", 0)
+
+        def Reset(self):
+            self.Bold = 0
+
+        def __setattr__(self, name, value):
+            object.__setattr__(self, name, value)
+            if name == "Bold" and self.owner.inserted_text:
+                self.owner.inserted_bold = value
+
+    class WordLikeExpandedRange(FakeWordRange):
+        def __init__(self):
+            super().__init__()
+            self.inserted_text = ""
+            self.inserted_bold = 0
+            self.Font = WordLikeFont(self)
+
+        def InsertAfter(self, value):
+            self.inserted_text += value
+            super().InsertAfter(value)
+
+    target = WordLikeExpandedRange()
+    controller = InteractiveWordController.for_testing(active_range=target)
+    controller.execute_event(ReconstructionEvent("ApplyRunProperties", "r1", {"bold": True}))
+    controller.execute_event(ReconstructionEvent("InsertText", "r1", {"text": "Bold"}))
+
+    assert target.inserted_bold == -1
 
 
 def test_paragraph_formatting_is_applied_before_text():

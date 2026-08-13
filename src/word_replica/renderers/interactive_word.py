@@ -86,6 +86,7 @@ class InteractiveWordController:
         self._owned_word_pid: int | None = None
         self._formatting_context_generation = 0
         self._last_run_properties_key: tuple[int, str, int] | None = None
+        self._active_run_properties: dict[str, Any] | None = None
         self._paragraph_format_context_generation = 0
         self._last_paragraph_properties_key: tuple[int, str, int] | None = None
         self._paragraph_style_cache: dict[tuple[str, str], Any] = {}
@@ -388,6 +389,7 @@ class InteractiveWordController:
     def _event_ApplyRunProperties(self, event: ReconstructionEvent) -> None:
         target = self._require_range()
         props = event.payload
+        self._active_run_properties = dict(props)
         properties_key = json.dumps(props, sort_keys=True, ensure_ascii=False, default=str)
         cache_key = (id(target), properties_key, self._formatting_context_generation)
         if cache_key == self._last_run_properties_key:
@@ -582,6 +584,11 @@ class InteractiveWordController:
     def _insert_text(self, text: str) -> None:
         target = self._require_range()
         _retry_rejected_com_call(lambda: target.InsertAfter(text))
+        if self._active_run_properties is not None:
+            self._last_run_properties_key = None
+            self._event_ApplyRunProperties(ReconstructionEvent(
+                "ApplyRunProperties", "inserted-text", self._active_run_properties,
+            ))
         self._collapse_end()
         self._page_break_continuation_pending = False
         self._post_table_paragraph_active = False
