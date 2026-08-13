@@ -45,20 +45,16 @@ class BlueprintCompiler:
         table_index = 0
         for block_index, block in enumerate(blocks):
             if isinstance(block, Paragraph):
-                structural_section_boundary = (
-                    location.story == "body" and "section_index" in block.properties and not block.runs and not block.text()
+                self._compile_paragraph(
+                    block,
+                    events,
+                    SemanticLocation(
+                        story=location.story, section_index=location.section_index, block_index=block_index,
+                        paragraph_index=paragraph_index, table_index=location.table_index,
+                        row_index=location.row_index, cell_index=location.cell_index,
+                    ),
                 )
-                if not structural_section_boundary:
-                    self._compile_paragraph(
-                        block,
-                        events,
-                        SemanticLocation(
-                            story=location.story, section_index=location.section_index, block_index=block_index,
-                            paragraph_index=paragraph_index, table_index=location.table_index,
-                            row_index=location.row_index, cell_index=location.cell_index,
-                        ),
-                    )
-                    paragraph_index += 1
+                paragraph_index += 1
                 if location.story == "body" and "section_index" in block.properties:
                     current = int(block.properties["section_index"])
                     if current + 1 < len(self._model.sections):

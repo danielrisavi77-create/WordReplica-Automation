@@ -145,6 +145,33 @@ def test_section_transition_occurs_at_canonical_boundary_not_before_body(tmp_pat
     assert [e.payload["orientation"] for e in events if e.event_type == "ApplySectionProperties"][-1] == "landscape"
 
 
+def test_empty_section_boundary_paragraph_is_preserved_before_section_transition():
+    from word_replica.domain.model import Section
+
+    model = DocumentModel(
+        source_sha256="a" * 64,
+        body=[
+            Paragraph("before", [Run("before-run", "Before")]),
+            Paragraph("section-boundary", properties={"section_index": 0}),
+            Paragraph("after", [Run("after-run", "After")]),
+        ],
+        sections=[Section("section-0"), Section("section-1", {"break_type": "nextPage"})],
+    )
+
+    events = BlueprintCompiler().compile(model).events
+    boundary_start = next(
+        index for index, event in enumerate(events)
+        if event.event_type == "BeginParagraph" and event.source_element_id == "section-boundary"
+    )
+    boundary_end = next(
+        index for index, event in enumerate(events)
+        if event.event_type == "EndParagraph" and event.source_element_id == "section-boundary"
+    )
+    section_end = next(index for index, event in enumerate(events) if event.event_type == "EndSection")
+
+    assert boundary_start < boundary_end < section_end
+
+
 def test_header_footer_stories_use_same_character_events(tmp_path):
     from word_replica.parser.parser import DocxParser
     from tests.fixtures.build_fixtures import build_extended_fixture
