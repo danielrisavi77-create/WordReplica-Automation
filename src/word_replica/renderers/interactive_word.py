@@ -66,6 +66,7 @@ class InteractiveWordController:
         self._owns_com = False
         self._paragraph_started = False
         self._page_break_continuation_pending = False
+        self._post_table_paragraph_active = False
         self._table_stack: list[dict[str, Any]] = []
         self._asset_resolver = None
         self._active_image: Any | None = None
@@ -583,24 +584,32 @@ class InteractiveWordController:
         _retry_rejected_com_call(lambda: target.InsertAfter(text))
         self._collapse_end()
         self._page_break_continuation_pending = False
+        self._post_table_paragraph_active = False
 
     def _event_InsertTab(self, event: ReconstructionEvent) -> None:
         target = self._require_range()
         _retry_rejected_com_call(lambda: target.InsertAfter("\t"))
         self._collapse_end()
         self._page_break_continuation_pending = False
+        self._post_table_paragraph_active = False
 
     def _event_InsertLineBreak(self, event: ReconstructionEvent) -> None:
         target = self._require_range()
         _retry_rejected_com_call(lambda: target.InsertBreak(Type=WD_LINE_BREAK))
         self._collapse_end()
         self._page_break_continuation_pending = False
+        self._post_table_paragraph_active = False
 
     def _event_InsertPageBreak(self, event: ReconstructionEvent) -> None:
         target = self._require_range()
-        _retry_rejected_com_call(lambda: target.InsertBreak(Type=WD_PAGE_BREAK))
+        post_table = self._post_table_paragraph_active
+        if post_table:
+            _retry_rejected_com_call(lambda: target.InsertAfter("\f"))
+        else:
+            _retry_rejected_com_call(lambda: target.InsertBreak(Type=WD_PAGE_BREAK))
         self._collapse_end()
-        self._page_break_continuation_pending = True
+        self._page_break_continuation_pending = not post_table
+        self._post_table_paragraph_active = False
 
     @staticmethod
     def _duplicate_range(value: Any) -> Any:
@@ -970,6 +979,7 @@ class InteractiveWordController:
         # Word keeps a real paragraph immediately after a table. Reuse it for
         # the next source paragraph instead of inserting an extra blank one.
         self._paragraph_started = False
+        self._post_table_paragraph_active = True
 
     def _event_BeginParagraph(self, event: ReconstructionEvent) -> None:
         if self._page_break_continuation_pending:
@@ -982,6 +992,7 @@ class InteractiveWordController:
         target = self._require_range()
         _retry_rejected_com_call(lambda: target.InsertParagraphAfter())
         self._collapse_end()
+        self._post_table_paragraph_active = False
 
     def _event_EndParagraph(self, event: ReconstructionEvent) -> None:
         return

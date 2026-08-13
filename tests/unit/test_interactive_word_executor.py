@@ -829,6 +829,22 @@ def test_end_table_reuses_words_existing_post_table_paragraph():
     assert after.paragraph_calls == 0
 
 
+def test_page_break_after_table_stays_in_words_existing_post_table_paragraph():
+    after = FakeWordRange()
+    controller = InteractiveWordController.for_testing(active_range=after)
+    controller._table_stack = [{"table": object(), "after_range": after, "element_id": "t1"}]
+
+    controller.execute_event(ReconstructionEvent("EndTable", "t1", {}))
+    controller.execute_event(ReconstructionEvent("BeginParagraph", "page-break", {}))
+    controller.execute_event(ReconstructionEvent("InsertPageBreak", "run", {}))
+    controller.execute_event(ReconstructionEvent("EndParagraph", "page-break", {}))
+    controller.execute_event(ReconstructionEvent("BeginParagraph", "following", {}))
+
+    assert after.insert_after_calls == ["\f"]
+    assert after.break_calls == []
+    assert after.paragraph_calls == 1
+
+
 def test_word2010_style_add_uses_positional_arguments():
     from types import SimpleNamespace
     class Style:
