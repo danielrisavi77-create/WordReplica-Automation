@@ -1,4 +1,5 @@
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from word_replica.config import InteractiveOptions, RebuildOptions
 from word_replica.domain.enums import ReconstructionMode, RunStatus, VisibilityMode
@@ -6,6 +7,366 @@ from word_replica.services.audit import AuditLog
 from word_replica.services.interactive_rebuild import InteractiveRebuildService
 from word_replica.services.project_store import ProjectStore
 from tests.fixtures.build_fixtures import build_plain_text
+
+
+def test_unexpected_word_bookmarks_are_removed_from_saved_package(tmp_path):
+    from lxml import etree
+
+    output = tmp_path / "output.docx"
+    document_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p>"
+        b"<w:bookmarkStart w:id='1' w:name='KeepMe'/>"
+        b"<w:bookmarkStart w:id='2' w:name='_GoBack'/>"
+        b"<w:r><w:t>text</w:t></w:r>"
+        b"<w:bookmarkEnd w:id='2'/><w:bookmarkEnd w:id='1'/>"
+        b"</w:p></w:body></w:document>"
+    )
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document_xml)
+        archive.writestr("word/styles.xml", b"styles")
+
+    removed = InteractiveRebuildService._remove_unexpected_bookmarks(output, {"KeepMe"})
+
+    assert removed == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    assert [node.get("{%(w)s}name" % ns) for node in root.xpath("//w:bookmarkStart", namespaces=ns)] == ["KeepMe"]
+
+
+def test_unexpected_headers_are_removed_from_saved_package(tmp_path):
+    from lxml import etree
+
+    output = tmp_path / "output.docx"
+    document_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main' "
+        b"xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'>"
+        b"<w:body><w:sectPr><w:headerReference w:type='default' r:id='rId1'/></w:sectPr></w:body></w:document>"
+    )
+    rels_xml = (
+        b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"
+        b"<Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/header' Target='header1.xml'/>"
+        b"</Relationships>"
+    )
+    types_xml = (
+        b"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'>"
+        b"<Override PartName='/word/header1.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml'/>"
+        b"</Types>"
+    )
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document_xml)
+        archive.writestr("word/_rels/document.xml.rels", rels_xml)
+        archive.writestr("[Content_Types].xml", types_xml)
+        archive.writestr("word/header1.xml", b"header")
+
+    removed = InteractiveRebuildService._remove_unexpected_headers(output, set())
+
+    assert removed == 1
+    with ZipFile(output) as archive:
+        assert "word/header1.xml" not in archive.namelist()
+        assert b"headerReference" not in archive.read("word/document.xml")
+        assert b"header1.xml" not in archive.read("word/_rels/document.xml.rels")
+        types = etree.fromstring(archive.read("[Content_Types].xml"))
+        assert not types.xpath("//*[local-name()='Override' and @PartName='/word/header1.xml']")
+
+
+def test_template_spacing_is_removed_when_source_paragraph_has_no_properties(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:r><w:br/></w:r></w:p><w:p><w:pPr><w:jc w:val='center'/></w:pPr></w:p></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:pPr><w:spacing w:after='200' w:line='276'/></w:pPr><w:r><w:br/></w:r></w:p>"
+        b"<w:p><w:pPr><w:spacing w:after='200'/><w:jc w:val='center'/></w:pPr></w:p></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    removed = InteractiveRebuildService._remove_template_paragraph_spacing(output, source)
+
+    assert removed == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+        paragraphs = root.xpath("//*[local-name()='body']/*[local-name()='p']")
+        assert paragraphs[0].find("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}pPr") is None
+        assert paragraphs[1].find("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}pPr") is not None
+
+
+def test_explicit_left_alignment_is_restored_when_word_omits_default(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:pPr><w:jc w:val='left'/></w:pPr></w:p></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:pPr><w:spacing w:after='240'/></w:pPr></w:p></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_explicit_paragraph_alignment(output, source)
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+        assert root.xpath("//*[local-name()='jc' and @*[local-name()='val']='left']")
+
+
+def test_explicit_paragraph_alignment_is_restored_when_word_normalizes_value(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:pPr><w:jc w:val='both'/></w:pPr></w:p></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:pPr><w:jc w:val='left'/></w:pPr></w:p></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_explicit_paragraph_alignment(output, source)
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+        assert root.xpath("//*[local-name()='jc']/@*[local-name()='val']") == ["both"]
+
+
+def test_explicit_run_character_spacing_is_restored_after_word_round_trip(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:r><w:rPr><w:spacing w:val='18'/></w:rPr><w:t>text</w:t></w:r></w:p></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:r><w:rPr><w:spacing w:val='17'/></w:rPr><w:t>text</w:t></w:r></w:p></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_explicit_run_character_spacing(output, source)
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+        assert root.xpath("//*[local-name()='spacing']/@*[local-name()='val']") == ["18"]
+
+
+def test_empty_source_runs_are_restored_to_saved_package(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:r/></w:p></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p/></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_empty_runs(output, source)
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+        assert len(root.xpath("//*[local-name()='p']/*[local-name()='r']")) == 1
+
+
+def test_explicit_section_column_space_is_restored_after_word_rounding(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:sectPr><w:cols w:space='720'/></w:sectPr></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:sectPr><w:cols w:space='708'/></w:sectPr></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_explicit_column_space(output, source)
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+        assert root.xpath("//*[local-name()='cols']/@*[local-name()='space']") == ["720"]
+
+
+def test_explicit_page_number_start_is_restored_after_word_save(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:sectPr><w:pgNumType w:start='1'/></w:sectPr></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:sectPr/></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_explicit_page_number_start(output, source)
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+        assert root.xpath("//*[local-name()='pgNumType']/@*[local-name()='start']") == ["1"]
+
+
+def test_source_document_defaults_are_restored_to_saved_styles(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_styles = (
+        b"<w:styles xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:docDefaults><w:pPrDefault><w:pPr><w:spacing w:line='360'/></w:pPr></w:pPrDefault></w:docDefaults></w:styles>"
+    )
+    output_styles = (
+        b"<w:styles xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:docDefaults><w:pPrDefault><w:pPr><w:spacing w:line='240'/></w:pPr></w:pPrDefault></w:docDefaults></w:styles>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/styles.xml", source_styles)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/styles.xml", output_styles)
+
+    restored = InteractiveRebuildService._restore_source_document_defaults(output, source)
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/styles.xml"))
+        assert root.xpath("//*[local-name()='spacing']/@*[local-name()='line']") == ["360"]
+
+
+def test_source_footer_parts_and_reference_types_are_restored(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    document_source = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main' "
+        b"xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'><w:body>"
+        b"<w:sectPr><w:footerReference w:type='default' r:id='rId1'/></w:sectPr></w:body></w:document>"
+    )
+    document_output = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main' "
+        b"xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'><w:body>"
+        b"<w:sectPr><w:footerReference w:type='even' r:id='rId1'/><w:footerReference w:type='default' r:id='rId2'/></w:sectPr>"
+        b"</w:body></w:document>"
+    )
+    rels = b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'/>"
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document_source)
+        archive.writestr("word/footer1.xml", b"<w:ftr xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:p><w:r><w:t>source</w:t></w:r></w:p></w:ftr>")
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document_output)
+        archive.writestr("word/footer1.xml", b"output")
+        archive.writestr("word/_rels/document.xml.rels", rels)
+
+    restored = InteractiveRebuildService._restore_source_footer_stories(output, source, [{"default"}])
+
+    assert restored == 2
+    with ZipFile(output) as archive:
+        assert b"source" in archive.read("word/footer1.xml")
+        root = etree.fromstring(archive.read("word/document.xml"))
+        assert len(root.xpath("//*[local-name()='footerReference' and @*[local-name()='type']='even']")) == 0
+
+
+def test_source_field_instructions_are_restored_after_word_save(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:r><w:instrText>TOC \\o \"1-3\"</w:instrText></w:r></w:p></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:r><w:instrText>TOC \\o \"1-3\" \\* MERGEFORMAT</w:instrText></w:r></w:p></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_source_field_instructions(output, source)
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+        assert root.xpath("string(//*[local-name()='instrText'])") == 'TOC \\o "1-3"'
+
+
+def test_source_autofit_table_layout_is_restored(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body>"
+        b"<w:tbl><w:tblPr/><w:tr><w:tc><w:tcPr/></w:tc></w:tr></w:tbl></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body>"
+        b"<w:tbl><w:tblPr><w:tblLayout w:type='fixed'/></w:tblPr><w:tblGrid><w:gridCol w:w='1000'/></w:tblGrid>"
+        b"<w:tr><w:tc><w:tcPr><w:tcW w:w='1000' w:type='dxa'/></w:tcPr></w:tc></w:tr></w:tbl></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    removed = InteractiveRebuildService._restore_source_table_layout(output, source)
+
+    assert removed == 3
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+        assert not root.xpath("//*[local-name()='tblGrid']|//*[local-name()='tblLayout']|//*[local-name()='tcW']")
 
 
 def test_blocked_preflight_never_creates_word_controller(tmp_path):
@@ -245,6 +606,51 @@ def test_completed_interactive_run_requires_final_l0_l3_and_l4_before_pass(tmp_p
     assert metrics[-1]["payload"]["completed_events"] == prepared.blueprint.total_events
 
 
+def test_deferred_l4_still_seals_output_and_runs_l0_l3_without_pdf_export(tmp_path):
+    import shutil
+    from word_replica.services.checkpoints import CheckpointManager
+
+    source = build_plain_text(tmp_path / "source.docx")
+    store = ProjectStore(tmp_path / "projects")
+    options = RebuildOptions(reconstruction_mode=ReconstructionMode.INTERACTIVE)
+    paths = store.create_project(source, options)
+    audit = AuditLog(paths.logs_dir / "audit.jsonl")
+    service = InteractiveRebuildService(
+        project_store=store,
+        word_probe=lambda: True,
+        run_l4_qa=False,
+        pdf_exporter=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("deferred L4 must not export PDFs")
+        ),
+    )
+    prepared = service.prepare(source, options, paths, audit)
+    output = paths.output_dir / "reconstructed.docx"
+    save_manager = CheckpointManager(paths.logs_dir / "save_history.jsonl", audit)
+
+    class Renderer:
+        def __init__(self):
+            self.properties = {}
+
+        def set_custom_property(self, name, value):
+            self.properties[name] = value
+
+        def save(self, path):
+            shutil.copy2(source, path)
+
+        def current_state_snapshot(self):
+            return {"story": "body", "range_start": 0, "range_end": 0}
+
+    renderer = Renderer()
+    result = service._finalize_qa(prepared, output, save_manager, audit, renderer)
+
+    assert result.status is RunStatus.PASS
+    assert result.output_path == output
+    assert result.qa_report_path and result.qa_report_path.exists()
+    assert result.save_count == 1
+    assert renderer.properties["WordReplicaActualSaveCount"] == 1
+    assert any(warning.code == "L4_DEFERRED" for warning in result.warnings)
+
+
 def test_live_verification_mismatch_pauses_at_saved_table_boundary(tmp_path):
     import shutil
     from word_replica.domain.reconstruction import LiveVerificationResult
@@ -342,6 +748,37 @@ def test_resume_checkpoint_preserves_metadata_mode_settings(tmp_path):
     assert restored.metadata is MetadataMode.PRESERVE
     assert restored.preserve_author_fields is True
     assert restored.custom_metadata_allowlist == ("StudyId",)
+
+
+def test_prepare_honors_disabled_table_fast_path(tmp_path):
+    from docx import Document
+
+    source = tmp_path / "legacy-table.docx"
+    document = Document()
+    document.add_table(rows=1, cols=1).cell(0, 0).text = "Alpha"
+    document.save(source)
+    options = RebuildOptions(
+        reconstruction_mode=ReconstructionMode.INTERACTIVE,
+        interactive=InteractiveOptions(enable_table_fast_path=False),
+    )
+    store = ProjectStore(tmp_path / "projects")
+    paths = store.create_project(source, options)
+
+    prepared = InteractiveRebuildService(word_probe=lambda: True).prepare(
+        source,
+        options,
+        paths,
+        AuditLog(paths.logs_dir / "audit.jsonl"),
+    )
+
+    assert not any(
+        event.event_type == "InsertTableBatch"
+        for event in prepared.blueprint.events
+    )
+    assert any(
+        event.event_type == "BeginTable"
+        for event in prepared.blueprint.events
+    )
 
 
 def test_prepare_and_resume_recompute_identical_model_fingerprint_with_metadata_policy(tmp_path):

@@ -55,6 +55,12 @@ class InteractiveProgressTracker:
             self.completed_characters += 1
         elif event.event_type == "InsertText":
             self.completed_characters += len(str(event.payload.get("text", "")))
+        elif event.event_type == "InsertTableBatch":
+            self.completed_characters += len(str(event.payload.get("text_projection", "")))
+            self.table_index += 1
+            self.completed_tables += 1
+            self.row_index = None
+            self.cell_index = None
         elif event.event_type == "BeginSection":
             self.section_index = int(event.payload.get("section_index", self.section_index))
             self.completed_sections += 1

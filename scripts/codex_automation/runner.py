@@ -14,6 +14,7 @@ from scripts.codex_automation.config import CodexAutomationConfig
 from scripts.codex_automation.process import ChildResult, run_owned_child
 from scripts.codex_automation.retention import prune_diagnostics
 from scripts.codex_automation.state import evaluate_run, load_state, save_state
+from scripts.codex_automation.trace_profile import profile_event_trace
 from scripts.codex_automation.workspace import GoldenWorkspace, sha256_file
 
 
@@ -65,6 +66,13 @@ def _trace_summary(path: Path) -> dict:
     return {"event_records": count, "first": first, "last": last}
 
 
+def _performance_profile(path: Path) -> dict:
+    try:
+        return profile_event_trace(path)
+    except (OSError, ValueError) as exc:
+        return {"available": False, "error": str(exc)}
+
+
 def _failure_report(run_id: str, source_hash: str, commit_sha: str, reconstruction_status: str, reason: str) -> dict:
     gates = {
         f"G{i}": GateResult(
@@ -93,12 +101,14 @@ class GoldenRunner:
         python_executable: str | None = None,
         child_executor: Callable[..., ChildResult] = run_owned_child,
         git_info: Callable[[Path], tuple[str, str]] = default_git_info,
+        visible_word: bool = False,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
         self.config = config
         self.python_executable = python_executable or sys.executable
         self.child_executor = child_executor
         self.git_info = git_info
+        self.visible_word = bool(visible_word)
         self.workspace = GoldenWorkspace(config)
 
     def _exec(self, command: list[str], *, timeout: int, run_dir: Path, stem: str, ownership_file: Path) -> ChildResult:
@@ -137,11 +147,15 @@ class GoldenRunner:
                 ownership_file=run.ownership_file,
             )
 
+            interactive_command = [
+                self.python_executable, str(child_runner), "--stage", "interactive_maximum",
+                "--source", str(run.source_copy), "--run-dir", str(interactive_dir),
+                "--defer-l4-qa",
+            ]
+            if self.visible_word:
+                interactive_command.append("--visible-word")
             interactive_result = self._exec(
-                [
-                    self.python_executable, str(child_runner), "--stage", "interactive_maximum",
-                    "--source", str(run.source_copy), "--run-dir", str(interactive_dir),
-                ],
+                interactive_command,
                 timeout=self.config.reconstruction_timeout_seconds,
                 run_dir=run.run_dir,
                 stem="interactive",
@@ -202,6 +216,7 @@ class GoldenRunner:
                 "audit_process": asdict(audit_result) if audit_result is not None else None,
                 "interactive_result": interactive_payload,
                 "trace": _trace_summary(interactive_dir / "event_trace.jsonl"),
+                "performance_profile": _performance_profile(interactive_dir / "event_trace.jsonl"),
             })
             if not source_unchanged:
                 report["full_pass"] = False

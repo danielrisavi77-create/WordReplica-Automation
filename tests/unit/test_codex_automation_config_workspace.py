@@ -4,6 +4,15 @@ from scripts.codex_automation.config import CodexAutomationConfig
 from scripts.codex_automation.workspace import GoldenWorkspace, sha256_file
 
 
+def test_default_golden_timeout_covers_long_complex_documents():
+    assert CodexAutomationConfig().reconstruction_timeout_seconds == 14_400
+
+    from scripts.codex_automation.config import load_config
+
+    repo_config = Path(__file__).resolve().parents[2] / "codex_automation.json"
+    assert load_config(repo_config).reconstruction_timeout_seconds == 14_400
+
+
 def test_workspace_copies_golden_without_mutating_source(tmp_path):
     root = tmp_path / "root"
     golden_dir = root / "golden"

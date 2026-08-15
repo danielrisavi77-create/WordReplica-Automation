@@ -31,6 +31,26 @@ def test_runner_produces_report_moves_run_and_preserves_golden(tmp_path):
             payload = {"stage": stage, "status": "PASS", "run_status": "PASS", "reasons": []}
             if stage == "interactive_maximum":
                 (run_dir / "output.docx").write_bytes(b"output")
+                (run_dir / "event_trace.jsonl").write_text("\n".join([
+                    json.dumps({
+                        "event_index": 0,
+                        "event_type": "InsertText",
+                        "source_element_id": "r1",
+                        "status": "before",
+                        "timestamp_utc": "2026-08-14T00:00:00+00:00",
+                        "table_element_id": None,
+                        "cell_element_id": None,
+                    }),
+                    json.dumps({
+                        "event_index": 0,
+                        "event_type": "InsertText",
+                        "source_element_id": "r1",
+                        "status": "after",
+                        "timestamp_utc": "2026-08-14T00:00:01.250000+00:00",
+                        "table_element_id": None,
+                        "cell_element_id": None,
+                    }),
+                ]), encoding="utf-8")
             (run_dir / "result.json").write_text(json.dumps(payload), encoding="utf-8")
         else:
             report_path = _arg(command, "--report")
@@ -59,8 +79,12 @@ def test_runner_produces_report_moves_run_and_preserves_golden(tmp_path):
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["commit_sha"] == "deadbeef"
     assert report["source_unchanged"] is True
+    assert report["performance_profile"]["paired_event_count"] == 1
+    assert report["performance_profile"]["by_event_type"][0]["total_seconds"] == 1.25
     assert golden.read_bytes() == b"golden"
     assert len(calls) == 3
+    interactive_call = next(call for call in calls if "interactive_maximum" in call)
+    assert "--defer-l4-qa" in interactive_call
     assert not any((root / "work").iterdir())
 
 
@@ -83,3 +107,49 @@ def test_runner_refuses_autonomous_run_on_main(tmp_path):
         assert "automation-dev" in str(exc)
     else:
         raise AssertionError("runner should refuse main")
+
+
+def test_visible_word_is_forwarded_only_to_interactive_child(tmp_path):
+    root = tmp_path / "local"
+    (root / "golden").mkdir(parents=True)
+    (root / "golden" / "golden.docx").write_bytes(b"golden")
+    repo = tmp_path / "repo"
+    (repo / "scripts" / "remote_harness").mkdir(parents=True)
+    (repo / "scripts" / "codex_automation").mkdir(parents=True)
+    calls = []
+
+    def executor(command, **kwargs):
+        calls.append(list(command))
+        if "--stage" in command:
+            stage = command[command.index("--stage") + 1]
+            run_dir = _arg(command, "--run-dir")
+            run_dir.mkdir(parents=True, exist_ok=True)
+            if stage == "interactive_maximum":
+                (run_dir / "output.docx").write_bytes(b"output")
+            (run_dir / "result.json").write_text(
+                json.dumps({"stage": stage, "run_status": "PASS", "reasons": []}),
+                encoding="utf-8",
+            )
+        else:
+            _arg(command, "--report").write_text(
+                json.dumps({
+                    "gates": {f"G{i}": False for i in range(10)},
+                    "gate_details": {},
+                    "full_pass": False,
+                }),
+                encoding="utf-8",
+            )
+        return ChildResult(0, False, 0.1, [])
+
+    GoldenRunner(
+        repo_root=repo,
+        config=CodexAutomationConfig(local_root=root, golden_filename="golden.docx"),
+        child_executor=executor,
+        git_info=lambda root: ("automation-dev", "deadbeef"),
+        visible_word=True,
+    ).run()
+
+    static_call = next(call for call in calls if "static" in call)
+    interactive_call = next(call for call in calls if "interactive_maximum" in call)
+    assert "--visible-word" not in static_call
+    assert "--visible-word" in interactive_call

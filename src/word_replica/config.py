@@ -23,6 +23,7 @@ class InteractiveOptions:
     verify_during_run: bool = True
     block_on_unsupported: bool = True
     allow_preserved_objects: bool = False
+    enable_table_fast_path: bool = True
 
     def __post_init__(self) -> None:
         if self.characters_per_second <= 0:

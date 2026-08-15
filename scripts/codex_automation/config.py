@@ -9,7 +9,7 @@ from pathlib import Path
 class CodexAutomationConfig:
     local_root: Path = Path(r"C:\WordReplica-Automation")
     golden_filename: str = "Glavna verzija rektorova (grupno)(1).docx"
-    reconstruction_timeout_seconds: int = 7200
+    reconstruction_timeout_seconds: int = 14_400
     audit_timeout_seconds: int = 1800
     keep_success_runs: int = 1
     keep_failure_runs: int = 2

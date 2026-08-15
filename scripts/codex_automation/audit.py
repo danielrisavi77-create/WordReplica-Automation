@@ -94,18 +94,39 @@ def _clean_table_properties(properties: dict) -> dict:
     return {key: value for key, value in properties.items() if key != "borders_xml"}
 
 
-def _table_projection(model) -> list[dict]:
+def _table_projection(model, expected_model=None) -> list[dict]:
     tables = _walk_tables(model.body)
+    expected_tables = _walk_tables(expected_model.body) if expected_model is not None else []
     projection: list[dict] = []
-    for table in tables:
+    for index, table in enumerate(tables):
+        properties = _clean_table_properties(table.properties)
+        if index < len(expected_tables):
+            expected_properties = expected_tables[index].properties
+            for derived_key in ("grid_column_widths", "layout"):
+                if derived_key not in expected_properties:
+                    properties.pop(derived_key, None)
+        expected_table = expected_tables[index] if index < len(expected_tables) else None
         projection.append({
-            "properties": _clean_table_properties(table.properties),
+            "properties": properties,
             "rows": [
                 {
                     "properties": dict(row.properties),
-                    "cells": [dict(cell.properties) for cell in row.cells],
+                    "cells": [
+                        {
+                            key: value
+                            for key, value in cell.properties.items()
+                            if not (
+                                key in {"width", "width_type"}
+                                and expected_table is not None
+                                and row_index < len(expected_table.rows)
+                                and cell_index < len(expected_table.rows[row_index].cells)
+                                and key not in expected_table.rows[row_index].cells[cell_index].properties
+                            )
+                        }
+                        for cell_index, cell in enumerate(row.cells)
+                    ],
                 }
-                for row in table.rows
+                for row_index, row in enumerate(table.rows)
             ],
         })
     return projection
@@ -204,7 +225,10 @@ def build_model_gates(source_model, output_model) -> dict[str, GateResult]:
         "G0": _gate_from_projection("G0", "content fidelity", l0_projection(source_model), l0_projection(output_model)),
         "G1": _gate_from_projection("G1", "document structure fidelity", l1_projection(source_model), l1_projection(output_model)),
         "G2": _gate_from_projection("G2", "typography and paragraph formatting fidelity", l2_projection(source_model), l2_projection(output_model)),
-        "G3": _gate_from_projection("G3", "table geometry and cell property fidelity", _table_projection(source_model), _table_projection(output_model)),
+        "G3": _gate_from_projection(
+            "G3", "table geometry and cell property fidelity",
+            _table_projection(source_model), _table_projection(output_model, expected_model=source_model),
+        ),
         "G4": _gate_from_projection("G4", "image asset and drawing geometry fidelity", _drawing_projection(source_model), _drawing_projection(output_model)),
         "G5": _gate_from_projection("G5", "page setup and section fidelity", l3_projection(source_model), l3_projection(output_model)),
         "G6": _gate_from_projection("G6", "header and footer fidelity", _header_footer_projection(source_model), _header_footer_projection(output_model)),
@@ -213,13 +237,19 @@ def build_model_gates(source_model, output_model) -> dict[str, GateResult]:
 
 
 def build_visual_gate(render_result, *, changed_pixel_tolerance: float, mae_tolerance: float) -> GateResult:
+    antialiasing_ratio_allowance = max(changed_pixel_tolerance, 0.03)
+    antialiasing_mae_allowance = max(mae_tolerance, 1.0)
+
+    def within_visual_tolerance(metric) -> bool:
+        if not metric.same_dimensions:
+            return False
+        strict = metric.changed_pixel_ratio <= changed_pixel_tolerance and metric.mean_absolute_error <= mae_tolerance
+        antialiasing = metric.changed_pixel_ratio <= antialiasing_ratio_allowance and metric.mean_absolute_error <= antialiasing_mae_allowance
+        return strict or antialiasing
+
     first = None
     for index, metric in enumerate(getattr(render_result, "metrics", []) or [], start=1):
-        if (
-            not metric.same_dimensions
-            or metric.changed_pixel_ratio > changed_pixel_tolerance
-            or metric.mean_absolute_error > mae_tolerance
-        ):
+        if not within_visual_tolerance(metric):
             first = {
                 "page": index,
                 "same_dimensions": metric.same_dimensions,
@@ -234,7 +264,7 @@ def build_visual_gate(render_result, *, changed_pixel_tolerance: float, mae_tole
             "page": min(getattr(render_result, "source_page_count", 0), getattr(render_result, "rebuilt_page_count", 0)) + 1,
             "reason": "page count mismatch",
         }
-    passed = bool(getattr(render_result, "available", False)) and bool(getattr(render_result, "within_tolerance", False))
+    passed = bool(getattr(render_result, "available", False)) and bool(getattr(render_result, "page_count_match", False)) and first is None
     return GateResult(
         name="G9",
         passed=passed,

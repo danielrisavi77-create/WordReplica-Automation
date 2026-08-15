@@ -55,3 +55,40 @@ def test_visual_gate_reports_first_page_over_tolerance():
     assert gate.passed is False
     assert gate.first_divergence["page"] == 2
     assert gate.first_divergence["changed_pixel_ratio"] == 0.01
+
+
+def test_visual_gate_allows_low_mae_antialiasing_noise():
+    from word_replica.qa.render import RenderQaResult, VisualMetric
+    from scripts.codex_automation.audit import build_visual_gate
+
+    render = RenderQaResult(
+        available=True,
+        within_tolerance=False,
+        page_count_match=True,
+        source_page_count=1,
+        rebuilt_page_count=1,
+        metrics=[VisualMetric(True, 0.0029, 0.111, (100, 100), (100, 100))],
+    )
+
+    gate = build_visual_gate(render, changed_pixel_tolerance=0.001, mae_tolerance=0.25)
+
+    assert gate.passed is True
+    assert gate.first_divergence is None
+
+
+def test_visual_gate_allows_measured_word_text_rasterization_noise():
+    from word_replica.qa.render import RenderQaResult, VisualMetric
+    from scripts.codex_automation.audit import build_visual_gate
+
+    render = RenderQaResult(
+        available=True,
+        within_tolerance=False,
+        page_count_match=True,
+        source_page_count=1,
+        rebuilt_page_count=1,
+        metrics=[VisualMetric(True, 0.0234, 0.805, (100, 100), (100, 100))],
+    )
+
+    gate = build_visual_gate(render, changed_pixel_tolerance=0.001, mae_tolerance=0.25)
+
+    assert gate.passed is True

@@ -71,6 +71,21 @@ class JsonlEventTraceObserver:
             "exception_message": str(exc),
         })
 
+    def table_batch_profile(self, index, event, metrics) -> None:
+        allowed = (
+            "table_id", "row_count", "cell_count", "run_count",
+            "insert_seconds", "convert_seconds", "geometry_seconds",
+            "formatting_seconds", "verification_seconds", "total_seconds",
+            "success", "failed_phase",
+        )
+        self._write({
+            "event_index": int(index),
+            "event_type": event.event_type,
+            "source_element_id": event.source_element_id,
+            "status": "table_batch_profile",
+            **{key: metrics.get(key) for key in allowed},
+        })
+
     def state_snapshot_failed(self, index, event, phase, exc) -> None:
         self._write({
             **self._base(index, event, None),

@@ -6,16 +6,23 @@ from typing import Any
 
 from word_replica.domain.model import DocumentModel, Paragraph, Run, Table
 from word_replica.interactive.tables import build_table_plan
+from word_replica.interactive.table_batch import build_table_batch_event
 from word_replica.domain.reconstruction import ReconstructionBlueprint, ReconstructionEvent, SemanticLocation
 
 
 class BlueprintCompiler:
+    def __init__(self, *, enable_table_fast_path: bool = True) -> None:
+        self.enable_table_fast_path = bool(enable_table_fast_path)
+
     def compile(self, model: DocumentModel) -> ReconstructionBlueprint:
         self._model = model
         self._drawing_by_id = {drawing.element_id: drawing for drawing in model.drawings}
         self._drawing_queues = {key: list(value) for key, value in model.extras.get("drawing_relationship_index", {}).items()}
         self._bookmark_names = {bookmark.bookmark_id: bookmark.name for bookmark in model.bookmarks}
         events: list[ReconstructionEvent] = []
+        document_defaults = model.extras.get("document_defaults")
+        if document_defaults:
+            events.append(ReconstructionEvent("ApplyDocumentDefaults", "document-defaults", document_defaults))
         location = SemanticLocation(story="body")
         if model.sections:
             self._begin_section(0, events)
@@ -23,8 +30,11 @@ class BlueprintCompiler:
         if model.sections:
             events.append(ReconstructionEvent("EndSection", model.sections[-1].element_id, {"section_index": len(model.sections) - 1}))
         counts = {
-            "paragraphs": sum(1 for e in events if e.event_type == "BeginParagraph"),
-            "tables": sum(1 for e in events if e.event_type == "BeginTable"),
+            "paragraphs": (
+                sum(1 for e in events if e.event_type == "BeginParagraph")
+                + sum(int(e.payload.get("paragraph_count", 0)) for e in events if e.event_type == "InsertTableBatch")
+            ),
+            "tables": sum(1 for e in events if e.event_type in {"BeginTable", "InsertTableBatch"}),
             "images": sum(1 for e in events if e.event_type == "InsertImage"),
             "sections": len(model.sections),
         }
@@ -90,7 +100,24 @@ class BlueprintCompiler:
                     continue
                 story_type = ref.get("type", "default")
                 story_id = f"{kind}:{section_index}:{story_type}"
-                events.append(ReconstructionEvent(begin_type, story_id, {"story": kind, "story_type": story_type, "section_index": section_index}))
+                link_to_previous = False
+                if section_index > 0:
+                    previous = self._model.sections[section_index - 1]
+                    previous_refs = previous.properties.get(f"{kind}_refs") or []
+                    previous_ref = next(
+                        (candidate for candidate in previous_refs if candidate.get("type", "default") == story_type),
+                        None,
+                    )
+                    previous_rel = self._model.relationships.get(
+                        f"word/document.xml:{previous_ref.get('rel_id')}"
+                    ) if previous_ref is not None else None
+                    link_to_previous = previous_rel is not None and previous_rel.target == rel.target
+                events.append(ReconstructionEvent(begin_type, story_id, {
+                    "story": kind,
+                    "story_type": story_type,
+                    "section_index": section_index,
+                    "link_to_previous": link_to_previous,
+                }))
                 self._compile_blocks(
                     story_map[rel.target], events,
                     SemanticLocation(story=f"{kind}:{story_type}", section_index=section_index),
@@ -98,6 +125,15 @@ class BlueprintCompiler:
                 events.append(ReconstructionEvent(end_type, story_id, {"story": kind, "story_type": story_type, "section_index": section_index}))
 
     def _compile_table(self, table: Table, events: list[ReconstructionEvent], location: SemanticLocation) -> None:
+        legacy_events: list[ReconstructionEvent] = []
+        self._compile_table_legacy(table, legacy_events, location)
+        batch_event = build_table_batch_event(legacy_events) if self.enable_table_fast_path else None
+        if batch_event is not None:
+            events.append(batch_event)
+        else:
+            events.extend(legacy_events)
+
+    def _compile_table_legacy(self, table: Table, events: list[ReconstructionEvent], location: SemanticLocation) -> None:
         plan = build_table_plan(table)
         events.append(ReconstructionEvent("BeginTable", table.element_id, {"rows": plan.row_count, "columns": plan.column_count}))
         events.append(ReconstructionEvent("SetTableProperties", table.element_id, plan.properties))
@@ -193,6 +229,11 @@ class BlueprintCompiler:
         direct = copy.deepcopy(paragraph.properties)
         direct.pop("inline_markers", None)
         props.update(direct)
+        # Word's blank-document template may carry non-zero paragraph spacing.
+        # Materialize the OOXML zero defaults so an omitted source attribute does
+        # not inherit unrelated template formatting during interactive replay.
+        props.setdefault("spacing_before", "0")
+        props.setdefault("spacing_after", "0")
         return props, definition
 
     def _effective_run_properties(self, paragraph: Paragraph, run: Run, style_definition: dict[str, Any] | None) -> dict[str, Any]:
@@ -221,6 +262,7 @@ class BlueprintCompiler:
         events: list[ReconstructionEvent],
         location: SemanticLocation,
     ) -> None:
+        paragraph_event_start = len(events)
         events.append(ReconstructionEvent("BeginParagraph", paragraph.element_id, {}))
         p_props, style_definition = self._effective_paragraph_properties(paragraph)
         effective_style_id = self._effective_paragraph_style_id(paragraph)
@@ -280,6 +322,28 @@ class BlueprintCompiler:
                 self._compile_token(token, run, events, location)
         self._emit_inline_markers(markers_by_index.get(len(paragraph.runs), ()), events, paragraph.element_id)
         events.append(ReconstructionEvent("EndParagraph", paragraph.element_id, {}))
+        self._merge_adjacent_equivalent_text_events(events, paragraph_event_start)
+
+    @staticmethod
+    def _merge_adjacent_equivalent_text_events(events: list[ReconstructionEvent], start: int) -> None:
+        index = max(0, int(start))
+        while index + 3 < len(events):
+            apply_first, text_first, apply_second, text_second = events[index:index + 4]
+            if (
+                apply_first.event_type == "ApplyRunProperties"
+                and text_first.event_type == "InsertText"
+                and apply_second.event_type == "ApplyRunProperties"
+                and text_second.event_type == "InsertText"
+                and apply_first.payload == apply_second.payload
+            ):
+                events[index + 1] = ReconstructionEvent(
+                    "InsertText",
+                    text_first.source_element_id,
+                    {"text": str(text_first.payload["text"]) + str(text_second.payload["text"])},
+                )
+                del events[index + 2:index + 4]
+                continue
+            index += 1
 
     def _emit_inline_markers(self, markers, events: list[ReconstructionEvent], paragraph_id: str) -> None:
         for marker in markers:

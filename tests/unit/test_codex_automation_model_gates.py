@@ -3,6 +3,7 @@ from word_replica.domain.model import (
     Section, Table, TableCell, TableRow,
 )
 from scripts.codex_automation.audit import build_model_gates
+from word_replica.qa.structure import l1_projection
 
 
 def para(eid, text, *, style=None, props=None, run_props=None):
@@ -52,6 +53,31 @@ def test_table_width_difference_is_first_g3_divergence():
     assert "grid_column_widths" in gates["G3"].first_divergence["path"]
 
 
+def test_g3_ignores_word_generated_table_grid_when_source_omits_it():
+    source = base_model()
+    source.body[1].properties.pop("grid_column_widths")
+    source.body[1].properties.pop("layout")
+    output = base_model()
+
+    gates = build_model_gates(source, output)
+
+    assert gates["G3"].passed
+
+
+def test_g3_ignores_word_generated_cell_width_when_source_omits_it():
+    source = base_model()
+    source.body[1].properties.pop("grid_column_widths")
+    source.body[1].properties.pop("layout")
+    source.body[1].rows[0].cells[0].properties.pop("width", None)
+    source.body[1].rows[0].cells[0].properties.pop("width_type", None)
+    output = base_model()
+    output.body[1].rows[0].cells[0].properties.update({"width": "1000", "width_type": "dxa"})
+
+    gates = build_model_gates(source, output)
+
+    assert gates["G3"].passed
+
+
 def test_header_typography_difference_is_g6_failure():
     source = base_model()
     output = base_model()
@@ -72,3 +98,14 @@ def test_field_instruction_difference_is_g7_failure():
 
     assert gates["G7"].passed is False
     assert "fields" in gates["G7"].first_divergence["path"]
+
+
+def test_l1_ignores_unreferenced_media_assets():
+    source = base_model()
+    source.drawings = []
+    output = base_model()
+    output.drawings = []
+    output.assets = {}
+
+    assert l1_projection(source)["asset_hashes"] == []
+    assert l1_projection(source) == l1_projection(output)

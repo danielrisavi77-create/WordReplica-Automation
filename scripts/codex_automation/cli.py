@@ -19,6 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run WordReplica Golden #1 locally for Codex automation")
     parser.add_argument("--config", default="codex_automation.json")
     parser.add_argument("--local-root", default=None)
+    parser.add_argument("--visible-word", action="store_true")
     return parser
 
 
@@ -31,7 +32,7 @@ def main(argv=None) -> int:
         config_path,
         local_root_override=Path(args.local_root) if args.local_root else None,
     )
-    runner = GoldenRunner(repo_root=ROOT, config=config)
+    runner = GoldenRunner(repo_root=ROOT, config=config, visible_word=args.visible_word)
     report_path = runner.run()
     report = json.loads(report_path.read_text(encoding="utf-8"))
     print(f"GOLDEN REPORT: {report_path}")

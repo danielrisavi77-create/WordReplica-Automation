@@ -134,9 +134,13 @@ class ReconstructionBlueprint:
             fingerprint=sha256(encoded).hexdigest(),
             total_events=len(frozen_events),
             total_visible_characters=sum(
-                len(str(event.payload.get("text", ""))) if event.event_type == "InsertText" else 1
+                len(str(event.payload.get("text", "")))
+                if event.event_type == "InsertText"
+                else len(str(event.payload.get("text_projection", "")))
+                if event.event_type == "InsertTableBatch"
+                else 1
                 for event in frozen_events
-                if event.event_type in {"InsertCharacter", "InsertText"}
+                if event.event_type in {"InsertCharacter", "InsertText", "InsertTableBatch"}
             ),
             semantic_counts=counts,
         )
