@@ -266,6 +266,51 @@ def test_post_insert_run_repair_does_not_reset_the_whole_font():
     assert "font.Bold" in names
 
 
+def test_uncolored_run_clears_explicit_color_inherited_from_previous_run_after_insert():
+    class WordLikeInheritedColorFont:
+        def __init__(self, owner):
+            object.__setattr__(self, "owner", owner)
+            object.__setattr__(self, "Bold", 0)
+            object.__setattr__(self, "Color", None)
+
+        def Reset(self):
+            if self.owner.range_expanded:
+                self.Color = None
+
+        def __setattr__(self, name, value):
+            object.__setattr__(self, name, value)
+            if name == "Color" and self.owner.range_expanded:
+                self.owner.inserted_colors[-1] = value
+
+    class WordLikeInheritedColorRange(FakeWordRange):
+        def __init__(self):
+            super().__init__()
+            self.range_expanded = False
+            self.inserted_colors = []
+            self.Font = WordLikeInheritedColorFont(self)
+
+        def InsertAfter(self, value):
+            self.range_expanded = True
+            self.inserted_colors.append(self.Font.Color)
+            super().InsertAfter(value)
+
+        def Collapse(self, direction):
+            super().Collapse(direction)
+            self.range_expanded = False
+
+    target = WordLikeInheritedColorRange()
+    controller = InteractiveWordController.for_testing(active_range=target)
+    controller.execute_event(ReconstructionEvent("ApplyRunProperties", "prefix", {
+        "bold": True,
+        "color": "1B2F4B",
+    }))
+    controller.execute_event(ReconstructionEvent("InsertText", "prefix", {"text": "Tablica 1."}))
+    controller.execute_event(ReconstructionEvent("ApplyRunProperties", "suffix", {"bold": True}))
+    controller.execute_event(ReconstructionEvent("InsertText", "suffix", {"text": " Zakonski okvir"}))
+
+    assert target.inserted_colors == [0x4B2F1B, None]
+
+
 def test_paragraph_formatting_is_applied_before_text():
     fake = FormattingRange()
     controller = InteractiveWordController.for_testing(active_range=fake)

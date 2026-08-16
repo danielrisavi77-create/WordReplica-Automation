@@ -87,6 +87,7 @@ class InteractiveWordController:
         self._formatting_context_generation = 0
         self._last_run_properties_key: tuple[int, str, int] | None = None
         self._active_run_properties: dict[str, Any] | None = None
+        self._reset_inherited_run_color_after_insert = False
         self._paragraph_format_context_generation = 0
         self._last_paragraph_properties_key: tuple[int, str, int] | None = None
         self._paragraph_style_cache: dict[tuple[str, str], Any] = {}
@@ -407,6 +408,17 @@ class InteractiveWordController:
     def _event_ApplyRunProperties(self, event: ReconstructionEvent) -> None:
         target = self._require_range()
         props = event.payload
+        previous_color = (self._active_run_properties or {}).get("color")
+        current_color = props.get("color")
+        previous_color_is_explicit = bool(
+            previous_color and str(previous_color).lower() not in {"auto", "none"}
+        )
+        current_color_is_explicit = bool(
+            current_color and str(current_color).lower() not in {"auto", "none"}
+        )
+        self._reset_inherited_run_color_after_insert = (
+            previous_color_is_explicit and not current_color_is_explicit
+        )
         self._active_run_properties = dict(props)
         properties_key = json.dumps(props, sort_keys=True, ensure_ascii=False, default=str)
         cache_key = (id(target), properties_key, self._formatting_context_generation)
@@ -486,6 +498,12 @@ class InteractiveWordController:
         """Apply only properties Word does not reliably inherit into inserted text."""
         target = self._require_range()
         font = _retry_getattr(target, "Font")
+        reset_inherited_color = self._reset_inherited_run_color_after_insert
+        self._reset_inherited_run_color_after_insert = False
+        if reset_inherited_color:
+            reset = _retry_getattr(font, "Reset", None)
+            if callable(reset):
+                _retry_rejected_com_call(reset)
         for key, attribute in (
             ("bold", "Bold"),
             ("italic", "Italic"),
