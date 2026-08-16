@@ -349,6 +349,148 @@ def test_explicit_run_font_names_follow_run_property_schema_order(tmp_path):
     assert run_property_names == ["rStyle", "rFonts", "b"]
 
 
+def test_drawing_effect_extents_are_restored_only_for_matching_geometry(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    prefix = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main' "
+        b"xmlns:wp='http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'>"
+        b"<w:body>"
+    )
+    source_xml = prefix + (
+        b"<w:p><w:r><w:drawing><wp:inline><wp:extent cx='100' cy='200'/>"
+        b"<wp:effectExtent l='0' t='0' r='0' b='0'/></wp:inline></w:drawing></w:r></w:p>"
+        b"<w:p><w:r><w:drawing><wp:inline><wp:extent cx='300' cy='400'/>"
+        b"<wp:effectExtent l='1' t='2' r='3' b='4'/></wp:inline></w:drawing></w:r></w:p>"
+        b"</w:body></w:document>"
+    )
+    output_xml = prefix + (
+        b"<w:p><w:r><w:drawing><wp:inline><wp:extent cx='100' cy='200'/>"
+        b"<wp:effectExtent l='0' t='0' r='0' b='1270'/></wp:inline></w:drawing></w:r></w:p>"
+        b"<w:p><w:r><w:drawing><wp:inline><wp:extent cx='301' cy='400'/>"
+        b"<wp:effectExtent l='9' t='9' r='9' b='9'/></wp:inline></w:drawing></w:r></w:p>"
+        b"</w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+        archive.writestr("word/unchanged.bin", b"unchanged")
+
+    restored = InteractiveRebuildService._restore_explicit_drawing_effect_extents(
+        output, source
+    )
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+        assert archive.read("word/unchanged.bin") == b"unchanged"
+    extents = root.xpath("//*[local-name()='effectExtent']")
+    assert [dict(node.attrib) for node in extents] == [
+        {"l": "0", "t": "0", "r": "0", "b": "0"},
+        {"l": "9", "t": "9", "r": "9", "b": "9"},
+    ]
+
+
+def test_drawing_effect_extents_refuse_swapped_same_size_images(tmp_path):
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    prefix = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main' "
+        b"xmlns:wp='http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing' "
+        b"xmlns:a='http://schemas.openxmlformats.org/drawingml/2006/main' "
+        b"xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'>"
+        b"<w:body>"
+    )
+
+    def drawing(relationship_id, bottom):
+        return (
+            b"<w:p><w:r><w:drawing><wp:inline><wp:extent cx='100' cy='200'/>"
+            + f"<wp:effectExtent l='0' t='0' r='0' b='{bottom}'/>".encode()
+            + b"<a:graphic><a:graphicData><a:blip r:embed='"
+            + relationship_id.encode()
+            + b"'/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
+        )
+
+    source_xml = prefix + drawing("rId1", 1) + drawing("rId2", 2) + b"</w:body></w:document>"
+    output_xml = prefix + drawing("rId2", 9) + drawing("rId1", 9) + b"</w:body></w:document>"
+    relationships = (
+        b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"
+        b"<Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' Target='media/image1.png'/>"
+        b"<Relationship Id='rId2' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' Target='media/image2.png'/>"
+        b"</Relationships>"
+    )
+    for path, document_xml in ((source, source_xml), (output, output_xml)):
+        with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+            archive.writestr("word/document.xml", document_xml)
+            archive.writestr("word/_rels/document.xml.rels", relationships)
+            archive.writestr("word/media/image1.png", b"first-image")
+            archive.writestr("word/media/image2.png", b"second-image")
+    before = output.read_bytes()
+
+    restored = InteractiveRebuildService._restore_explicit_drawing_effect_extents(
+        output, source
+    )
+
+    assert restored == 0
+    assert output.read_bytes() == before
+
+
+def test_drawing_effect_extents_ignore_unrestored_field_instruction_spacing(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    prefix = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main' "
+        b"xmlns:wp='http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing' "
+        b"xmlns:a='http://schemas.openxmlformats.org/drawingml/2006/main' "
+        b"xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'>"
+        b"<w:body><w:p><w:r><w:t>Caption</w:t></w:r><w:r><w:drawing><wp:inline>"
+        b"<wp:extent cx='100' cy='200'/>"
+    )
+    suffix = (
+        b"<a:graphic><a:graphicData><a:blip r:embed='rId1'/></a:graphicData></a:graphic>"
+        b"</wp:inline></w:drawing></w:r></w:p>"
+    )
+    source_xml = (
+        prefix
+        + b"<wp:effectExtent l='0' t='0' r='0' b='0'/>"
+        + suffix
+        + b"<w:p><w:r><w:instrText>PAGE</w:instrText></w:r><w:r><w:t>1</w:t></w:r></w:p>"
+        + b"</w:body></w:document>"
+    )
+    output_xml = (
+        prefix
+        + b"<wp:effectExtent l='0' t='0' r='0' b='1270'/>"
+        + suffix
+        + b"<w:p><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:t>1</w:t></w:r></w:p>"
+        + b"</w:body></w:document>"
+    )
+    relationships = (
+        b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"
+        b"<Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' Target='media/image1.png'/>"
+        b"</Relationships>"
+    )
+    for path, document_xml in ((source, source_xml), (output, output_xml)):
+        with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+            archive.writestr("word/document.xml", document_xml)
+            archive.writestr("word/_rels/document.xml.rels", relationships)
+            archive.writestr("word/media/image1.png", b"same-image")
+
+    restored = InteractiveRebuildService._restore_explicit_drawing_effect_extents(
+        output, source
+    )
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    assert root.xpath("//*[local-name()='effectExtent']/@b") == ["0"]
+    assert root.xpath("//*[local-name()='instrText']/text()") == [" PAGE "]
+
+
 def test_empty_source_runs_are_restored_to_saved_package(tmp_path):
     from lxml import etree
 
@@ -1230,7 +1372,8 @@ def test_completed_interactive_run_requires_final_l0_l3_and_l4_before_pass(tmp_p
     assert metrics[-1]["payload"]["completed_events"] == prepared.blueprint.total_events
 
 
-def test_deferred_l4_still_seals_output_and_runs_l0_l3_without_pdf_export(tmp_path):
+def test_deferred_l4_still_seals_output_and_runs_l0_l3_without_pdf_export(tmp_path, monkeypatch):
+    import json
     import shutil
     from word_replica.services.checkpoints import CheckpointManager
 
@@ -1246,6 +1389,17 @@ def test_deferred_l4_still_seals_output_and_runs_l0_l3_without_pdf_export(tmp_pa
         pdf_exporter=lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("deferred L4 must not export PDFs")
         ),
+    )
+    restored_effect_extents = []
+
+    def restore_effect_extents(output_path, source_path):
+        restored_effect_extents.append((Path(output_path), Path(source_path)))
+        return 2
+
+    monkeypatch.setattr(
+        service,
+        "_restore_explicit_drawing_effect_extents",
+        restore_effect_extents,
     )
     prepared = service.prepare(source, options, paths, audit)
     output = paths.output_dir / "reconstructed.docx"
@@ -1273,6 +1427,17 @@ def test_deferred_l4_still_seals_output_and_runs_l0_l3_without_pdf_export(tmp_pa
     assert result.save_count == 1
     assert renderer.properties["WordReplicaActualSaveCount"] == 1
     assert any(warning.code == "L4_DEFERRED" for warning in result.warnings)
+    assert restored_effect_extents == [(output, source)]
+    audit_rows = [
+        json.loads(line)
+        for line in (paths.logs_dir / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    events = [
+        row for row in audit_rows
+        if row.get("event_type") == "EXPLICIT_DRAWING_EFFECT_EXTENTS_RESTORED"
+    ]
+    assert events[-1]["payload"] == {"count": 2}
 
 
 def test_finalization_removes_unexpected_header_shape_defaults_and_audits_it(tmp_path):

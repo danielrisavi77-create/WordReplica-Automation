@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict, replace
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -704,6 +705,175 @@ class InteractiveRebuildService:
         return restored
 
     @staticmethod
+    def _restore_explicit_drawing_effect_extents(output_path: Path, source_path: Path) -> int:
+        from lxml import etree
+
+        word_namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        drawing_namespace = (
+            "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+        )
+        drawingml_namespace = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        relationship_namespace = (
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        )
+        ns = {
+            "w": word_namespace,
+            "wp": drawing_namespace,
+            "a": drawingml_namespace,
+            "r": relationship_namespace,
+        }
+        with ZipFile(source_path) as source_archive:
+            source_parts = {
+                name: source_archive.read(name) for name in source_archive.namelist()
+            }
+        with ZipFile(output_path) as output_archive:
+            parts = {name: output_archive.read(name) for name in output_archive.namelist()}
+        source_root = etree.fromstring(source_parts["word/document.xml"])
+        output_root = etree.fromstring(parts["word/document.xml"])
+        source_paragraphs = source_root.xpath("//w:body//w:p", namespaces=ns)
+        output_paragraphs = output_root.xpath("//w:body//w:p", namespaces=ns)
+        if len(source_paragraphs) != len(output_paragraphs):
+            return 0
+
+        def visible_paragraph_text(paragraph) -> str:
+            return "".join(paragraph.xpath(".//w:t/text()", namespaces=ns))
+
+        source_texts = [visible_paragraph_text(paragraph) for paragraph in source_paragraphs]
+        output_texts = [visible_paragraph_text(paragraph) for paragraph in output_paragraphs]
+        if source_texts != output_texts:
+            return 0
+        source_drawings = source_root.xpath("//w:body//w:drawing", namespaces=ns)
+        output_drawings = output_root.xpath("//w:body//w:drawing", namespaces=ns)
+        if len(source_drawings) != len(output_drawings):
+            return 0
+
+        def normalized_part_name(target: str) -> str:
+            target_path = PurePosixPath(target.lstrip("/"))
+            combined = target_path if target.startswith("/") else PurePosixPath("word") / target_path
+            normalized = []
+            for part in combined.parts:
+                if part in ("", "."):
+                    continue
+                if part == "..":
+                    if not normalized:
+                        return ""
+                    normalized.pop()
+                else:
+                    normalized.append(part)
+            return "/".join(normalized)
+
+        def relationship_targets(package_parts: dict[str, bytes]) -> dict[str, str]:
+            relationships_name = "word/_rels/document.xml.rels"
+            if relationships_name not in package_parts:
+                return {}
+            relationships_root = etree.fromstring(package_parts[relationships_name])
+            return {
+                relationship.get("Id"): relationship.get("Target")
+                for relationship in relationships_root
+                if relationship.get("Id")
+                and relationship.get("Target")
+                and relationship.get("TargetMode") != "External"
+            }
+
+        def drawing_identities(root, package_parts: dict[str, bytes]):
+            paragraphs = root.xpath("//w:body//w:p", namespaces=ns)
+            paragraph_indices = {id(paragraph): index for index, paragraph in enumerate(paragraphs)}
+            targets = relationship_targets(package_parts)
+            identities = []
+            for drawing in root.xpath("//w:body//w:drawing", namespaces=ns):
+                paragraph = drawing.xpath("ancestor::w:p[1]", namespaces=ns)
+                if not paragraph:
+                    return None
+                paragraph = paragraph[0]
+                paragraph_drawings = paragraph.xpath(".//w:drawing", namespaces=ns)
+                drawing_index = next(
+                    (index for index, candidate in enumerate(paragraph_drawings) if candidate is drawing),
+                    None,
+                )
+                if drawing_index is None:
+                    return None
+                host = drawing.find("wp:inline", namespaces=ns)
+                if host is None:
+                    host = drawing.find("wp:anchor", namespaces=ns)
+                extent = host.find("wp:extent", namespaces=ns) if host is not None else None
+                if host is None or extent is None:
+                    return None
+                media_hashes = []
+                for blip in drawing.xpath(".//a:blip[@r:embed]", namespaces=ns):
+                    relationship_id = blip.get(f"{{{relationship_namespace}}}embed")
+                    target = targets.get(relationship_id)
+                    part_name = normalized_part_name(target) if target else ""
+                    if not part_name or part_name not in package_parts:
+                        return None
+                    media_hashes.append(hashlib.sha256(package_parts[part_name]).hexdigest())
+                identities.append(
+                    (
+                        paragraph_indices[id(paragraph)],
+                        drawing_index,
+                        visible_paragraph_text(paragraph),
+                        etree.QName(host).localname,
+                        tuple(media_hashes),
+                    )
+                )
+            return identities
+
+        source_identities = drawing_identities(source_root, source_parts)
+        output_identities = drawing_identities(output_root, parts)
+        if source_identities is None or source_identities != output_identities:
+            return 0
+        restored = 0
+        for source_drawing, output_drawing in zip(source_drawings, output_drawings):
+            source_host = source_drawing.find("wp:inline", namespaces=ns)
+            if source_host is None:
+                source_host = source_drawing.find("wp:anchor", namespaces=ns)
+            output_host = output_drawing.find("wp:inline", namespaces=ns)
+            if output_host is None:
+                output_host = output_drawing.find("wp:anchor", namespaces=ns)
+            if (
+                source_host is None
+                or output_host is None
+                or source_host.tag != output_host.tag
+            ):
+                continue
+            source_extent = source_host.find("wp:extent", namespaces=ns)
+            output_extent = output_host.find("wp:extent", namespaces=ns)
+            if (
+                source_extent is None
+                or output_extent is None
+                or dict(source_extent.attrib) != dict(output_extent.attrib)
+            ):
+                continue
+            source_effect = source_host.find("wp:effectExtent", namespaces=ns)
+            if source_effect is None:
+                continue
+            output_effect = output_host.find("wp:effectExtent", namespaces=ns)
+            if output_effect is not None and dict(output_effect.attrib) == dict(source_effect.attrib):
+                continue
+            copied = etree.fromstring(etree.tostring(source_effect))
+            if output_effect is not None:
+                output_host.replace(output_effect, copied)
+            else:
+                output_host.insert(list(output_host).index(output_extent) + 1, copied)
+            restored += 1
+        if not restored:
+            return 0
+        parts["word/document.xml"] = etree.tostring(
+            output_root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{output_path.name}.", suffix=".tmp", dir=output_path.parent
+        )
+        os.close(fd)
+        try:
+            with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
+                for name, data in parts.items():
+                    archive.writestr(name, data)
+            Path(temporary_name).replace(output_path)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return restored
+
+    @staticmethod
     def _restore_empty_runs(output_path: Path, source_path: Path) -> int:
         from lxml import etree
 
@@ -1349,6 +1519,9 @@ class InteractiveRebuildService:
         restored_run_font_names = self._restore_explicit_run_font_names(
             output_path, Path(prepared.source_path)
         )
+        restored_drawing_effect_extents = self._restore_explicit_drawing_effect_extents(
+            output_path, Path(prepared.source_path)
+        )
         restored_empty_runs = self._restore_empty_runs(output_path, Path(prepared.source_path))
         restored_column_space = self._restore_explicit_column_space(
             output_path, Path(prepared.source_path)
@@ -1372,7 +1545,7 @@ class InteractiveRebuildService:
         restored_table_layout = self._restore_source_table_layout(
             output_path, Path(prepared.source_path)
         )
-        if removed_header_shape_defaults or removed_bookmarks or removed_headers or restored_header_stories or removed_template_spacing or restored_alignment or restored_run_character_spacing or restored_run_font_names or restored_empty_runs or restored_column_space or restored_page_number_start or restored_defaults or restored_footer_stories or restored_field_instructions or restored_table_layout:
+        if removed_header_shape_defaults or removed_bookmarks or removed_headers or restored_header_stories or removed_template_spacing or restored_alignment or restored_run_character_spacing or restored_run_font_names or restored_drawing_effect_extents or restored_empty_runs or restored_column_space or restored_page_number_start or restored_defaults or restored_footer_stories or restored_field_instructions or restored_table_layout:
             final_checkpoint = replace(
                 final_checkpoint,
                 output_sha256=sha256_file(output_path),
@@ -1397,6 +1570,11 @@ class InteractiveRebuildService:
             audit.append("EXPLICIT_RUN_CHARACTER_SPACING_RESTORED", {"count": restored_run_character_spacing})
         if restored_run_font_names:
             audit.append("EXPLICIT_RUN_FONT_NAMES_RESTORED", {"count": restored_run_font_names})
+        if restored_drawing_effect_extents:
+            audit.append(
+                "EXPLICIT_DRAWING_EFFECT_EXTENTS_RESTORED",
+                {"count": restored_drawing_effect_extents},
+            )
         if restored_empty_runs:
             audit.append("EMPTY_RUNS_RESTORED", {"count": restored_empty_runs})
         if restored_column_space:
