@@ -310,6 +310,7 @@ def audit_docx_pair(
     reconstruction_status: str,
     parser=None,
     pdf_exporter=None,
+    pdf_pair_exporter=None,
     pdf_comparer=None,
     page_text_extractor=None,
     visual_dpi: int = 144,
@@ -319,12 +320,11 @@ def audit_docx_pair(
     from pathlib import Path
     from word_replica.parser.parser import DocxParser
     from word_replica.qa.render import compare_pdfs
-    from word_replica.qa.word_render import export_docx_to_pdf_with_word
+    from word_replica.qa.word_render import export_docx_pair_to_pdf_with_word
 
     qa_dir = Path(qa_dir)
     qa_dir.mkdir(parents=True, exist_ok=True)
     parser = parser or DocxParser()
-    pdf_exporter = pdf_exporter or export_docx_to_pdf_with_word
     pdf_comparer = pdf_comparer or compare_pdfs
     page_text_extractor = page_text_extractor or extract_pdf_page_texts
 
@@ -337,8 +337,18 @@ def audit_docx_pair(
     source_page_texts: list[str] = []
     output_page_texts: list[str] = []
     try:
-        pdf_exporter(Path(source_docx), source_pdf, visible=False)
-        pdf_exporter(Path(output_docx), output_pdf, visible=False)
+        if pdf_exporter is not None:
+            pdf_exporter(Path(source_docx), source_pdf, visible=False)
+            pdf_exporter(Path(output_docx), output_pdf, visible=False)
+        else:
+            pair_exporter = pdf_pair_exporter or export_docx_pair_to_pdf_with_word
+            pair_exporter(
+                Path(source_docx),
+                source_pdf,
+                Path(output_docx),
+                output_pdf,
+                visible=False,
+            )
         source_page_texts = page_text_extractor(source_pdf)
         output_page_texts = page_text_extractor(output_pdf)
         gates["G8"] = compare_page_text_partitions(source_page_texts, output_page_texts)

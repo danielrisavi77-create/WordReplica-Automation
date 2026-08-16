@@ -46,6 +46,41 @@ def test_audit_docx_pair_builds_all_ten_gates(tmp_path):
     assert report["gates"] == {f"G{i}": True for i in range(10)}
 
 
+def test_default_audit_path_exports_source_and_output_in_one_word_application(tmp_path):
+    calls = []
+
+    def pair_exporter(source_docx, source_pdf, output_docx, output_pdf, visible=False):
+        calls.append((source_docx, output_docx, visible))
+        Path(source_pdf).write_bytes(b"source pdf")
+        Path(output_pdf).write_bytes(b"output pdf")
+
+    render = RenderQaResult(
+        available=True,
+        within_tolerance=True,
+        page_count_match=True,
+        source_page_count=1,
+        rebuilt_page_count=1,
+        metrics=[VisualMetric(True, 0.0, 0.0, (10, 10), (10, 10))],
+    )
+
+    report = audit_docx_pair(
+        tmp_path / "source.docx",
+        tmp_path / "output.docx",
+        tmp_path / "qa",
+        run_id="r",
+        source_sha256="abc",
+        commit_sha="def",
+        reconstruction_status="PASS",
+        parser=Parser(),
+        pdf_pair_exporter=pair_exporter,
+        pdf_comparer=lambda a, b, q, **kwargs: render,
+        page_text_extractor=lambda p: ["A"],
+    )
+
+    assert report["full_pass"] is True
+    assert calls == [(tmp_path / "source.docx", tmp_path / "output.docx", False)]
+
+
 def test_audit_preserves_model_gates_when_pdf_export_fails(tmp_path):
     def exporter(docx, pdf, visible=False):
         raise RuntimeError("Word PDF failed")

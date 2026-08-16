@@ -4,7 +4,7 @@ from copy import deepcopy
 from dataclasses import asdict, replace
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import tempfile
 from typing import Callable
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -747,6 +747,45 @@ class InteractiveRebuildService:
         return 1
 
     @staticmethod
+    def _restore_relationship_free_source_headers(
+        output_path: Path,
+        source_path: Path,
+        expected_targets: set[str],
+    ) -> int:
+        with ZipFile(source_path) as source_archive:
+            source_names = set(source_archive.namelist())
+            source_parts = {
+                name: source_archive.read(name)
+                for name in expected_targets
+                if name in source_names and name.startswith("word/header") and name.endswith(".xml")
+            }
+        with ZipFile(output_path) as output_archive:
+            parts = {name: output_archive.read(name) for name in output_archive.namelist()}
+        restored = 0
+        for name, data in source_parts.items():
+            part = PurePosixPath(name)
+            relationship_part = str(part.parent / "_rels" / f"{part.name}.rels")
+            if relationship_part in source_names or relationship_part in parts:
+                continue
+            if name in parts and parts[name] != data:
+                parts[name] = data
+                restored += 1
+        if not restored:
+            return 0
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{output_path.name}.", suffix=".tmp", dir=output_path.parent
+        )
+        os.close(fd)
+        try:
+            with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
+                for name, data in parts.items():
+                    archive.writestr(name, data)
+            Path(temporary_name).replace(output_path)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return restored
+
+    @staticmethod
     def _restore_source_footer_stories(output_path: Path, source_path: Path, expected_types: list[set[str]]) -> int:
         from lxml import etree
 
@@ -790,15 +829,235 @@ class InteractiveRebuildService:
     def _restore_source_field_instructions(output_path: Path, source_path: Path) -> int:
         from lxml import etree
 
+        namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        field_type_attr = f"{{{namespace}}}fldCharType"
+        instruction_attr = f"{{{namespace}}}instr"
         with ZipFile(source_path) as source_archive:
             source_root = etree.fromstring(source_archive.read("word/document.xml"))
         with ZipFile(output_path) as output_archive:
             parts = {name: output_archive.read(name) for name in output_archive.namelist()}
         output_root = etree.fromstring(parts["word/document.xml"])
-        source_nodes = source_root.xpath("//*[local-name()='instrText']")
-        output_nodes = output_root.xpath("//*[local-name()='instrText']")
+
+        def parse_fields(root):
+            records: list[dict] = []
+            context: list[int] = []
+            loose_instructions: list[object] = []
+            malformed = False
+
+            def add_record(kind: str, node) -> int:
+                index = len(records)
+                records.append(
+                    {
+                        "kind": kind,
+                        "node": node,
+                        "parent": context[-1] if context else None,
+                        "depth": len(context),
+                        "instruction_nodes": [],
+                        "separate": None,
+                        "end": None,
+                    }
+                )
+                return index
+
+            def walk(node) -> None:
+                nonlocal malformed
+                local_name = etree.QName(node).localname
+                if local_name == "fldSimple":
+                    index = add_record("simple", node)
+                    context.append(index)
+                    for child in node:
+                        walk(child)
+                    context.pop()
+                    return
+                if local_name == "fldChar":
+                    field_type = node.get(field_type_attr)
+                    if field_type == "begin":
+                        context.append(add_record("complex", node))
+                    elif field_type == "separate":
+                        if not context or records[context[-1]]["kind"] != "complex":
+                            malformed = True
+                        else:
+                            records[context[-1]]["separate"] = node
+                    elif field_type == "end":
+                        if not context or records[context[-1]]["kind"] != "complex":
+                            malformed = True
+                        else:
+                            records[context[-1]]["end"] = node
+                            context.pop()
+                elif local_name == "instrText":
+                    if context and records[context[-1]]["kind"] == "complex":
+                        records[context[-1]]["instruction_nodes"].append(node)
+                    else:
+                        loose_instructions.append(node)
+                for child in node:
+                    walk(child)
+
+            walk(root)
+            if context:
+                malformed = True
+            for record in records:
+                if record["kind"] == "simple":
+                    record["instruction"] = record["node"].get(instruction_attr) or ""
+                else:
+                    record["instruction"] = "".join(
+                        node.text or "" for node in record["instruction_nodes"]
+                    )
+                    if record["separate"] is None or record["end"] is None:
+                        malformed = True
+            return records, loose_instructions, malformed
+
+        def normalized_instruction(value: str) -> str:
+            tokens = value.split()
+            normalized = []
+            index = 0
+            while index < len(tokens):
+                if (
+                    tokens[index] == "\\*"
+                    and index + 1 < len(tokens)
+                    and tokens[index + 1].casefold() == "mergeformat"
+                ):
+                    index += 2
+                    continue
+                normalized.append(tokens[index].casefold())
+                index += 1
+            return " ".join(normalized)
+
+        def complex_span(record):
+            begin_run = record["node"].getparent()
+            separate_run = record["separate"].getparent()
+            end_run = record["end"].getparent()
+            if begin_run is None or separate_run is None or end_run is None:
+                return None
+            container = begin_run.getparent()
+            if container is None or separate_run.getparent() is not container or end_run.getparent() is not container:
+                return None
+            start = container.index(begin_run)
+            separate = container.index(separate_run)
+            end = container.index(end_run)
+            if not start <= separate < end:
+                return None
+            return container, start, separate, end
+
+        def output_result(record):
+            if record["kind"] == "simple":
+                return list(record["node"]), record["node"].tail
+            span = complex_span(record)
+            if span is None:
+                return None
+            container, _, separate, end = span
+            return list(container)[separate + 1 : end], list(container)[end].tail
+
+        def source_replacement(record, result_nodes, output_tail):
+            if record["kind"] == "simple":
+                wrapper = deepcopy(record["node"])
+                for child in list(wrapper):
+                    wrapper.remove(child)
+                for child in result_nodes:
+                    wrapper.append(deepcopy(child))
+                wrapper.tail = output_tail
+                return [wrapper]
+            span = complex_span(record)
+            if span is None:
+                return None
+            container, start, separate, end = span
+            children = list(container)
+            replacement = [deepcopy(node) for node in children[start : separate + 1]]
+            replacement.extend(deepcopy(node) for node in result_nodes)
+            replacement.append(deepcopy(children[end]))
+            replacement[-1].tail = output_tail
+            return replacement
+
+        def replace_output_field(record, replacement) -> bool:
+            if record["kind"] == "simple":
+                node = record["node"]
+                parent = node.getparent()
+                if parent is None:
+                    return False
+                index = parent.index(node)
+                parent.remove(node)
+            else:
+                span = complex_span(record)
+                if span is None:
+                    return False
+                parent, index, _, end = span
+                for child in list(parent)[index : end + 1]:
+                    parent.remove(child)
+            for offset, node in enumerate(replacement):
+                parent.insert(index + offset, node)
+            return True
+
+        source_fields, source_loose, source_malformed = parse_fields(source_root)
+        output_fields, output_loose, output_malformed = parse_fields(output_root)
+        if source_malformed or output_malformed or len(source_fields) != len(output_fields):
+            return 0
+        if [field["parent"] for field in source_fields] != [field["parent"] for field in output_fields]:
+            return 0
+        if any(
+            normalized_instruction(source_field["instruction"])
+            != normalized_instruction(output_field["instruction"])
+            for source_field, output_field in zip(source_fields, output_fields)
+        ):
+            return 0
+        if len(source_loose) != len(output_loose):
+            return 0
+
+        source_order = {node: index for index, node in enumerate(source_root.iter())}
+        output_order = {node: index for index, node in enumerate(output_root.iter())}
+
+        def has_nested_instruction_field(fields, field_index: int, order: dict) -> bool:
+            field = fields[field_index]
+            separate = field.get("separate")
+            if separate is None:
+                return False
+            separate_position = order[separate]
+            return any(
+                child["parent"] == field_index and order[child["node"]] < separate_position
+                for child in fields
+            )
+
+        def restore_instruction_only(source_field, output_field) -> int:
+            if source_field["kind"] == "simple" and output_field["kind"] == "simple":
+                source_instruction = source_field["node"].get(instruction_attr) or ""
+                if output_field["node"].get(instruction_attr) != source_instruction:
+                    output_field["node"].set(instruction_attr, source_instruction)
+                    return 1
+                return 0
+            if source_field["kind"] != "complex" or output_field["kind"] != "complex":
+                return 0
+            source_nodes = source_field["instruction_nodes"]
+            output_nodes = output_field["instruction_nodes"]
+            if len(source_nodes) != len(output_nodes):
+                return 0
+            changed = False
+            for source_node, output_node in zip(source_nodes, output_nodes):
+                if output_node.text != source_node.text:
+                    output_node.text = source_node.text
+                    changed = True
+            return int(changed)
+
         restored = 0
-        for source_node, output_node in zip(source_nodes, output_nodes):
+        paired_fields = list(enumerate(zip(source_fields, output_fields)))
+        for field_index, (source_field, output_field) in sorted(
+            paired_fields,
+            key=lambda item: (item[1][1]["depth"], item[0]),
+            reverse=True,
+        ):
+            if (
+                has_nested_instruction_field(source_fields, field_index, source_order)
+                or has_nested_instruction_field(output_fields, field_index, output_order)
+            ):
+                restored += restore_instruction_only(source_field, output_field)
+                continue
+            result = output_result(output_field)
+            if result is None:
+                restored += restore_instruction_only(source_field, output_field)
+                continue
+            result_nodes, output_tail = result
+            replacement = source_replacement(source_field, result_nodes, output_tail)
+            if replacement is not None and replace_output_field(output_field, replacement):
+                restored += 1
+
+        for source_node, output_node in zip(source_loose, output_loose):
             if output_node.text != source_node.text:
                 output_node.text = source_node.text
                 restored += 1
@@ -955,6 +1214,9 @@ class InteractiveRebuildService:
             if rel is not None and rel.target in prepared.model.headers
         }
         removed_headers = self._remove_unexpected_headers(output_path, expected_header_targets)
+        restored_header_stories = self._restore_relationship_free_source_headers(
+            output_path, Path(prepared.source_path), expected_header_targets
+        )
         removed_template_spacing = self._remove_template_paragraph_spacing(
             output_path, Path(prepared.source_path)
         )
@@ -987,7 +1249,7 @@ class InteractiveRebuildService:
         restored_table_layout = self._restore_source_table_layout(
             output_path, Path(prepared.source_path)
         )
-        if removed_bookmarks or removed_headers or removed_template_spacing or restored_alignment or restored_run_character_spacing or restored_empty_runs or restored_column_space or restored_page_number_start or restored_defaults or restored_footer_stories or restored_field_instructions or restored_table_layout:
+        if removed_bookmarks or removed_headers or restored_header_stories or removed_template_spacing or restored_alignment or restored_run_character_spacing or restored_empty_runs or restored_column_space or restored_page_number_start or restored_defaults or restored_footer_stories or restored_field_instructions or restored_table_layout:
             final_checkpoint = replace(
                 final_checkpoint,
                 output_sha256=sha256_file(output_path),
@@ -997,6 +1259,8 @@ class InteractiveRebuildService:
             audit.append("UNEXPECTED_BOOKMARKS_REMOVED", {"count": removed_bookmarks})
         if removed_headers:
             audit.append("UNEXPECTED_HEADERS_REMOVED", {"count": removed_headers})
+        if restored_header_stories:
+            audit.append("SOURCE_HEADER_STORIES_RESTORED", {"count": restored_header_stories})
         if removed_template_spacing:
             audit.append("TEMPLATE_PARAGRAPH_SPACING_REMOVED", {"count": removed_template_spacing})
         if restored_alignment:

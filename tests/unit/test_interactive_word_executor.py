@@ -71,6 +71,32 @@ def test_semantic_tab_and_breaks_are_dedicated_atomic_calls():
     assert fake.break_calls == [6]
 
 
+def test_tab_reapplies_active_run_formatting_after_word_resets_it():
+    from types import SimpleNamespace
+
+    class WordLikeTabRange(FakeWordRange):
+        def __init__(self):
+            super().__init__()
+            self.Font = SimpleNamespace(Name=None, NameBi=None)
+
+        def InsertAfter(self, value):
+            super().InsertAfter(value)
+            if value == "\t":
+                self.Font.NameBi = "Times New Roman"
+
+    fake = WordLikeTabRange()
+    controller = InteractiveWordController.for_testing(active_range=fake)
+    controller.execute_event(ReconstructionEvent("ApplyRunProperties", "r1", {
+        "font_ascii": "Times New Roman",
+        "font_cs": "Cambria",
+    }))
+
+    controller.execute_event(ReconstructionEvent("InsertTab", "r1", {}))
+
+    assert fake.insert_after_calls == ["\t"]
+    assert fake.Font.NameBi == "Cambria"
+
+
 def test_page_break_reapplies_complex_script_font_after_word_resets_it():
     class WordLikePageBreakFont:
         def __init__(self):
@@ -181,6 +207,40 @@ def test_repeated_paragraph_style_definition_is_configured_once():
     controller.execute_event(ReconstructionEvent("ApplyParagraphProperties", "p2", payload))
 
     assert [name for name, _ in log if name == "style.ReplicaBody.font.Name"] == ["style.ReplicaBody.font.Name"]
+
+
+def test_paragraph_style_definition_applies_complex_script_font():
+    from types import SimpleNamespace
+
+    log = []
+
+    class FakeStyle:
+        def __init__(self):
+            self.Font = RecordingObject(log, "style.font")
+            self.ParagraphFormat = RecordingObject(log, "style.paragraph")
+
+    style = FakeStyle()
+
+    class Styles:
+        def __call__(self, key):
+            if key != "Footer":
+                raise RuntimeError("missing style")
+            return style
+
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = SimpleNamespace(Styles=Styles())
+    controller.execute_event(ReconstructionEvent("ApplyParagraphProperties", "footer-p", {
+        "style_id": "Footer",
+        "style_definition": {
+            "style_id": "Footer",
+            "name": "footer",
+            "type": "paragraph",
+            "run_properties": {"font_ascii": "Times New Roman", "font_cs": "Cambria"},
+            "paragraph_properties": {},
+        },
+    }))
+
+    assert ("style.font.NameBi", "Cambria") in log
 
 
 def test_repeated_paragraph_properties_are_not_reset_after_new_paragraph_inherits_them():

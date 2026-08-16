@@ -598,6 +598,7 @@ class InteractiveWordController:
             if "strike" in run_props: _retry_setattr(font, "StrikeThrough", self._word_bool(run_props["strike"]))
             font_name = run_props.get("font_ascii") or run_props.get("font_hansi")
             if font_name: _retry_setattr(font, "Name", str(font_name))
+            if run_props.get("font_cs"): _retry_setattr(font, "NameBi", str(run_props["font_cs"]))
             if run_props.get("size_half_points") is not None: _retry_setattr(font, "Size", self._half_points_to_points(run_props["size_half_points"]))
             color = run_props.get("color")
             if color and str(color).lower() not in {"auto", "none"}: _retry_setattr(font, "Color", self._word_color(str(color)))
@@ -710,11 +711,7 @@ class InteractiveWordController:
         self._post_table_paragraph_active = False
 
     def _event_InsertTab(self, event: ReconstructionEvent) -> None:
-        target = self._require_range()
-        _retry_rejected_com_call(lambda: target.InsertAfter("\t"))
-        self._collapse_end()
-        self._page_break_continuation_pending = False
-        self._post_table_paragraph_active = False
+        self._insert_text("\t")
 
     def _event_InsertLineBreak(self, event: ReconstructionEvent) -> None:
         target = self._require_range()

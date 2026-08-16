@@ -316,6 +316,81 @@ def test_source_footer_parts_and_reference_types_are_restored(tmp_path):
         assert len(root.xpath("//*[local-name()='footerReference' and @*[local-name()='type']='even']")) == 0
 
 
+def test_relationship_free_source_header_story_is_restored_after_word_updates_field(tmp_path):
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    document = b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body/></w:document>"
+    source_header = (
+        b"<w:hdr xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:p>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r><w:r><w:instrText> STYLEREF \"Heading 1\" </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>6. Results</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='end'/></w:r></w:p></w:hdr>"
+    )
+    output_header = source_header.replace(b"6. Results", b"Appendices")
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document)
+        archive.writestr("word/header1.xml", source_header)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document)
+        archive.writestr("word/header1.xml", output_header)
+
+    restored = InteractiveRebuildService._restore_relationship_free_source_headers(
+        output, source, {"word/header1.xml"}
+    )
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        assert archive.read("word/header1.xml") == source_header
+
+
+def test_source_header_with_relationships_is_not_replaced(tmp_path):
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    document = b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body/></w:document>"
+    relationships = b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'/>"
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document)
+        archive.writestr("word/header1.xml", b"source header")
+        archive.writestr("word/_rels/header1.xml.rels", relationships)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document)
+        archive.writestr("word/header1.xml", b"output header")
+        archive.writestr("word/_rels/header1.xml.rels", relationships)
+
+    restored = InteractiveRebuildService._restore_relationship_free_source_headers(
+        output, source, {"word/header1.xml"}
+    )
+
+    assert restored == 0
+    with ZipFile(output) as archive:
+        assert archive.read("word/header1.xml") == b"output header"
+
+
+def test_nested_source_header_relationship_path_is_not_mistaken_for_relationship_free(tmp_path):
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    document = b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body/></w:document>"
+    relationships = b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'/>"
+    header_part = "word/headers/header1.xml"
+    relationship_part = "word/headers/_rels/header1.xml.rels"
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document)
+        archive.writestr(header_part, b"source header")
+        archive.writestr(relationship_part, relationships)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document)
+        archive.writestr(header_part, b"output header")
+        archive.writestr(relationship_part, relationships)
+
+    restored = InteractiveRebuildService._restore_relationship_free_source_headers(
+        output, source, {header_part}
+    )
+
+    assert restored == 0
+    with ZipFile(output) as archive:
+        assert archive.read(header_part) == b"output header"
+
+
 def test_source_field_instructions_are_restored_after_word_save(tmp_path):
     from lxml import etree
 
@@ -340,6 +415,279 @@ def test_source_field_instructions_are_restored_after_word_save(tmp_path):
     with ZipFile(output) as archive:
         root = etree.fromstring(archive.read("word/document.xml"))
         assert root.xpath("string(//*[local-name()='instrText'])") == 'TOC \\o "1-3"'
+
+
+def test_word_simple_field_is_restored_to_source_complex_field_structure(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r>"
+        b"<w:r><w:instrText xml:space='preserve'> REF ref_tab_1 \\h </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r>"
+        b"<w:r><w:t>SOURCE RESULT</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='end'/></w:r>"
+        b"</w:p></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p>"
+        b"<w:fldSimple w:instr=' REF ref_tab_1 \\h \\* MERGEFORMAT '>"
+        b"<w:r><w:rPr><w:b/></w:rPr><w:t>OUTPUT RESULT</w:t></w:r>"
+        b"</w:fldSimple></w:p></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_source_field_instructions(output, source)
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    assert not root.xpath("//w:fldSimple", namespaces=ns)
+    assert [
+        node.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}fldCharType")
+        for node in root.xpath("//w:fldChar", namespaces=ns)
+    ] == ["begin", "separate", "end"]
+    assert root.xpath("string(//w:instrText)", namespaces=ns) == " REF ref_tab_1 \\h "
+    assert root.xpath("string(//w:fldChar[@w:fldCharType='separate']/following::w:t[1])", namespaces=ns) == "OUTPUT RESULT"
+    assert root.xpath("boolean(//w:t[text()='OUTPUT RESULT']/../w:rPr/w:b)", namespaces=ns)
+
+
+def test_nested_word_simple_fields_are_both_restored_to_complex_structure(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r>"
+        b"<w:r><w:instrText> IF OUTER </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r>"
+        b"<w:r><w:instrText> REF INNER </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r>"
+        b"<w:r><w:t>SOURCE INNER</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='end'/></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='end'/></w:r>"
+        b"</w:p></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p>"
+        b"<w:fldSimple w:instr=' IF OUTER \\* MERGEFORMAT '>"
+        b"<w:fldSimple w:instr=' REF INNER \\* MERGEFORMAT '>"
+        b"<w:r><w:t>OUTPUT INNER</w:t></w:r>"
+        b"</w:fldSimple></w:fldSimple>"
+        b"</w:p></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_source_field_instructions(output, source)
+
+    assert restored == 2
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    assert not root.xpath("//w:fldSimple", namespaces=ns)
+    assert len(root.xpath("//w:fldChar[@w:fldCharType='begin']", namespaces=ns)) == 2
+    assert root.xpath("string(//w:t[text()='OUTPUT INNER'])", namespaces=ns) == "OUTPUT INNER"
+
+
+def test_split_field_instructions_keep_field_alignment_and_source_run_structure(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r>"
+        b"<w:r><w:instrText> REF </w:instrText></w:r><w:r><w:instrText>first </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>ONE</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='end'/></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r>"
+        b"<w:r><w:instrText> REF second </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>TWO</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='end'/></w:r>"
+        b"</w:p></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r>"
+        b"<w:r><w:instrText> REF first \\* MERGEFORMAT </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>OUTPUT ONE</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='end'/></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r>"
+        b"<w:r><w:instrText> REF second \\* MERGEFORMAT </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>OUTPUT TWO</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='end'/></w:r>"
+        b"</w:p></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_source_field_instructions(output, source)
+
+    assert restored == 2
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    assert root.xpath("//w:instrText/text()", namespaces=ns) == [" REF ", "first ", " REF second "]
+    assert root.xpath("//w:t/text()", namespaces=ns) == ["OUTPUT ONE", "OUTPUT TWO"]
+
+
+def test_simple_field_expansion_preserves_source_field_flags_run_formatting_and_output_tail(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p>"
+        b"<w:r><w:rPr><w:b/></w:rPr><w:fldChar w:fldCharType='begin' w:fldLock='true' w:dirty='true'/></w:r>"
+        b"<w:r><w:rPr><w:i/></w:rPr><w:instrText> REF locked </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r>"
+        b"<w:r><w:t>SOURCE</w:t></w:r><w:r><w:fldChar w:fldCharType='end'/></w:r>"
+        b"</w:p></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p>"
+        b"<w:fldSimple w:instr=' REF locked \\* MERGEFORMAT '><w:r><w:t>OUTPUT</w:t></w:r></w:fldSimple>TAIL"
+        b"</w:p></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_source_field_instructions(output, source)
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    begin = root.xpath("//w:fldChar[@w:fldCharType='begin']", namespaces=ns)[0]
+    assert begin.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}fldLock") == "true"
+    assert begin.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}dirty") == "true"
+    assert begin.xpath("boolean(../w:rPr/w:b)", namespaces=ns)
+    assert root.xpath("boolean(//w:instrText/../w:rPr/w:i)", namespaces=ns)
+    assert root.xpath("string(//w:t)", namespaces=ns) == "OUTPUT"
+    end_run = root.xpath("//w:fldChar[@w:fldCharType='end']/..", namespaces=ns)[0]
+    assert end_run.tail == "TAIL"
+
+
+def test_field_restoration_rejects_unmatched_field_topology(tmp_path):
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r><w:r><w:instrText> REF one </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>ONE</w:t></w:r><w:r><w:fldChar w:fldCharType='end'/></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r><w:r><w:instrText> REF two </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>TWO</w:t></w:r><w:r><w:fldChar w:fldCharType='end'/></w:r>"
+        b"</w:p></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p>"
+        b"<w:fldSimple w:instr=' REF one \\* MERGEFORMAT '><w:r><w:t>OUTPUT</w:t></w:r></w:fldSimple>"
+        b"</w:p></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_source_field_instructions(output, source)
+
+    assert restored == 0
+    with ZipFile(output) as archive:
+        assert archive.read("word/document.xml") == output_xml
+
+
+def test_cross_paragraph_field_does_not_block_restoration_of_other_fields(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body>"
+        b"<w:p><w:r><w:fldChar w:fldCharType='begin'/></w:r><w:r><w:instrText> TOC </w:instrText></w:r></w:p>"
+        b"<w:p><w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>SOURCE TOC</w:t></w:r></w:p>"
+        b"<w:p><w:r><w:fldChar w:fldCharType='end'/></w:r></w:p>"
+        b"<w:p><w:r><w:fldChar w:fldCharType='begin'/></w:r><w:r><w:instrText> REF flat </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>SOURCE FLAT</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='end'/></w:r></w:p>"
+        b"</w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body>"
+        b"<w:p><w:r><w:fldChar w:fldCharType='begin'/></w:r><w:r><w:instrText> TOC \\* MERGEFORMAT </w:instrText></w:r></w:p>"
+        b"<w:p><w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>OUTPUT TOC</w:t></w:r></w:p>"
+        b"<w:p><w:r><w:fldChar w:fldCharType='end'/></w:r></w:p>"
+        b"<w:p><w:fldSimple w:instr=' REF flat \\* MERGEFORMAT '><w:r><w:t>OUTPUT FLAT</w:t></w:r></w:fldSimple></w:p>"
+        b"</w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_source_field_instructions(output, source)
+
+    assert restored == 2
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    assert root.xpath("//w:instrText/text()", namespaces=ns) == [" TOC ", " REF flat "]
+    assert not root.xpath("//w:fldSimple", namespaces=ns)
+    assert root.xpath("//w:t/text()", namespaces=ns) == ["OUTPUT TOC", "OUTPUT FLAT"]
+
+
+def test_outer_field_does_not_overwrite_nested_output_result_inside_instruction(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r><w:r><w:instrText> IF </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r><w:r><w:instrText> REF nested </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>SOURCE INNER</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='end'/></w:r><w:r><w:instrText> = 1 </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>SOURCE OUTER</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='end'/></w:r>"
+        b"</w:p></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r><w:r><w:instrText> IF \\* MERGEFORMAT </w:instrText></w:r>"
+        b"<w:fldSimple w:instr=' REF nested \\* MERGEFORMAT '><w:r><w:t>OUTPUT INNER</w:t></w:r></w:fldSimple>"
+        b"<w:r><w:instrText> = 1 </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>OUTPUT OUTER</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='end'/></w:r>"
+        b"</w:p></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_source_field_instructions(output, source)
+
+    assert restored == 2
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    assert not root.xpath("//w:fldSimple", namespaces=ns)
+    assert root.xpath("//w:t/text()", namespaces=ns) == ["OUTPUT INNER", "OUTPUT OUTER"]
+    assert root.xpath("//w:instrText/text()", namespaces=ns) == [" IF ", " REF nested ", " = 1 "]
 
 
 def test_source_autofit_table_layout_is_restored(tmp_path):
