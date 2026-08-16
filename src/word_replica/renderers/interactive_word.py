@@ -707,6 +707,8 @@ class InteractiveWordController:
     def _event_InsertPageBreak(self, event: ReconstructionEvent) -> None:
         target = self._require_range()
         _retry_rejected_com_call(lambda: target.InsertAfter("\f"))
+        if self._active_run_properties is not None:
+            self._apply_post_insert_run_properties(self._active_run_properties, "\f")
         self._collapse_end()
         self._page_break_continuation_pending = False
         self._post_table_paragraph_active = False

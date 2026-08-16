@@ -71,6 +71,33 @@ def test_semantic_tab_and_breaks_are_dedicated_atomic_calls():
     assert fake.break_calls == [6]
 
 
+def test_page_break_reapplies_complex_script_font_after_word_resets_it():
+    class WordLikePageBreakFont:
+        def __init__(self):
+            self.Name = None
+            self.NameBi = None
+
+    class WordLikePageBreakRange(FakeWordRange):
+        def __init__(self):
+            super().__init__()
+            self.Font = WordLikePageBreakFont()
+
+        def InsertAfter(self, value):
+            super().InsertAfter(value)
+            if value == "\f":
+                self.Font.NameBi = "Times New Roman"
+
+    fake = WordLikePageBreakRange()
+    controller = InteractiveWordController.for_testing(active_range=fake)
+    controller.execute_event(ReconstructionEvent("ApplyRunProperties", "r1", {
+        "font_ascii": "Times New Roman",
+        "font_cs": "Cambria",
+    }))
+    controller.execute_event(ReconstructionEvent("InsertPageBreak", "r1", {}))
+
+    assert fake.Font.NameBi == "Cambria"
+
+
 def test_interactive_renderer_has_no_forbidden_input_automation_path():
     source = Path("src/word_replica/renderers/interactive_word.py").read_text(encoding="utf-8")
     forbidden = ("Send" + "Keys", "win32" + "clipboard", "pyauto" + "gui", "keyboard" + ".write", "Selection" + ".TypeText")
