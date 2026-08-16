@@ -246,6 +246,109 @@ def test_explicit_run_character_spacing_is_restored_after_word_round_trip(tmp_pa
         assert root.xpath("//*[local-name()='spacing']/@*[local-name()='val']") == ["18"]
 
 
+def test_explicit_run_font_names_are_restored_only_for_safely_paired_runs(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body>"
+        b"<w:p><w:r><w:rPr><w:rFonts w:ascii='Times New Roman' w:hAnsi='Times New Roman'/></w:rPr>"
+        b"<w:t>Heading</w:t></w:r></w:p>"
+        b"<w:p><w:r><w:rPr><w:rFonts w:ascii='Calibri'/></w:rPr><w:t>Merged </w:t></w:r>"
+        b"<w:r><w:rPr><w:rFonts w:ascii='Calibri'/></w:rPr><w:t>text</w:t></w:r></w:p>"
+        b"</w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body>"
+        b"<w:p><w:r><w:t>Heading</w:t></w:r></w:p>"
+        b"<w:p><w:r><w:t>Merged text</w:t></w:r></w:p>"
+        b"</w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+        archive.writestr("word/unchanged.bin", b"unchanged")
+
+    restored = InteractiveRebuildService._restore_explicit_run_font_names(output, source)
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+        assert archive.read("word/unchanged.bin") == b"unchanged"
+    paragraphs = root.xpath("//*[local-name()='body']/*[local-name()='p']")
+    assert paragraphs[0].xpath(
+        "./*[local-name()='r']/*[local-name()='rPr']/*[local-name()='rFonts']"
+        "/@*[local-name()='ascii']"
+    ) == ["Times New Roman"]
+    assert paragraphs[0].xpath(
+        "./*[local-name()='r']/*[local-name()='rPr']/*[local-name()='rFonts']"
+        "/@*[local-name()='hAnsi']"
+    ) == ["Times New Roman"]
+    assert not paragraphs[1].xpath(".//*[local-name()='rFonts']")
+
+
+def test_explicit_run_font_names_refuse_mismatched_paragraph_topology(tmp_path):
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body>"
+        b"<w:p><w:r><w:rPr><w:rFonts w:ascii='Calibri'/></w:rPr><w:t>Repeated</w:t></w:r></w:p>"
+        b"<w:p><w:r><w:rPr><w:rFonts w:ascii='Times New Roman'/></w:rPr><w:t>Repeated</w:t></w:r></w:p>"
+        b"</w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:r><w:t>Repeated</w:t></w:r></w:p></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+    before = output.read_bytes()
+
+    restored = InteractiveRebuildService._restore_explicit_run_font_names(output, source)
+
+    assert restored == 0
+    assert output.read_bytes() == before
+
+
+def test_explicit_run_font_names_follow_run_property_schema_order(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:r><w:rPr><w:rFonts w:ascii='Times New Roman'/></w:rPr>"
+        b"<w:t>Heading</w:t></w:r></w:p></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:r><w:rPr><w:rStyle w:val='Emphasis'/><w:b/></w:rPr>"
+        b"<w:t>Heading</w:t></w:r></w:p></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_explicit_run_font_names(output, source)
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    run_property_names = [
+        etree.QName(child).localname
+        for child in root.xpath("//*[local-name()='rPr']")[0]
+    ]
+    assert run_property_names == ["rStyle", "rFonts", "b"]
+
+
 def test_empty_source_runs_are_restored_to_saved_package(tmp_path):
     from lxml import etree
 
@@ -1243,6 +1346,101 @@ def test_finalization_removes_unexpected_header_shape_defaults_and_audits_it(tmp
     events = [
         row for row in audit_rows
         if row.get("event_type") == "UNEXPECTED_HEADER_SHAPE_DEFAULTS_REMOVED"
+    ]
+    assert events[-1]["payload"] == {"count": 1}
+
+
+def test_finalization_restores_explicit_run_font_names_and_audits_it(tmp_path):
+    import json
+    import shutil
+
+    from lxml import etree
+    from word_replica.services.checkpoints import CheckpointManager
+
+    source = build_plain_text(tmp_path / "source.docx")
+    with ZipFile(source) as archive:
+        source_parts = {name: archive.read(name) for name in archive.namelist()}
+    namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    ns = {"w": namespace}
+    source_root = etree.fromstring(source_parts["word/document.xml"])
+    source_run = source_root.xpath("//w:body//w:r[w:t][1]", namespaces=ns)[0]
+    source_rpr = etree.Element(f"{{{namespace}}}rPr")
+    source_fonts = etree.SubElement(source_rpr, f"{{{namespace}}}rFonts")
+    source_fonts.set(f"{{{namespace}}}ascii", "Times New Roman")
+    source_fonts.set(f"{{{namespace}}}hAnsi", "Times New Roman")
+    source_run.insert(0, source_rpr)
+    source_parts["word/document.xml"] = etree.tostring(
+        source_root, xml_declaration=True, encoding="UTF-8", standalone=True
+    )
+    rewritten_source = tmp_path / "source-with-fonts.docx"
+    with ZipFile(rewritten_source, "w", ZIP_DEFLATED) as archive:
+        for part_name, data in source_parts.items():
+            archive.writestr(part_name, data)
+    rewritten_source.replace(source)
+
+    store = ProjectStore(tmp_path / "projects")
+    options = RebuildOptions(reconstruction_mode=ReconstructionMode.INTERACTIVE)
+    paths = store.create_project(source, options)
+    audit = AuditLog(paths.logs_dir / "audit.jsonl")
+    service = InteractiveRebuildService(
+        project_store=store,
+        word_probe=lambda: True,
+        run_l4_qa=False,
+    )
+    prepared = service.prepare(source, options, paths, audit)
+    output = paths.output_dir / "reconstructed.docx"
+    save_manager = CheckpointManager(paths.logs_dir / "save_history.jsonl", audit)
+
+    class Renderer:
+        def set_custom_property(self, name, value):
+            pass
+
+        def save(self, path):
+            shutil.copy2(source, path)
+            with ZipFile(path) as archive:
+                parts = {name: archive.read(name) for name in archive.namelist()}
+            root = etree.fromstring(parts["word/document.xml"])
+            run = root.xpath("//w:body//w:r[w:t][1]", namespaces=ns)[0]
+            run.remove(run.find(f"{{{namespace}}}rPr"))
+            parts["word/document.xml"] = etree.tostring(
+                root, xml_declaration=True, encoding="UTF-8", standalone=True
+            )
+            mutated = tmp_path / "mutated-fonts.docx"
+            with ZipFile(mutated, "w", ZIP_DEFLATED) as archive:
+                for part_name, data in parts.items():
+                    archive.writestr(part_name, data)
+            mutated.replace(path)
+
+        def current_state_snapshot(self):
+            return {"story": "body", "range_start": 0, "range_end": 0}
+
+        def close(self):
+            pass
+
+    result = service._finalize_qa(
+        prepared,
+        output,
+        save_manager,
+        audit,
+        Renderer(),
+    )
+
+    assert result.status is RunStatus.PASS
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    restored_fonts = root.xpath(
+        "//w:body//w:r[w:t][1]/w:rPr/w:rFonts", namespaces=ns
+    )
+    assert len(restored_fonts) == 1
+    assert restored_fonts[0].get(f"{{{namespace}}}ascii") == "Times New Roman"
+    audit_rows = [
+        json.loads(line)
+        for line in (paths.logs_dir / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    events = [
+        row for row in audit_rows
+        if row.get("event_type") == "EXPLICIT_RUN_FONT_NAMES_RESTORED"
     ]
     assert events[-1]["payload"] == {"count": 1}
 

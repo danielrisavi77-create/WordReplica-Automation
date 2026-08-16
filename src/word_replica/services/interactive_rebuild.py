@@ -624,6 +624,86 @@ class InteractiveRebuildService:
         return restored
 
     @staticmethod
+    def _restore_explicit_run_font_names(output_path: Path, source_path: Path) -> int:
+        from lxml import etree
+
+        namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        ns = {"w": namespace}
+        with ZipFile(source_path) as source_archive:
+            source_root = etree.fromstring(source_archive.read("word/document.xml"))
+        with ZipFile(output_path) as output_archive:
+            parts = {name: output_archive.read(name) for name in output_archive.namelist()}
+        output_root = etree.fromstring(parts["word/document.xml"])
+        source_paragraphs = source_root.xpath("//w:body//w:p", namespaces=ns)
+        output_paragraphs = output_root.xpath("//w:body//w:p", namespaces=ns)
+        if len(source_paragraphs) != len(output_paragraphs):
+            return 0
+        source_paragraph_texts = [
+            "".join(paragraph.xpath(".//w:t/text()", namespaces=ns))
+            for paragraph in source_paragraphs
+        ]
+        output_paragraph_texts = [
+            "".join(paragraph.xpath(".//w:t/text()", namespaces=ns))
+            for paragraph in output_paragraphs
+        ]
+        if source_paragraph_texts != output_paragraph_texts:
+            return 0
+        restored = 0
+        for source_paragraph, output_paragraph in zip(source_paragraphs, output_paragraphs):
+            source_runs = source_paragraph.findall("w:r", namespaces=ns)
+            output_runs = output_paragraph.findall("w:r", namespaces=ns)
+            if len(source_runs) != len(output_runs):
+                continue
+            source_texts = ["".join(run.xpath(".//w:t/text()", namespaces=ns)) for run in source_runs]
+            output_texts = ["".join(run.xpath(".//w:t/text()", namespaces=ns)) for run in output_runs]
+            if source_texts != output_texts:
+                continue
+            for source_run, output_run, source_text in zip(source_runs, output_runs, source_texts):
+                if not source_text:
+                    continue
+                source_fonts = source_run.find("w:rPr/w:rFonts", namespaces=ns)
+                if source_fonts is None:
+                    continue
+                output_rpr = output_run.find("w:rPr", namespaces=ns)
+                output_fonts = (
+                    output_rpr.find("w:rFonts", namespaces=ns) if output_rpr is not None else None
+                )
+                if output_fonts is not None and dict(output_fonts.attrib) == dict(source_fonts.attrib):
+                    continue
+                copied = etree.fromstring(etree.tostring(source_fonts))
+                if output_rpr is None:
+                    output_rpr = etree.Element(f"{{{namespace}}}rPr")
+                    output_run.insert(0, output_rpr)
+                if output_fonts is not None:
+                    output_rpr.replace(output_fonts, copied)
+                else:
+                    output_style = output_rpr.find("w:rStyle", namespaces=ns)
+                    insertion_index = (
+                        list(output_rpr).index(output_style) + 1
+                        if output_style is not None
+                        else 0
+                    )
+                    output_rpr.insert(insertion_index, copied)
+                restored += 1
+        if not restored:
+            return 0
+        parts["word/document.xml"] = etree.tostring(
+            output_root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{output_path.name}.", suffix=".tmp", dir=output_path.parent
+        )
+        os.close(fd)
+        try:
+            with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
+                for name, data in parts.items():
+                    archive.writestr(name, data)
+            Path(temporary_name).replace(output_path)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return restored
+
+    @staticmethod
     def _restore_empty_runs(output_path: Path, source_path: Path) -> int:
         from lxml import etree
 
@@ -1266,6 +1346,9 @@ class InteractiveRebuildService:
         restored_run_character_spacing = self._restore_explicit_run_character_spacing(
             output_path, Path(prepared.source_path)
         )
+        restored_run_font_names = self._restore_explicit_run_font_names(
+            output_path, Path(prepared.source_path)
+        )
         restored_empty_runs = self._restore_empty_runs(output_path, Path(prepared.source_path))
         restored_column_space = self._restore_explicit_column_space(
             output_path, Path(prepared.source_path)
@@ -1289,7 +1372,7 @@ class InteractiveRebuildService:
         restored_table_layout = self._restore_source_table_layout(
             output_path, Path(prepared.source_path)
         )
-        if removed_header_shape_defaults or removed_bookmarks or removed_headers or restored_header_stories or removed_template_spacing or restored_alignment or restored_run_character_spacing or restored_empty_runs or restored_column_space or restored_page_number_start or restored_defaults or restored_footer_stories or restored_field_instructions or restored_table_layout:
+        if removed_header_shape_defaults or removed_bookmarks or removed_headers or restored_header_stories or removed_template_spacing or restored_alignment or restored_run_character_spacing or restored_run_font_names or restored_empty_runs or restored_column_space or restored_page_number_start or restored_defaults or restored_footer_stories or restored_field_instructions or restored_table_layout:
             final_checkpoint = replace(
                 final_checkpoint,
                 output_sha256=sha256_file(output_path),
@@ -1312,6 +1395,8 @@ class InteractiveRebuildService:
             audit.append("EXPLICIT_PARAGRAPH_ALIGNMENT_RESTORED", {"count": restored_alignment})
         if restored_run_character_spacing:
             audit.append("EXPLICIT_RUN_CHARACTER_SPACING_RESTORED", {"count": restored_run_character_spacing})
+        if restored_run_font_names:
+            audit.append("EXPLICIT_RUN_FONT_NAMES_RESTORED", {"count": restored_run_font_names})
         if restored_empty_runs:
             audit.append("EMPTY_RUNS_RESTORED", {"count": restored_empty_runs})
         if restored_column_space:
