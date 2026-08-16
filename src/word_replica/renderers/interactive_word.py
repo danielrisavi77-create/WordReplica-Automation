@@ -758,11 +758,16 @@ class InteractiveWordController:
             Text=str(event.payload.get("instruction", "")), PreserveFormatting=True,
         )
         cached_result = event.payload.get("cached_result")
+        cached_text = None
         if cached_result is not None:
-            with suppress(Exception): field.Result.Text = str(cached_result)
+            cached_text = str(cached_result)
+            with suppress(Exception): field.Result.Text = cached_text
         # Do not refresh a field while later source content may not exist yet.
         # The source cached result remains visible and the output remains a real field.
         result = self._duplicate_range(field.Result)
+        if cached_text is not None and self._active_run_properties is not None:
+            self.active_range = result
+            self._apply_post_insert_run_properties(self._active_run_properties, cached_text)
         with suppress(Exception): result.Collapse(WD_COLLAPSE_END)
         self.active_range = result
 

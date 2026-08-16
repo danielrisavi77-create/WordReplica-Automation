@@ -972,11 +972,13 @@ def test_custom_document_property_add_uses_word_compatible_positional_arguments(
     assert custom.calls == [("WordReplicaActualSaveCount", False, 4, "1")]
 
 
-def test_create_field_seeds_cached_result_without_refreshing_mid_reconstruction():
+def test_create_field_seeds_cached_result_and_reapplies_active_run_formatting_without_refresh():
     from types import SimpleNamespace
 
     class ResultRange:
-        def __init__(self): self.Text = ""; self.Start=4; self.End=4; self.collapse=[]
+        def __init__(self):
+            self.Text = ""; self.Start=4; self.End=4; self.collapse=[]
+            self.Font = SimpleNamespace(Bold=-1, Name=None, NameBi="Times New Roman")
         @property
         def Duplicate(self): return self
         def Collapse(self, direction): self.collapse.append(direction)
@@ -988,13 +990,20 @@ def test_create_field_seeds_cached_result_without_refreshing_mid_reconstruction(
         def Add(self, Range, Type, Text, PreserveFormatting):
             self.created=Field(); self.args=(Range,Type,Text,PreserveFormatting); return self.created
     fields=Fields(); document=SimpleNamespace(Fields=fields)
-    active=SimpleNamespace(Start=4, End=4)
+    active=FormattingRange(); active.Start=4; active.End=4
     controller=InteractiveWordController.for_testing(active_range=active); controller.document=document
+    controller.execute_event(ReconstructionEvent("ApplyRunProperties", "f1", {
+        "bold": False,
+        "font_ascii": "Times New Roman",
+        "font_cs": "Cambria",
+    }))
     controller.execute_event(ReconstructionEvent("CreateField", "f1", {
         "instruction": 'TOC \\o "1-3"', "cached_result": "Chapter One .... 1"
     }))
     assert fields.created.Result.Text == "Chapter One .... 1"
     assert fields.created.updated == 0
+    assert fields.created.Result.Font.Bold == 0
+    assert fields.created.Result.Font.NameBi == "Cambria"
     assert controller.active_range is fields.created.Result
 
 class CallableComRange(FakeWordRange):

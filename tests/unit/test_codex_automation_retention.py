@@ -28,3 +28,19 @@ def test_retention_keeps_latest_success_two_failures_and_pinned(tmp_path):
     assert not (root / "002").exists()
     assert not (root / "003").exists()
     assert not (root / "004").exists()
+
+
+def test_retention_ignores_non_run_diagnostic_directories(tmp_path):
+    root = tmp_path / "diagnostics"
+    root.mkdir()
+    older_failure = _run(root, "20260816T010000Z_aaaaaaaa", full_pass=False)
+    latest_failure = _run(root, "20260816T020000Z_bbbbbbbb", full_pass=False)
+    pytest_temp = root / "pytest-full-field-format"
+    pytest_temp.mkdir()
+
+    kept = prune_diagnostics(root, keep_success=0, keep_failures=1)
+
+    assert not older_failure.exists()
+    assert latest_failure.exists()
+    assert pytest_temp.exists()
+    assert pytest_temp not in kept
