@@ -669,6 +669,7 @@ class FakeInlineImage:
         self.log = log
         self.Width = None; self.Height = None; self.LockAspectRatio = None
         self.Range = FormattingRange()
+        object.__setattr__(self.Range.Font, "NameBi", "Times New Roman")
     def ConvertToShape(self):
         self.log.append(("convert_to_shape",))
         return FakeShape(self.log)
@@ -700,16 +701,39 @@ class FakeShape:
 
 
 class FakeInlineShapes:
-    def __init__(self, log): self.log=log
+    def __init__(self, log):
+        self.log = log
+        self.last_inline = None
     def AddPicture(self, **kwargs):
         self.log.append(("add_picture", kwargs["FileName"]))
-        return FakeInlineImage(self.log)
+        self.last_inline = FakeInlineImage(self.log)
+        return self.last_inline
 
 
 class FakeImageDocument(FakeDocument):
     def __init__(self, log):
         super().__init__(log)
         self.InlineShapes = FakeInlineShapes(log)
+
+
+def test_insert_image_preserves_active_complex_script_font_on_image_range():
+    log = []
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = FakeImageDocument(log)
+    controller.set_asset_resolver(lambda asset_id: Path("C:/tmp/image.png"))
+
+    controller.execute_event(ReconstructionEvent(
+        "ApplyRunProperties",
+        "d1",
+        {"font_ascii": "Times New Roman", "font_cs": "Cambria"},
+    ))
+    controller.execute_event(ReconstructionEvent(
+        "InsertImage",
+        "d1",
+        {"asset_id": "a1", "representation": "inline", "source_path": "word/media/image1.png"},
+    ))
+
+    assert controller.document.InlineShapes.last_inline.Range.Font.NameBi == "Cambria"
 
 
 def test_image_is_created_before_stepwise_geometry_mutations():

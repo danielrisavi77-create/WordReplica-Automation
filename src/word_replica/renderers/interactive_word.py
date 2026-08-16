@@ -897,6 +897,11 @@ class InteractiveWordController:
         inline = self.document.InlineShapes.AddPicture(
             FileName=str(asset_path), LinkToFile=False, SaveWithDocument=True, Range=self._require_range()
         )
+        font_cs = (self._active_run_properties or {}).get("font_cs")
+        if font_cs:
+            with suppress(Exception):
+                image_font = _retry_getattr(_retry_getattr(inline, "Range"), "Font")
+                _retry_setattr(image_font, "NameBi", str(font_cs))
         after_range = self._duplicate_range(inline.Range)
         with suppress(Exception): after_range.Collapse(WD_COLLAPSE_END)
         representation = str(event.payload.get("representation", "inline"))
