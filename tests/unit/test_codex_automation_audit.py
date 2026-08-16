@@ -92,3 +92,52 @@ def test_visual_gate_allows_measured_word_text_rasterization_noise():
     gate = build_visual_gate(render, changed_pixel_tolerance=0.001, mae_tolerance=0.25)
 
     assert gate.passed is True
+
+
+def test_visual_gate_uses_blurred_mae_to_separate_word_antialiasing_from_layout_error():
+    from word_replica.qa.render import RenderQaResult, VisualMetric
+    from scripts.codex_automation.audit import build_visual_gate
+
+    render = RenderQaResult(
+        available=True,
+        within_tolerance=False,
+        page_count_match=True,
+        source_page_count=2,
+        rebuilt_page_count=2,
+        metrics=[
+            VisualMetric(
+                True,
+                0.0287,
+                1.804,
+                (1191, 1684),
+                (1191, 1684),
+                blurred_mean_absolute_error=0.914,
+            ),
+            VisualMetric(
+                True,
+                0.0885,
+                7.7,
+                (1191, 1684),
+                (1191, 1684),
+                blurred_mean_absolute_error=4.8,
+            ),
+        ],
+    )
+
+    gate = build_visual_gate(render, changed_pixel_tolerance=0.001, mae_tolerance=0.25)
+
+    assert gate.passed is False
+    assert gate.first_divergence["page"] == 2
+    assert gate.first_divergence["blurred_mean_absolute_error"] == 4.8
+    assert gate.details["blurred_antialiasing_policy"] == {
+        "changed_pixel_ratio_allowance": 0.04,
+        "blurred_mae_allowance": 1.0,
+        "gaussian_blur_radius": 1.0,
+    }
+    assert gate.details["blur_assisted_pages"] == [1]
+    assert gate.details["acceptance_mode_counts"] == {
+        "strict": 0,
+        "legacy_antialiasing": 0,
+        "blurred_antialiasing": 1,
+        "failed": 1,
+    }

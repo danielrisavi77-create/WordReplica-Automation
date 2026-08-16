@@ -237,28 +237,58 @@ def build_model_gates(source_model, output_model) -> dict[str, GateResult]:
 
 
 def build_visual_gate(render_result, *, changed_pixel_tolerance: float, mae_tolerance: float) -> GateResult:
+    from word_replica.qa.render import ANTIALIASING_BLUR_RADIUS
+
     antialiasing_ratio_allowance = max(changed_pixel_tolerance, 0.03)
     antialiasing_mae_allowance = max(mae_tolerance, 1.0)
+    blurred_antialiasing_ratio_allowance = max(changed_pixel_tolerance, 0.04)
+    blurred_antialiasing_mae_allowance = max(mae_tolerance, 1.0)
 
-    def within_visual_tolerance(metric) -> bool:
+    def acceptance_mode(metric) -> str | None:
         if not metric.same_dimensions:
-            return False
+            return None
         strict = metric.changed_pixel_ratio <= changed_pixel_tolerance and metric.mean_absolute_error <= mae_tolerance
+        if strict:
+            return "strict"
         antialiasing = metric.changed_pixel_ratio <= antialiasing_ratio_allowance and metric.mean_absolute_error <= antialiasing_mae_allowance
-        return strict or antialiasing
+        if antialiasing:
+            return "legacy_antialiasing"
+        blurred_mae = getattr(metric, "blurred_mean_absolute_error", None)
+        blurred_antialiasing = (
+            blurred_mae is not None
+            and metric.changed_pixel_ratio <= blurred_antialiasing_ratio_allowance
+            and blurred_mae <= blurred_antialiasing_mae_allowance
+        )
+        return "blurred_antialiasing" if blurred_antialiasing else None
 
     first = None
+    acceptance_mode_counts = {
+        "strict": 0,
+        "legacy_antialiasing": 0,
+        "blurred_antialiasing": 0,
+        "failed": 0,
+    }
+    blur_assisted_pages = []
     for index, metric in enumerate(getattr(render_result, "metrics", []) or [], start=1):
-        if not within_visual_tolerance(metric):
+        mode = acceptance_mode(metric)
+        if mode is None:
+            acceptance_mode_counts["failed"] += 1
+        else:
+            acceptance_mode_counts[mode] += 1
+            if mode == "blurred_antialiasing":
+                blur_assisted_pages.append(index)
+        if mode is None and first is None:
             first = {
                 "page": index,
                 "same_dimensions": metric.same_dimensions,
                 "changed_pixel_ratio": metric.changed_pixel_ratio,
                 "mean_absolute_error": metric.mean_absolute_error,
+                "blurred_mean_absolute_error": getattr(
+                    metric, "blurred_mean_absolute_error", None
+                ),
                 "source_size": list(metric.source_size),
                 "output_size": list(metric.rebuilt_size),
             }
-            break
     if first is None and not getattr(render_result, "page_count_match", False):
         first = {
             "page": min(getattr(render_result, "source_page_count", 0), getattr(render_result, "rebuilt_page_count", 0)) + 1,
@@ -274,6 +304,17 @@ def build_visual_gate(render_result, *, changed_pixel_tolerance: float, mae_tole
             "output_page_count": getattr(render_result, "rebuilt_page_count", None),
             "changed_pixel_tolerance": changed_pixel_tolerance,
             "mae_tolerance": mae_tolerance,
+            "legacy_antialiasing_policy": {
+                "changed_pixel_ratio_allowance": antialiasing_ratio_allowance,
+                "mae_allowance": antialiasing_mae_allowance,
+            },
+            "blurred_antialiasing_policy": {
+                "changed_pixel_ratio_allowance": blurred_antialiasing_ratio_allowance,
+                "blurred_mae_allowance": blurred_antialiasing_mae_allowance,
+                "gaussian_blur_radius": ANTIALIASING_BLUR_RADIUS,
+            },
+            "acceptance_mode_counts": acceptance_mode_counts,
+            "blur_assisted_pages": blur_assisted_pages,
         },
         first_divergence=first,
     )
