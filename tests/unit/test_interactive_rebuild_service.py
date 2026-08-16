@@ -71,6 +71,74 @@ def test_unexpected_headers_are_removed_from_saved_package(tmp_path):
         assert not types.xpath("//*[local-name()='Override' and @PartName='/word/header1.xml']")
 
 
+def test_unexpected_header_shape_defaults_are_removed_when_source_omits_them(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_settings = (
+        b"<w:settings xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:compat/></w:settings>"
+    )
+    output_settings = (
+        b"<w:settings xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:hdrShapeDefaults/><w:compat/></w:settings>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/settings.xml", source_settings)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/settings.xml", output_settings)
+        archive.writestr("word/unchanged.bin", b"unchanged")
+
+    removed = InteractiveRebuildService._remove_unexpected_header_shape_defaults(output, source)
+
+    assert removed == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/settings.xml"))
+        assert archive.read("word/unchanged.bin") == b"unchanged"
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    assert not root.xpath("./w:hdrShapeDefaults", namespaces=ns)
+    assert root.xpath("./w:compat", namespaces=ns)
+
+
+def test_header_shape_defaults_are_untouched_when_source_contains_them(tmp_path):
+    settings = (
+        b"<w:settings xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:hdrShapeDefaults/><w:compat/></w:settings>"
+    )
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    for path in (source, output):
+        with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+            archive.writestr("word/settings.xml", settings)
+    before = output.read_bytes()
+
+    removed = InteractiveRebuildService._remove_unexpected_header_shape_defaults(output, source)
+
+    assert removed == 0
+    assert output.read_bytes() == before
+
+
+def test_unexpected_header_shape_defaults_are_removed_when_source_has_no_settings_part(tmp_path):
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", b"document")
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "word/settings.xml",
+            b"<w:settings xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+            b"<w:hdrShapeDefaults/></w:settings>",
+        )
+
+    removed = InteractiveRebuildService._remove_unexpected_header_shape_defaults(output, source)
+
+    assert removed == 1
+    with ZipFile(output) as archive:
+        settings = archive.read("word/settings.xml")
+    assert b"hdrShapeDefaults" not in settings
+
+
 def test_template_spacing_is_removed_when_source_paragraph_has_no_properties(tmp_path):
     from lxml import etree
 
@@ -1102,6 +1170,81 @@ def test_deferred_l4_still_seals_output_and_runs_l0_l3_without_pdf_export(tmp_pa
     assert result.save_count == 1
     assert renderer.properties["WordReplicaActualSaveCount"] == 1
     assert any(warning.code == "L4_DEFERRED" for warning in result.warnings)
+
+
+def test_finalization_removes_unexpected_header_shape_defaults_and_audits_it(tmp_path):
+    import json
+    import shutil
+
+    from lxml import etree
+    from word_replica.services.checkpoints import CheckpointManager
+
+    source = build_plain_text(tmp_path / "source.docx")
+    store = ProjectStore(tmp_path / "projects")
+    options = RebuildOptions(reconstruction_mode=ReconstructionMode.INTERACTIVE)
+    paths = store.create_project(source, options)
+    audit = AuditLog(paths.logs_dir / "audit.jsonl")
+    service = InteractiveRebuildService(
+        project_store=store,
+        word_probe=lambda: True,
+        run_l4_qa=False,
+    )
+    prepared = service.prepare(source, options, paths, audit)
+    output = paths.output_dir / "reconstructed.docx"
+    save_manager = CheckpointManager(paths.logs_dir / "save_history.jsonl", audit)
+
+    class Renderer:
+        def set_custom_property(self, name, value):
+            pass
+
+        def save(self, path):
+            shutil.copy2(source, path)
+            with ZipFile(path) as archive:
+                parts = {name: archive.read(name) for name in archive.namelist()}
+            settings = etree.fromstring(parts["word/settings.xml"])
+            namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            assert not settings.xpath(
+                "./w:hdrShapeDefaults", namespaces={"w": namespace}
+            )
+            settings.insert(0, etree.Element(f"{{{namespace}}}hdrShapeDefaults"))
+            parts["word/settings.xml"] = etree.tostring(
+                settings, xml_declaration=True, encoding="UTF-8", standalone=True
+            )
+            mutated = tmp_path / "mutated.docx"
+            with ZipFile(mutated, "w", ZIP_DEFLATED) as archive:
+                for part_name, data in parts.items():
+                    archive.writestr(part_name, data)
+            mutated.replace(path)
+
+        def current_state_snapshot(self):
+            return {"story": "body", "range_start": 0, "range_end": 0}
+
+        def close(self):
+            pass
+
+    result = service._finalize_qa(
+        prepared,
+        output,
+        save_manager,
+        audit,
+        Renderer(),
+    )
+
+    assert result.status is RunStatus.PASS
+    with ZipFile(output) as archive:
+        settings = etree.fromstring(archive.read("word/settings.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    assert not settings.xpath("./w:hdrShapeDefaults", namespaces=ns)
+    audit_rows = [
+        json.loads(line)
+        for line in (paths.logs_dir / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    events = [
+        row for row in audit_rows
+        if row.get("event_type") == "UNEXPECTED_HEADER_SHAPE_DEFAULTS_REMOVED"
+    ]
+    assert events[-1]["payload"] == {"count": 1}
 
 
 def test_live_verification_mismatch_pauses_at_saved_table_boundary(tmp_path):

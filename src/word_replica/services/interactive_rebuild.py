@@ -486,6 +486,43 @@ class InteractiveRebuildService:
         return removed
 
     @staticmethod
+    def _remove_unexpected_header_shape_defaults(output_path: Path, source_path: Path) -> int:
+        from lxml import etree
+
+        namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        ns = {"w": namespace}
+        with ZipFile(source_path) as source_archive:
+            if "word/settings.xml" in source_archive.namelist():
+                source_root = etree.fromstring(source_archive.read("word/settings.xml"))
+                if source_root.xpath("./w:hdrShapeDefaults", namespaces=ns):
+                    return 0
+        with ZipFile(output_path) as output_archive:
+            parts = {name: output_archive.read(name) for name in output_archive.namelist()}
+        if "word/settings.xml" not in parts:
+            return 0
+        output_root = etree.fromstring(parts["word/settings.xml"])
+        unexpected = output_root.xpath("./w:hdrShapeDefaults", namespaces=ns)
+        for node in unexpected:
+            output_root.remove(node)
+        if not unexpected:
+            return 0
+        parts["word/settings.xml"] = etree.tostring(
+            output_root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{output_path.name}.", suffix=".tmp", dir=output_path.parent
+        )
+        os.close(fd)
+        try:
+            with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
+                for name, data in parts.items():
+                    archive.writestr(name, data)
+            Path(temporary_name).replace(output_path)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return len(unexpected)
+
+    @staticmethod
     def _restore_explicit_paragraph_alignment(output_path: Path, source_path: Path) -> int:
         from lxml import etree
 
@@ -1202,6 +1239,9 @@ class InteractiveRebuildService:
         close = getattr(renderer, "close", None)
         if callable(close):
             close()
+        removed_header_shape_defaults = self._remove_unexpected_header_shape_defaults(
+            output_path, Path(prepared.source_path)
+        )
         removed_bookmarks = self._remove_unexpected_bookmarks(
             output_path,
             {str(bookmark.name) for bookmark in prepared.model.bookmarks},
@@ -1249,12 +1289,17 @@ class InteractiveRebuildService:
         restored_table_layout = self._restore_source_table_layout(
             output_path, Path(prepared.source_path)
         )
-        if removed_bookmarks or removed_headers or restored_header_stories or removed_template_spacing or restored_alignment or restored_run_character_spacing or restored_empty_runs or restored_column_space or restored_page_number_start or restored_defaults or restored_footer_stories or restored_field_instructions or restored_table_layout:
+        if removed_header_shape_defaults or removed_bookmarks or removed_headers or restored_header_stories or removed_template_spacing or restored_alignment or restored_run_character_spacing or restored_empty_runs or restored_column_space or restored_page_number_start or restored_defaults or restored_footer_stories or restored_field_instructions or restored_table_layout:
             final_checkpoint = replace(
                 final_checkpoint,
                 output_sha256=sha256_file(output_path),
             )
             checkpoint_store.write(final_checkpoint)
+        if removed_header_shape_defaults:
+            audit.append(
+                "UNEXPECTED_HEADER_SHAPE_DEFAULTS_REMOVED",
+                {"count": removed_header_shape_defaults},
+            )
         if removed_bookmarks:
             audit.append("UNEXPECTED_BOOKMARKS_REMOVED", {"count": removed_bookmarks})
         if removed_headers:
