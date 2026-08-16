@@ -14,6 +14,7 @@ from word_replica.renderers.word_ownership import clear_owned_word, record_owned
 
 
 WD_COLLAPSE_END = 0
+WD_CHARACTER = 1
 WD_LINE_BREAK = 6
 WD_PAGE_BREAK = 7
 WD_FORMAT_DOCX = 16
@@ -787,6 +788,10 @@ class InteractiveWordController:
             self.active_range = result
             self._apply_post_insert_run_properties(self._active_run_properties, cached_text)
         with suppress(Exception): result.Collapse(WD_COLLAPSE_END)
+        move = _retry_getattr(result, "Move", None)
+        if not callable(move):
+            raise RuntimeError("Word field result range does not support Move")
+        _retry_rejected_com_call(lambda: move(WD_CHARACTER, 1))
         self.active_range = result
 
     def _create_note(self, *, footnote: bool) -> None:

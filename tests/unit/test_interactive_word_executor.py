@@ -1017,16 +1017,63 @@ def test_custom_document_property_add_uses_word_compatible_positional_arguments(
     assert custom.calls == [("WordReplicaActualSaveCount", False, 4, "1")]
 
 
+def test_create_field_moves_active_range_past_field_end_marker():
+    from types import SimpleNamespace
+
+    class WordLikeFieldResult:
+        def __init__(self, start, end):
+            self.Start = start
+            self.End = end
+            self.Text = ""
+            self.collapse_calls = []
+            self.move_calls = []
+
+        @property
+        def Duplicate(self):
+            return self
+
+        def Collapse(self, direction):
+            self.collapse_calls.append(direction)
+            self.Start = self.End
+
+        def Move(self, unit, count):
+            self.move_calls.append((unit, count))
+            self.Start += count
+            self.End += count
+            return count
+
+    class Fields:
+        def __init__(self, result):
+            self.result = result
+
+        def Add(self, Range, Type, Text, PreserveFormatting):
+            return SimpleNamespace(Result=self.result)
+
+    result = WordLikeFieldResult(start=10, end=14)
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = SimpleNamespace(Fields=Fields(result))
+
+    controller.execute_event(ReconstructionEvent("CreateField", "field", {
+        "instruction": "REF ref_tab_1 \\h",
+        "cached_result": "1",
+    }))
+
+    assert result.collapse_calls == [0]
+    assert result.move_calls == [(1, 1)]
+    assert (controller.active_range.Start, controller.active_range.End) == (15, 15)
+
+
 def test_create_field_seeds_cached_result_and_reapplies_active_run_formatting_without_refresh():
     from types import SimpleNamespace
 
     class ResultRange:
         def __init__(self):
-            self.Text = ""; self.Start=4; self.End=4; self.collapse=[]
+            self.Text = ""; self.Start=4; self.End=4; self.collapse=[]; self.move=[]
             self.Font = SimpleNamespace(Bold=-1, Name=None, NameBi="Times New Roman")
         @property
         def Duplicate(self): return self
         def Collapse(self, direction): self.collapse.append(direction)
+        def Move(self, unit, count): self.move.append((unit, count)); return count
     class Field:
         def __init__(self): self.Result=ResultRange(); self.updated=0
         def Update(self): self.updated += 1
