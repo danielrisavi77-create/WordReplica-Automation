@@ -944,12 +944,28 @@ class InteractiveWordController:
     def _event_SetImageSize(self, event: ReconstructionEvent) -> None:
         image = self._active_image
         if image is None: raise RuntimeError("image geometry event without active image")
-        if event.payload.get("lock_aspect_ratio") is not None:
-            with suppress(Exception): image.LockAspectRatio = self._word_bool(event.payload["lock_aspect_ratio"])
-        if event.payload.get("width_emu") is not None:
-            image.Width = self._emu_to_points(event.payload["width_emu"])
-        if event.payload.get("height_emu") is not None:
-            image.Height = self._emu_to_points(event.payload["height_emu"])
+        lock_aspect_ratio = event.payload.get("lock_aspect_ratio")
+        width_emu = event.payload.get("width_emu")
+        height_emu = event.payload.get("height_emu")
+        unlock_for_exact_size = width_emu is not None and height_emu is not None
+        restore_lock = None
+        if unlock_for_exact_size:
+            restore_lock = (
+                self._word_bool(lock_aspect_ratio)
+                if lock_aspect_ratio is not None
+                else _retry_getattr(image, "LockAspectRatio", None)
+            )
+            _retry_setattr(image, "LockAspectRatio", self._word_bool(False))
+        elif lock_aspect_ratio is not None:
+            _retry_setattr(image, "LockAspectRatio", self._word_bool(lock_aspect_ratio))
+        try:
+            if width_emu is not None:
+                image.Width = self._emu_to_points(width_emu)
+            if height_emu is not None:
+                image.Height = self._emu_to_points(height_emu)
+        finally:
+            if unlock_for_exact_size and restore_lock is not None:
+                _retry_setattr(image, "LockAspectRatio", restore_lock)
 
     def _event_SetImageWrap(self, event: ReconstructionEvent) -> None:
         image = self._active_image

@@ -803,6 +803,84 @@ def test_image_is_created_before_stepwise_geometry_mutations():
     assert log.index(("shape.Rotation",15.0)) > 1
 
 
+def test_image_dimensions_are_set_while_aspect_ratio_is_temporarily_unlocked():
+    log = []
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = FakeImageDocument(log)
+    controller.set_asset_resolver(lambda asset_id: Path("C:/tmp/image.png"))
+    controller.execute_event(ReconstructionEvent(
+        "InsertImage",
+        "d1",
+        {"asset_id": "a1", "representation": "floating", "source_path": "word/media/image1.png"},
+    ))
+    log.clear()
+
+    controller.execute_event(ReconstructionEvent(
+        "SetImageSize",
+        "d1",
+        {"width_emu": 914400, "height_emu": 457200, "lock_aspect_ratio": True},
+    ))
+
+    assert log == [
+        ("shape.LockAspectRatio", 0),
+        ("shape.Width", 72.0),
+        ("shape.Height", 36.0),
+        ("shape.LockAspectRatio", -1),
+    ]
+
+
+def test_image_dimensions_preserve_existing_aspect_lock_when_source_lock_is_unspecified():
+    log = []
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = FakeImageDocument(log)
+    controller.set_asset_resolver(lambda asset_id: Path("C:/tmp/image.png"))
+    controller.execute_event(ReconstructionEvent(
+        "InsertImage",
+        "d1",
+        {"asset_id": "a1", "representation": "floating", "source_path": "word/media/image1.png"},
+    ))
+    controller._active_image.LockAspectRatio = -1
+    log.clear()
+
+    controller.execute_event(ReconstructionEvent(
+        "SetImageSize",
+        "d1",
+        {"width_emu": 914400, "height_emu": 457200, "lock_aspect_ratio": None},
+    ))
+
+    assert log == [
+        ("shape.LockAspectRatio", 0),
+        ("shape.Width", 72.0),
+        ("shape.Height", 36.0),
+        ("shape.LockAspectRatio", -1),
+    ]
+
+
+@pytest.mark.parametrize("failure_on_assignment", [1, 2])
+def test_image_size_propagates_required_aspect_lock_failures(failure_on_assignment):
+    class FailingLockShape:
+        def __init__(self):
+            object.__setattr__(self, "lock_assignments", 0)
+
+        def __setattr__(self, name, value):
+            if name == "LockAspectRatio":
+                assignment = self.lock_assignments + 1
+                object.__setattr__(self, "lock_assignments", assignment)
+                if assignment == failure_on_assignment:
+                    raise RuntimeError("lock assignment failed")
+            object.__setattr__(self, name, value)
+
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller._active_image = FailingLockShape()
+
+    with pytest.raises(RuntimeError, match="lock assignment failed"):
+        controller.execute_event(ReconstructionEvent(
+            "SetImageSize",
+            "d1",
+            {"width_emu": 914400, "height_emu": 457200, "lock_aspect_ratio": True},
+        ))
+
+
 def test_renderer_can_resume_from_first_uncompleted_event():
     from word_replica.config import InteractiveOptions
     from word_replica.interactive.control import InteractiveRunControl
