@@ -369,6 +369,111 @@ def test_source_autofit_table_layout_is_restored(tmp_path):
         assert not root.xpath("//*[local-name()='tblGrid']|//*[local-name()='tblLayout']|//*[local-name()='tcW']")
 
 
+def test_source_table_property_topology_is_restored_after_word_materializes_defaults(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:tbl>"
+        b"<w:tblPr><w:tblW w:w='0' w:type='auto'/><w:tblBorders>"
+        b"<w:top w:val='single' w:sz='12' w:color='1B2F4B'/><w:left w:val='nil'/>"
+        b"</w:tblBorders></w:tblPr><w:tblGrid><w:gridCol w:w='1000'/></w:tblGrid>"
+        b"<w:tr><w:trPr><w:cantSplit/></w:trPr><w:tc><w:tcPr>"
+        b"<w:tcW w:w='1000' w:type='dxa'/><w:shd w:fill='F2F5FA'/><w:tcBorders>"
+        b"<w:bottom w:val='single' w:sz='8'/></w:tcBorders></w:tcPr>"
+        b"<w:p><w:r><w:t>SOURCE CONTENT</w:t></w:r></w:p></w:tc></w:tr>"
+        b"</w:tbl></w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:tbl>"
+        b"<w:tblPr><w:tblW w:w='1000' w:type='dxa'/><w:tblBorders>"
+        b"<w:top w:val='single' w:sz='12' w:color='1B2F4B'/>"
+        b"</w:tblBorders><w:shd w:fill='auto'/></w:tblPr><w:tblGrid><w:gridCol w:w='1200'/></w:tblGrid>"
+        b"<w:tr><w:trPr><w:tblHeader/></w:trPr><w:tc><w:tcPr>"
+        b"<w:tcW w:w='1200' w:type='dxa'/><w:shd w:fill='auto'/><w:tcBorders>"
+        b"<w:top w:val='single' w:sz='12' w:color='1B2F4B'/><w:bottom w:val='nil'/>"
+        b"</w:tcBorders></w:tcPr><w:p><w:r><w:t>OUTPUT CONTENT</w:t></w:r></w:p></w:tc></w:tr>"
+        b"</w:tbl></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_source_table_layout(output, source)
+
+    assert restored == 4
+    with ZipFile(source) as archive:
+        source_root = etree.fromstring(archive.read("word/document.xml"))
+    with ZipFile(output) as archive:
+        output_root = etree.fromstring(archive.read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    for path in ("//w:tblPr", "//w:tblGrid", "//w:trPr", "//w:tcPr"):
+        assert etree.tostring(output_root.xpath(path, namespaces=ns)[0]) == etree.tostring(
+            source_root.xpath(path, namespaces=ns)[0]
+        )
+    assert output_root.xpath("string(//w:t)", namespaces=ns) == "OUTPUT CONTENT"
+
+
+def test_source_table_properties_are_not_restored_when_nested_topology_differs(tmp_path):
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body>"
+        b"<w:tbl><w:tblPr><w:tblW w:w='1000' w:type='dxa'/></w:tblPr><w:tr><w:tc>"
+        b"<w:p><w:r><w:t>SOURCE</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
+        b"</w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body>"
+        b"<w:tbl><w:tblPr><w:tblW w:w='2000' w:type='dxa'/></w:tblPr><w:tr><w:tc>"
+        b"<w:p><w:r><w:t>OUTPUT</w:t></w:r></w:p>"
+        b"<w:tbl><w:tblPr/><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl>"
+        b"</w:tc></w:tr></w:tbl></w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    before = output.read_bytes()
+    restored = InteractiveRebuildService._restore_source_table_layout(output, source)
+
+    assert restored == 0
+    assert output.read_bytes() == before
+
+
+def test_source_row_properties_are_inserted_after_table_property_exceptions(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body>"
+        b"<w:tbl><w:tr><w:tblPrEx/><w:trPr><w:cantSplit/></w:trPr><w:tc><w:p/></w:tc></w:tr></w:tbl>"
+        b"</w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body>"
+        b"<w:tbl><w:tr><w:tblPrEx/><w:tc><w:p/></w:tc></w:tr></w:tbl>"
+        b"</w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_source_table_layout(output, source)
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        output_root = etree.fromstring(archive.read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    row = output_root.xpath("//w:tr", namespaces=ns)[0]
+    assert [etree.QName(child).localname for child in row[:2]] == ["tblPrEx", "trPr"]
+
+
 def test_blocked_preflight_never_creates_word_controller(tmp_path):
     source=build_plain_text(tmp_path/"source.docx")
     store=ProjectStore(tmp_path/"projects")

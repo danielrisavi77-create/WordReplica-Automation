@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict, replace
 import json
 import os
@@ -832,27 +833,73 @@ class InteractiveRebuildService:
         output_root = etree.fromstring(parts["word/document.xml"])
         source_tables = source_root.xpath("//w:body//w:tbl", namespaces=ns)
         output_tables = output_root.xpath("//w:body//w:tbl", namespaces=ns)
-        removed = 0
+
+        table_tag = f"{{{namespace}}}tbl"
+
+        def direct_nested_tables(cell, owner_table) -> list:
+            nested = []
+            for candidate in cell.xpath(".//w:tbl", namespaces=ns):
+                nearest_table = next(
+                    (ancestor for ancestor in candidate.iterancestors() if ancestor.tag == table_tag),
+                    None,
+                )
+                if nearest_table is owner_table:
+                    nested.append(candidate)
+            return nested
+
+        def table_topology(table) -> tuple:
+            return tuple(
+                tuple(
+                    tuple(table_topology(nested) for nested in direct_nested_tables(cell, table))
+                    for cell in row.xpath("./w:tc", namespaces=ns)
+                )
+                for row in table.xpath("./w:tr", namespaces=ns)
+            )
+
+        source_topology = tuple(
+            table_topology(table)
+            for table in source_tables
+            if not any(ancestor.tag == table_tag for ancestor in table.iterancestors())
+        )
+        output_topology = tuple(
+            table_topology(table)
+            for table in output_tables
+            if not any(ancestor.tag == table_tag for ancestor in table.iterancestors())
+        )
+        if source_topology != output_topology:
+            return 0
+
+        def synchronize_child(source_parent, output_parent, path: str, index: int) -> int:
+            source_child = source_parent.find(path, namespaces=ns)
+            output_child = output_parent.find(path, namespaces=ns)
+            if source_child is None and output_child is None:
+                return 0
+            if source_child is not None and output_child is not None:
+                if etree.tostring(source_child) == etree.tostring(output_child):
+                    return 0
+                output_parent.replace(output_child, deepcopy(source_child))
+                return 1
+            if output_child is not None:
+                output_parent.remove(output_child)
+                return 1
+            output_parent.insert(min(index, len(output_parent)), deepcopy(source_child))
+            return 1
+
+        restored = 0
         for source_table, output_table in zip(source_tables, output_tables):
-            if source_table.find("w:tblGrid", namespaces=ns) is None:
-                generated_grid = output_table.find("w:tblGrid", namespaces=ns)
-                if generated_grid is not None:
-                    output_table.remove(generated_grid)
-                    removed += 1
-            if source_table.find("w:tblPr/w:tblLayout", namespaces=ns) is None:
-                generated_layout = output_table.find("w:tblPr/w:tblLayout", namespaces=ns)
-                if generated_layout is not None:
-                    output_table.find("w:tblPr", namespaces=ns).remove(generated_layout)
-                    removed += 1
-            source_cells = source_table.xpath(".//w:tc", namespaces=ns)
-            output_cells = output_table.xpath(".//w:tc", namespaces=ns)
-            for source_cell, output_cell in zip(source_cells, output_cells):
-                if source_cell.find("w:tcPr/w:tcW", namespaces=ns) is None:
-                    generated_width = output_cell.find("w:tcPr/w:tcW", namespaces=ns)
-                    if generated_width is not None:
-                        output_cell.find("w:tcPr", namespaces=ns).remove(generated_width)
-                        removed += 1
-        if not removed:
+            restored += synchronize_child(source_table, output_table, "w:tblPr", 0)
+            grid_index = 1 if output_table.find("w:tblPr", namespaces=ns) is not None else 0
+            restored += synchronize_child(source_table, output_table, "w:tblGrid", grid_index)
+            source_rows = source_table.xpath("./w:tr", namespaces=ns)
+            output_rows = output_table.xpath("./w:tr", namespaces=ns)
+            for source_row, output_row in zip(source_rows, output_rows):
+                row_properties_index = 1 if output_row.find("w:tblPrEx", namespaces=ns) is not None else 0
+                restored += synchronize_child(source_row, output_row, "w:trPr", row_properties_index)
+                source_cells = source_row.xpath("./w:tc", namespaces=ns)
+                output_cells = output_row.xpath("./w:tc", namespaces=ns)
+                for source_cell, output_cell in zip(source_cells, output_cells):
+                    restored += synchronize_child(source_cell, output_cell, "w:tcPr", 0)
+        if not restored:
             return 0
         parts["word/document.xml"] = etree.tostring(
             output_root, xml_declaration=True, encoding="UTF-8", standalone=True
@@ -868,7 +915,7 @@ class InteractiveRebuildService:
             Path(temporary_name).replace(output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
-        return removed
+        return restored
 
     @staticmethod
     def _load_save_history(path: Path) -> list[dict]:
