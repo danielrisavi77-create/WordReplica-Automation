@@ -163,6 +163,22 @@ class GoldenRunner:
             )
 
             interactive_payload = _read_json(interactive_dir / "result.json")
+            interactive_processes = [interactive_result]
+            resume_project_id = interactive_payload.get("project_id")
+            if (
+                not interactive_result.timed_out
+                and interactive_payload.get("status") == "COM_FAIL"
+                and resume_project_id
+            ):
+                interactive_result = self._exec(
+                    [*interactive_command, "--resume-project-id", str(resume_project_id)],
+                    timeout=self.config.reconstruction_timeout_seconds,
+                    run_dir=run.run_dir,
+                    stem="interactive_resume_1",
+                    ownership_file=run.ownership_file,
+                )
+                interactive_processes.append(interactive_result)
+                interactive_payload = _read_json(interactive_dir / "result.json")
             reconstruction_status = (
                 "TIMEOUT" if interactive_result.timed_out
                 else str(interactive_payload.get("run_status") or interactive_payload.get("status") or f"EXIT_{interactive_result.exit_code}")
@@ -213,6 +229,7 @@ class GoldenRunner:
                 "source_sha256_after": sha256_file(self.config.golden_path) if self.config.golden_path.exists() else None,
                 "static_process": asdict(static_result),
                 "interactive_process": asdict(interactive_result),
+                "interactive_processes": [asdict(item) for item in interactive_processes],
                 "audit_process": asdict(audit_result) if audit_result is not None else None,
                 "interactive_result": interactive_payload,
                 "trace": _trace_summary(interactive_dir / "event_trace.jsonl"),

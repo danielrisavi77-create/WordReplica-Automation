@@ -258,6 +258,8 @@ def test_explicit_run_font_names_are_restored_only_for_safely_paired_runs(tmp_pa
         b"<w:t>Heading</w:t></w:r></w:p>"
         b"<w:p><w:r><w:rPr><w:rFonts w:ascii='Calibri'/></w:rPr><w:t>Merged </w:t></w:r>"
         b"<w:r><w:rPr><w:rFonts w:ascii='Calibri'/></w:rPr><w:t>text</w:t></w:r></w:p>"
+        b"<w:p><w:r><w:rPr><w:rFonts w:ascii='Arial'/></w:rPr><w:t>Mixed </w:t></w:r>"
+        b"<w:r><w:rPr><w:rFonts w:ascii='Calibri'/></w:rPr><w:t>fonts</w:t></w:r></w:p>"
         b"</w:body></w:document>"
     )
     output_xml = (
@@ -265,6 +267,7 @@ def test_explicit_run_font_names_are_restored_only_for_safely_paired_runs(tmp_pa
         b"<w:body>"
         b"<w:p><w:r><w:t>Heading</w:t></w:r></w:p>"
         b"<w:p><w:r><w:t>Merged text</w:t></w:r></w:p>"
+        b"<w:p><w:r><w:t>Mixed fonts</w:t></w:r></w:p>"
         b"</w:body></w:document>"
     )
     with ZipFile(source, "w", ZIP_DEFLATED) as archive:
@@ -275,7 +278,7 @@ def test_explicit_run_font_names_are_restored_only_for_safely_paired_runs(tmp_pa
 
     restored = InteractiveRebuildService._restore_explicit_run_font_names(output, source)
 
-    assert restored == 1
+    assert restored == 2
     with ZipFile(output) as archive:
         root = etree.fromstring(archive.read("word/document.xml"))
         assert archive.read("word/unchanged.bin") == b"unchanged"
@@ -288,7 +291,11 @@ def test_explicit_run_font_names_are_restored_only_for_safely_paired_runs(tmp_pa
         "./*[local-name()='r']/*[local-name()='rPr']/*[local-name()='rFonts']"
         "/@*[local-name()='hAnsi']"
     ) == ["Times New Roman"]
-    assert not paragraphs[1].xpath(".//*[local-name()='rFonts']")
+    assert paragraphs[1].xpath(
+        "./*[local-name()='r']/*[local-name()='rPr']/*[local-name()='rFonts']"
+        "/@*[local-name()='ascii']"
+    ) == ["Calibri"]
+    assert not paragraphs[2].xpath(".//*[local-name()='rFonts']")
 
 
 def test_explicit_run_font_names_refuse_mismatched_paragraph_topology(tmp_path):
@@ -593,6 +600,116 @@ def test_source_document_defaults_are_restored_to_saved_styles(tmp_path):
     with ZipFile(output) as archive:
         root = etree.fromstring(archive.read("word/styles.xml"))
         assert root.xpath("//*[local-name()='spacing']/@*[local-name()='line']") == ["360"]
+
+
+def test_source_theme_style_latin_fonts_are_resolved_without_changing_theme_or_cs(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_theme = b"""<a:theme xmlns:a='http://schemas.openxmlformats.org/drawingml/2006/main'>
+      <a:themeElements><a:fontScheme name='Source'>
+        <a:majorFont><a:latin typeface='Calibri'/><a:ea typeface='Source Major EA'/><a:cs typeface='Source Major CS'/></a:majorFont>
+        <a:minorFont><a:latin typeface='Cambria'/><a:ea typeface='Source Minor EA'/><a:cs typeface='Source Minor CS'/></a:minorFont>
+      </a:fontScheme><a:fmtScheme name='Source'/></a:themeElements>
+    </a:theme>"""
+    output_theme = b"""<a:theme xmlns:a='http://schemas.openxmlformats.org/drawingml/2006/main'>
+      <a:themeElements><a:fontScheme name='Output'>
+        <a:majorFont><a:latin typeface='Cambria'/><a:ea typeface='Output Major EA'/><a:cs typeface='Output Major CS'/></a:majorFont>
+        <a:minorFont><a:latin typeface='Calibri'/><a:ea typeface='Output Minor EA'/><a:cs typeface='Output Minor CS'/></a:minorFont>
+      </a:fontScheme><a:fmtScheme name='Output'/></a:themeElements>
+    </a:theme>"""
+    source_styles = b"""<w:styles xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>
+      <w:style w:type='paragraph' w:styleId='Heading2'><w:name w:val='heading 2'/><w:rPr>
+        <w:rFonts w:asciiTheme='majorHAnsi' w:hAnsiTheme='majorHAnsi' w:eastAsiaTheme='majorEastAsia' w:cstheme='majorBidi'/>
+      </w:rPr></w:style>
+      <w:style w:type='paragraph' w:styleId='Normal'><w:rPr><w:rFonts w:ascii='Times New Roman'/></w:rPr></w:style>
+      <w:style w:type='paragraph' w:styleId='NoFonts'><w:rPr><w:rFonts w:asciiTheme='majorHAnsi'/></w:rPr></w:style>
+      <w:style w:type='paragraph' w:styleId='SourceOnly'><w:rPr><w:rFonts w:asciiTheme='minorHAnsi'/></w:rPr></w:style>
+    </w:styles>"""
+    output_styles = b"""<w:styles xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>
+      <w:style w:type='paragraph' w:styleId='Heading2'><w:name w:val='heading 2'/><w:rPr>
+        <w:rFonts w:ascii='Times New Roman' w:hAnsi='Times New Roman' w:cs='Calibri'/>
+      </w:rPr></w:style>
+      <w:style w:type='paragraph' w:styleId='Normal'><w:rPr><w:rFonts w:ascii='Arial'/></w:rPr></w:style>
+      <w:style w:type='paragraph' w:styleId='NoFonts'><w:rPr><w:b/></w:rPr></w:style>
+    </w:styles>"""
+    for path, theme, styles, theme_name in (
+        (source, source_theme, source_styles, "theme2.xml"),
+        (output, output_theme, output_styles, "theme7.xml"),
+    ):
+        with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+            archive.writestr(f"word/theme/{theme_name}", theme)
+            archive.writestr("word/styles.xml", styles)
+            archive.writestr(
+                "word/_rels/document.xml.rels",
+                (
+                    "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"
+                    "<Relationship Id='rIdTheme' "
+                    "Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme' "
+                    f"Target='theme/{theme_name}'/>"
+                    "</Relationships>"
+                ).encode(),
+            )
+
+    restored = InteractiveRebuildService._restore_source_theme_style_latin_fonts(
+        output, source
+    )
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        theme = etree.fromstring(archive.read("word/theme/theme7.xml"))
+        styles = etree.fromstring(archive.read("word/styles.xml"))
+    assert theme.xpath(
+        "string(//*[local-name()='fontScheme']/@name)"
+    ) == "Output"
+    assert theme.xpath(
+        "string(//*[local-name()='majorFont']/*[local-name()='latin']/@typeface)"
+    ) == "Cambria"
+    assert theme.xpath(
+        "string(//*[local-name()='minorFont']/*[local-name()='latin']/@typeface)"
+    ) == "Calibri"
+    assert theme.xpath(
+        "string(//*[local-name()='majorFont']/*[local-name()='ea']/@typeface)"
+    ) == "Output Major EA"
+    assert theme.xpath(
+        "string(//*[local-name()='majorFont']/*[local-name()='cs']/@typeface)"
+    ) == "Output Major CS"
+    assert theme.xpath(
+        "string(//*[local-name()='minorFont']/*[local-name()='ea']/@typeface)"
+    ) == "Output Minor EA"
+    assert theme.xpath(
+        "string(//*[local-name()='minorFont']/*[local-name()='cs']/@typeface)"
+    ) == "Output Minor CS"
+    assert theme.xpath(
+        "string(//*[local-name()='fmtScheme']/@name)"
+    ) == "Output"
+    heading_fonts = styles.xpath(
+        "//*[local-name()='style' and @*[local-name()='styleId']='Heading2']"
+        "/*[local-name()='rPr']/*[local-name()='rFonts']"
+    )[0]
+    assert heading_fonts.xpath("string(@*[local-name()='asciiTheme'])") == ""
+    assert heading_fonts.xpath("string(@*[local-name()='hAnsiTheme'])") == ""
+    assert heading_fonts.xpath("string(@*[local-name()='ascii'])") == "Calibri"
+    assert heading_fonts.xpath("string(@*[local-name()='hAnsi'])") == "Calibri"
+    assert heading_fonts.xpath("string(@*[local-name()='cs'])") == "Calibri"
+    assert heading_fonts.xpath("string(@*[local-name()='cstheme'])") == ""
+    assert heading_fonts.xpath("string(@*[local-name()='eastAsiaTheme'])") == ""
+    normal_fonts = styles.xpath(
+        "//*[local-name()='style' and @*[local-name()='styleId']='Normal']"
+        "/*[local-name()='rPr']/*[local-name()='rFonts']"
+    )[0]
+    assert normal_fonts.xpath("string(@*[local-name()='ascii'])") == "Arial"
+    assert not styles.xpath(
+        "//*[local-name()='style' and @*[local-name()='styleId']='NoFonts']"
+        "/*[local-name()='rPr']/*[local-name()='rFonts']"
+    )
+    assert not styles.xpath(
+        "//*[local-name()='style' and @*[local-name()='styleId']='SourceOnly']"
+    )
+    assert InteractiveRebuildService._restore_source_theme_style_latin_fonts(
+        output, source
+    ) == 0
 
 
 def test_source_footer_parts_and_reference_types_are_restored(tmp_path):

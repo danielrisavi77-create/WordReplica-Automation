@@ -110,6 +110,71 @@ def test_l2_treats_theme_font_and_same_explicit_font_as_equivalent():
     assert run_l0_l3(source, rebuilt).levels["L2"].passed is True
 
 
+def test_l2_child_theme_font_overrides_inherited_explicit_font():
+    source = DocumentModel(
+        source_sha256="x",
+        body=[Paragraph("p", [Run("r", "Appendix", {})], style_id="Heading2")],
+    )
+    source.extras["theme_font_scheme"] = {"majorHAnsi": "Calibri"}
+    source.extras["style_definitions"] = {
+        "Normal": {
+            "style_id": "Normal",
+            "run_properties": {"font_ascii": "Times New Roman"},
+            "paragraph_properties": {},
+        },
+        "Heading2": {
+            "style_id": "Heading2",
+            "based_on": "Normal",
+            "run_properties": {"font_ascii_theme": "majorHAnsi"},
+            "paragraph_properties": {},
+        },
+    }
+
+    rebuilt = DocumentModel(
+        source_sha256="y",
+        body=[
+            Paragraph(
+                "p",
+                [Run("r", "Appendix", {"font_ascii": "Calibri"})],
+                style_id="Heading2",
+            )
+        ],
+    )
+
+    assert run_l0_l3(source, rebuilt).levels["L2"].passed is True
+
+
+def test_l2_theme_font_overrides_direct_font_from_the_same_layer():
+    source = DocumentModel(
+        source_sha256="x",
+        body=[Paragraph("p", [Run("r", "Theme", {})], style_id="Heading2")],
+    )
+    source.extras["theme_font_scheme"] = {"majorHAnsi": "Calibri"}
+    source.extras["style_definitions"] = {
+        "Heading2": {
+            "style_id": "Heading2",
+            "run_properties": {
+                "font_ascii": "Times New Roman",
+                "font_ascii_theme": "majorHAnsi",
+            },
+            "paragraph_properties": {},
+        },
+    }
+
+    rebuilt = DocumentModel(
+        source_sha256="y",
+        body=[
+            Paragraph(
+                "p",
+                [Run("r", "Theme", {"font_ascii": "Calibri"})],
+                style_id="Heading2",
+            )
+        ],
+    )
+
+    assert run_l0_l3(source, rebuilt).levels["L2"].passed is True
+
+
 def test_l2_applies_default_paragraph_style_when_style_id_is_implicit():
     source = DocumentModel(
         source_sha256="x",

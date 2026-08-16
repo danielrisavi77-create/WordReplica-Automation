@@ -153,3 +153,57 @@ def test_visible_word_is_forwarded_only_to_interactive_child(tmp_path):
     interactive_call = next(call for call in calls if "interactive_maximum" in call)
     assert "--visible-word" not in static_call
     assert "--visible-word" in interactive_call
+
+
+def test_runner_restarts_word_once_and_resumes_checkpoint_after_com_failure(tmp_path):
+    root = tmp_path / "local"
+    (root / "golden").mkdir(parents=True)
+    (root / "golden" / "golden.docx").write_bytes(b"golden")
+    repo = tmp_path / "repo"
+    (repo / "scripts" / "remote_harness").mkdir(parents=True)
+    (repo / "scripts" / "codex_automation").mkdir(parents=True)
+    calls = []
+
+    def executor(command, **kwargs):
+        calls.append(list(command))
+        if "--stage" in command:
+            stage = command[command.index("--stage") + 1]
+            run_dir = _arg(command, "--run-dir")
+            run_dir.mkdir(parents=True, exist_ok=True)
+            if stage == "static":
+                payload = {"stage": stage, "status": "PASS", "run_status": "PASS", "reasons": []}
+            elif "--resume-project-id" not in command:
+                payload = {
+                    "stage": stage,
+                    "status": "COM_FAIL",
+                    "run_status": "FAIL",
+                    "project_id": "project-1",
+                    "reasons": ["Call was rejected by callee."],
+                }
+            else:
+                assert command[command.index("--resume-project-id") + 1] == "project-1"
+                payload = {"stage": stage, "status": "PASS", "run_status": "PASS", "project_id": "project-1", "reasons": []}
+                (run_dir / "output.docx").write_bytes(b"resumed-output")
+            (run_dir / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+        else:
+            _arg(command, "--report").write_text(json.dumps({
+                "gates": {f"G{i}": True for i in range(10)},
+                "gate_details": {},
+                "full_pass": True,
+            }), encoding="utf-8")
+        return ChildResult(0, False, 0.1, [])
+
+    report_path = GoldenRunner(
+        repo_root=repo,
+        config=CodexAutomationConfig(local_root=root, golden_filename="golden.docx"),
+        child_executor=executor,
+        git_info=lambda _root: ("automation-dev", "deadbeef"),
+    ).run()
+
+    interactive_calls = [call for call in calls if "interactive_maximum" in call]
+    assert len(interactive_calls) == 2
+    assert "--resume-project-id" not in interactive_calls[0]
+    assert "--resume-project-id" in interactive_calls[1]
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["full_pass"] is True
+    assert len(report["interactive_processes"]) == 2

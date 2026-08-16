@@ -965,10 +965,11 @@ def test_renderer_can_resume_from_first_uncompleted_event():
     assert outcome.last_completed_index == 2
 
 
-def test_restore_checkpoint_state_recreates_exact_body_range():
+def test_restore_checkpoint_state_reanchors_body_append_boundary_to_reopened_document_end():
     from types import SimpleNamespace
     calls=[]
     class Doc:
+        Content = SimpleNamespace(Start=0, End=101)
         def Range(self,start,end):
             calls.append((start,end))
             return FakeCheckpointRange(start,end)
@@ -979,8 +980,8 @@ def test_restore_checkpoint_state_recreates_exact_body_range():
     controller.document=Doc()
     checkpoint=SimpleNamespace(story="body", range_start=42, range_end=42, paragraph_started=True)
     controller.restore_checkpoint_state(checkpoint)
-    assert calls == [(42,42)]
-    assert controller.active_range.Start == 42
+    assert calls == [(100,100)]
+    assert controller.active_range.Start == 100
     assert controller._paragraph_started is True
 
 
@@ -1587,17 +1588,17 @@ def test_source_style_application_retries_word2010_rejected_style_font_setter():
     assert style.Font.Size == 14.0
 
 
-def test_default_word2010_retry_budget_survives_more_than_one_second_busy_burst(monkeypatch):
+def test_default_word2010_retry_budget_survives_more_than_thirty_second_busy_burst(monkeypatch):
     from word_replica.renderers import interactive_word as module
     monkeypatch.setattr(module.time, "sleep", lambda _: None)
     attempts = {"count": 0}
     def operation():
         attempts["count"] += 1
-        if attempts["count"] <= 61:
+        if attempts["count"] <= 301:
             raise RejectedCall("Word 2010 busy")
         return "ok"
     assert module._retry_rejected_com_call(operation) == "ok"
-    assert attempts["count"] == 62
+    assert attempts["count"] == 302
 
 
 def test_visible_word_is_shown_only_after_blank_document_is_ready(monkeypatch):

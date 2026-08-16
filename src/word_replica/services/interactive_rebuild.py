@@ -5,6 +5,7 @@ from dataclasses import asdict, replace
 import hashlib
 import json
 import os
+import posixpath
 from pathlib import Path, PurePosixPath
 import tempfile
 from typing import Callable
@@ -653,16 +654,42 @@ class InteractiveRebuildService:
         for source_paragraph, output_paragraph in zip(source_paragraphs, output_paragraphs):
             source_runs = source_paragraph.findall("w:r", namespaces=ns)
             output_runs = output_paragraph.findall("w:r", namespaces=ns)
-            if len(source_runs) != len(output_runs):
-                continue
             source_texts = ["".join(run.xpath(".//w:t/text()", namespaces=ns)) for run in source_runs]
             output_texts = ["".join(run.xpath(".//w:t/text()", namespaces=ns)) for run in output_runs]
-            if source_texts != output_texts:
-                continue
-            for source_run, output_run, source_text in zip(source_runs, output_runs, source_texts):
-                if not source_text:
-                    continue
-                source_fonts = source_run.find("w:rPr/w:rFonts", namespaces=ns)
+            font_pairs = []
+            if source_texts == output_texts:
+                font_pairs = [
+                    (source_run.find("w:rPr/w:rFonts", namespaces=ns), output_run)
+                    for source_run, output_run, source_text in zip(
+                        source_runs, output_runs, source_texts
+                    )
+                    if source_text
+                ]
+            elif "".join(source_texts) == "".join(output_texts):
+                source_text_runs = [
+                    run for run, text in zip(source_runs, source_texts) if text
+                ]
+                output_text_runs = [
+                    run for run, text in zip(output_runs, output_texts) if text
+                ]
+                source_fonts = [
+                    run.find("w:rPr/w:rFonts", namespaces=ns)
+                    for run in source_text_runs
+                ]
+                if (
+                    source_fonts
+                    and output_text_runs
+                    and all(fonts is not None for fonts in source_fonts)
+                    and all(
+                        dict(fonts.attrib) == dict(source_fonts[0].attrib)
+                        for fonts in source_fonts[1:]
+                    )
+                ):
+                    font_pairs = [
+                        (source_fonts[0], output_run)
+                        for output_run in output_text_runs
+                    ]
+            for source_fonts, output_run in font_pairs:
                 if source_fonts is None:
                     continue
                 output_rpr = output_run.find("w:rPr", namespaces=ns)
@@ -1032,6 +1059,135 @@ class InteractiveRebuildService:
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return 1
+
+    @staticmethod
+    def _restore_source_theme_style_latin_fonts(
+        output_path: Path, source_path: Path
+    ) -> int:
+        from lxml import etree
+
+        word_namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        drawing_namespace = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+        def word_attr(name: str) -> str:
+            return f"{{{word_namespace}}}{name}"
+
+        namespaces = {"w": word_namespace, "a": drawing_namespace}
+        styles_path = "word/styles.xml"
+        relationships_path = "word/_rels/document.xml.rels"
+        relationship_namespace = (
+            "http://schemas.openxmlformats.org/package/2006/relationships"
+        )
+
+        def active_theme_path(part_names: set[str], relationships: bytes) -> str | None:
+            root = etree.fromstring(relationships)
+            for relationship in root.findall(
+                f"{{{relationship_namespace}}}Relationship"
+            ):
+                relationship_type = relationship.get("Type") or ""
+                if not relationship_type.endswith("/theme"):
+                    continue
+                if relationship.get("TargetMode") == "External":
+                    continue
+                target = relationship.get("Target") or ""
+                if not target:
+                    return None
+                if target.startswith("/"):
+                    candidate = posixpath.normpath(target.lstrip("/"))
+                else:
+                    candidate = posixpath.normpath(posixpath.join("word", target))
+                if candidate == ".." or candidate.startswith("../"):
+                    return None
+                return candidate if candidate in part_names else None
+            return None
+
+        with ZipFile(source_path) as source_archive:
+            source_names = set(source_archive.namelist())
+            if relationships_path not in source_names or styles_path not in source_names:
+                return 0
+            source_theme_path = active_theme_path(
+                source_names, source_archive.read(relationships_path)
+            )
+            if source_theme_path is None:
+                return 0
+            source_theme = etree.fromstring(source_archive.read(source_theme_path))
+            source_styles = etree.fromstring(source_archive.read(styles_path))
+        with ZipFile(output_path) as output_archive:
+            parts = {name: output_archive.read(name) for name in output_archive.namelist()}
+        if styles_path not in parts:
+            return 0
+
+        output_styles = etree.fromstring(parts[styles_path])
+        source_latin_scheme = {}
+        for prefix, font_group in (("major", "majorFont"), ("minor", "minorFont")):
+            source_latin = source_theme.find(
+                f".//a:{font_group}/a:latin", namespaces
+            )
+            typeface = source_latin.get("typeface") if source_latin is not None else None
+            if typeface:
+                source_latin_scheme[f"{prefix}Ascii"] = typeface
+                source_latin_scheme[f"{prefix}HAnsi"] = typeface
+
+        def style_key(style):
+            return style.get(word_attr("type")), style.get(word_attr("styleId"))
+
+        output_style_map = {
+            style_key(style): style for style in output_styles.findall("w:style", namespaces)
+        }
+        restored_style_fonts = 0
+        for source_style in source_styles.findall("w:style", namespaces):
+            output_style = output_style_map.get(style_key(source_style))
+            if output_style is None:
+                continue
+            source_fonts = source_style.find("w:rPr/w:rFonts", namespaces)
+            if source_fonts is None:
+                continue
+            output_run_properties = output_style.find("w:rPr", namespaces)
+            if output_run_properties is None:
+                continue
+            output_fonts = output_run_properties.find("w:rFonts", namespaces)
+            if output_fonts is None:
+                continue
+            changed = False
+            for direct_name, theme_name in (
+                ("ascii", "asciiTheme"),
+                ("hAnsi", "hAnsiTheme"),
+            ):
+                theme_reference = source_fonts.get(word_attr(theme_name))
+                resolved_font = source_latin_scheme.get(theme_reference or "")
+                if not resolved_font:
+                    continue
+                direct_attribute = word_attr(direct_name)
+                theme_attribute = word_attr(theme_name)
+                if (
+                    output_fonts.get(direct_attribute) == resolved_font
+                    and output_fonts.get(theme_attribute) is None
+                ):
+                    continue
+                output_fonts.set(direct_attribute, resolved_font)
+                output_fonts.attrib.pop(theme_attribute, None)
+                changed = True
+            if changed:
+                restored_style_fonts += 1
+
+        if not restored_style_fonts:
+            return 0
+        if restored_style_fonts:
+            parts[styles_path] = etree.tostring(
+                output_styles, xml_declaration=True, encoding="UTF-8", standalone=True
+            )
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{output_path.name}.", suffix=".tmp", dir=output_path.parent
+        )
+        os.close(fd)
+        try:
+            with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
+                for name, data in parts.items():
+                    archive.writestr(name, data)
+            Path(temporary_name).replace(output_path)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return restored_style_fonts
 
     @staticmethod
     def _restore_relationship_free_source_headers(
@@ -1532,6 +1688,11 @@ class InteractiveRebuildService:
         restored_defaults = self._restore_source_document_defaults(
             output_path, Path(prepared.source_path)
         )
+        restored_theme_style_latin_fonts = (
+            self._restore_source_theme_style_latin_fonts(
+                output_path, Path(prepared.source_path)
+            )
+        )
         expected_footer_types = [
             {str(ref.get("type", "default")) for ref in (section.properties.get("footer_refs") or [])}
             for section in prepared.model.sections
@@ -1545,7 +1706,7 @@ class InteractiveRebuildService:
         restored_table_layout = self._restore_source_table_layout(
             output_path, Path(prepared.source_path)
         )
-        if removed_header_shape_defaults or removed_bookmarks or removed_headers or restored_header_stories or removed_template_spacing or restored_alignment or restored_run_character_spacing or restored_run_font_names or restored_drawing_effect_extents or restored_empty_runs or restored_column_space or restored_page_number_start or restored_defaults or restored_footer_stories or restored_field_instructions or restored_table_layout:
+        if removed_header_shape_defaults or removed_bookmarks or removed_headers or restored_header_stories or removed_template_spacing or restored_alignment or restored_run_character_spacing or restored_run_font_names or restored_drawing_effect_extents or restored_empty_runs or restored_column_space or restored_page_number_start or restored_defaults or restored_theme_style_latin_fonts or restored_footer_stories or restored_field_instructions or restored_table_layout:
             final_checkpoint = replace(
                 final_checkpoint,
                 output_sha256=sha256_file(output_path),
@@ -1583,6 +1744,11 @@ class InteractiveRebuildService:
             audit.append("EXPLICIT_PAGE_NUMBER_START_RESTORED", {"count": restored_page_number_start})
         if restored_defaults:
             audit.append("SOURCE_DOCUMENT_DEFAULTS_RESTORED", {"count": restored_defaults})
+        if restored_theme_style_latin_fonts:
+            audit.append(
+                "SOURCE_THEME_STYLE_LATIN_FONTS_RESTORED",
+                {"count": restored_theme_style_latin_fonts},
+            )
         if restored_footer_stories:
             audit.append("SOURCE_FOOTER_STORIES_RESTORED", {"count": restored_footer_stories})
         if restored_field_instructions:

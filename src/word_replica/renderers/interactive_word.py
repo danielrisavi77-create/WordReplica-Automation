@@ -31,7 +31,7 @@ def _is_rejected_com_call(exc: Exception) -> bool:
     return hresult == RPC_E_CALL_REJECTED
 
 
-def _retry_rejected_com_call(operation, *, attempts: int = 300, delay_seconds: float = 0.1):
+def _retry_rejected_com_call(operation, *, attempts: int = 600, delay_seconds: float = 0.1):
     last = None
     for attempt in range(attempts):
         try:
@@ -194,13 +194,22 @@ class InteractiveWordController:
             self._active_section = self.document.Sections(self._active_section_index + 1)
         story = str(getattr(checkpoint, "story", "body"))
         note_index = state.get("note_index")
-        self.active_range = self._resume_range_for_story(
-            story, int(start), int(end), section_index=self._active_section_index, note_index=note_index
-        )
+        active_table_element_id = getattr(checkpoint, "table_element_id", None)
+        if story == "body" and active_table_element_id is None:
+            content = _retry_getattr(self.document, "Content")
+            content_start = int(_retry_getattr(content, "Start"))
+            content_end = max(content_start, int(_retry_getattr(content, "End")) - 1)
+            self.active_range = _retry_rejected_com_call(
+                lambda: self.document.Range(content_end, content_end)
+            )
+        else:
+            self.active_range = self._resume_range_for_story(
+                story, int(start), int(end), section_index=self._active_section_index, note_index=note_index
+            )
         self._paragraph_started = bool(getattr(checkpoint, "paragraph_started", False))
         self._active_story = story
         self._active_note_index = int(note_index) if note_index is not None else None
-        self._active_table_element_id = getattr(checkpoint, "table_element_id", None)
+        self._active_table_element_id = active_table_element_id
         self._active_cell_element_id = getattr(checkpoint, "cell_element_id", None)
         self._story_stack.clear()
         return_start = state.get("return_range_start")
@@ -1479,20 +1488,28 @@ class InteractiveWordController:
     def close(self) -> None:
         if self.document is not None:
             with suppress(Exception):
-                self.document.Close(False)
+                _retry_rejected_com_call(lambda: self.document.Close(False))
             self.document = None
+        application_quit = self.application is None
         if self.application is not None:
-            with suppress(Exception):
-                self.application.Quit()
+            try:
+                _retry_rejected_com_call(lambda: self.application.Quit())
+                application_quit = True
+            except Exception:
+                application_quit = False
             self.application = None
-        clear_owned_word(self._owned_word_pid)
-        self._owned_word_pid = None
         self.active_range = None
         if self._owns_com:
             with suppress(Exception):
                 import pythoncom
                 pythoncom.CoUninitialize()
             self._owns_com = False
+        if application_quit and (
+            self._owned_word_pid is None
+            or self._owned_word_pid not in word_process_pids()
+        ):
+            clear_owned_word(self._owned_word_pid)
+            self._owned_word_pid = None
 
 
 class InteractiveWordRenderer:

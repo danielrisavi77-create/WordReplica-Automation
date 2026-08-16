@@ -17,7 +17,7 @@ def compare_page_text_partitions(source_pages: list[str], output_pages: list[str
     same_count = len(source_pages) == len(output_pages)
     first = None
     for index, (left, right) in enumerate(zip(source_pages, output_pages), start=1):
-        if left != right:
+        if "".join(left.split()) != "".join(right.split()):
             first = {"page": index, "expected": left[:500], "actual": right[:500]}
             break
     if first is None and not same_count:
@@ -27,7 +27,11 @@ def compare_page_text_partitions(source_pages: list[str], output_pages: list[str
         name="G8",
         passed=passed,
         summary="pagination and page text partitions match" if passed else "pagination or page text partition mismatch",
-        details={"source_page_count": len(source_pages), "output_page_count": len(output_pages)},
+        details={
+            "source_page_count": len(source_pages),
+            "output_page_count": len(output_pages),
+            "comparison": "non_whitespace_character_partition",
+        },
         first_divergence=first,
     )
 

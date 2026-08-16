@@ -117,6 +117,7 @@ def run_stage(
     defer_l4_qa: bool = False,
     visible_word: bool = False,
     disable_table_fast_path: bool = False,
+    resume_project_id: str | None = None,
 ) -> dict:
     run_dir.mkdir(parents=True, exist_ok=True)
     if stage == "static":
@@ -153,15 +154,23 @@ def run_stage(
         interactive_service=_interactive_service_for(stage, defer_l4_qa=defer_l4_qa),
     )
     started = time.perf_counter()
-    result = service.rebuild(
-        source,
-        _options_for(
-            stage,
-            visible_word=visible_word,
-            disable_table_fast_path=disable_table_fast_path,
-        ),
-        interactive_observer=trace,
-    )
+    if resume_project_id is not None:
+        if not stage.startswith("interactive_"):
+            raise ValueError("checkpoint resume is only valid for an interactive stage")
+        result = service.resume_interactive(
+            resume_project_id,
+            interactive_observer=trace,
+        )
+    else:
+        result = service.rebuild(
+            source,
+            _options_for(
+                stage,
+                visible_word=visible_word,
+                disable_table_fast_path=disable_table_fast_path,
+            ),
+            interactive_observer=trace,
+        )
     payload = serialize_run_result(source.name, stage, result, time.perf_counter() - started)
     payload["preflight_can_proceed"] = static.get("preflight", {}).get("can_proceed")
     payload["status"] = classify_run_result(payload).value
@@ -183,6 +192,7 @@ def main(argv=None) -> int:
     parser.add_argument("--defer-l4-qa", action="store_true")
     parser.add_argument("--visible-word", action="store_true")
     parser.add_argument("--disable-table-fast-path", action="store_true")
+    parser.add_argument("--resume-project-id")
     args = parser.parse_args(argv)
     run_dir = Path(args.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -196,6 +206,7 @@ def main(argv=None) -> int:
             args.defer_l4_qa,
             args.visible_word,
             args.disable_table_fast_path,
+            args.resume_project_id,
         )
         result_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
         return 0

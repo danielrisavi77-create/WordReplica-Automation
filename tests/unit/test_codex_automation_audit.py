@@ -11,6 +11,21 @@ def test_page_partition_requires_same_page_count_and_text():
     assert moved.details["output_page_count"] == 1
 
 
+def test_page_partition_ignores_pdf_glyph_spacing_but_detects_moved_characters():
+    glyph_spacing = compare_page_text_partitions(
+        ["čini kvalitet a odluka", "sljedeća stranica"],
+        ["čini kvaliteta odluka", "sljedeća stranica"],
+    )
+    assert glyph_spacing.passed is True
+
+    moved = compare_page_text_partitions(
+        ["ABC", "DEF"],
+        ["AB", "CDEF"],
+    )
+    assert moved.passed is False
+    assert moved.first_divergence["page"] == 1
+
+
 def test_report_selects_first_failed_gate_in_g0_to_g9_order():
     gates = {
         f"G{i}": GateResult(name=f"G{i}", passed=True, summary="ok")

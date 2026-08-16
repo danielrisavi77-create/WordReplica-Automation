@@ -18,6 +18,26 @@ RUN_KEYS = (
     "language", "language_east_asia", "language_bidi",
     "character_spacing", "character_position",
 )
+FONT_PROPERTY_PAIRS = (
+    ("font_ascii", "font_ascii_theme"),
+    ("font_hansi", "font_hansi_theme"),
+    ("font_east_asia", "font_east_asia_theme"),
+    ("font_cs", "font_cs_theme"),
+)
+
+
+def _merge_run_properties(
+    properties: dict[str, Any], overrides: dict[str, Any]
+) -> None:
+    for direct_key, theme_key in FONT_PROPERTY_PAIRS:
+        if theme_key in overrides:
+            properties.pop(direct_key, None)
+        elif direct_key in overrides:
+            properties.pop(theme_key, None)
+    properties.update(overrides)
+    for direct_key, theme_key in FONT_PROPERTY_PAIRS:
+        if theme_key in overrides:
+            properties.pop(direct_key, None)
 
 
 def _uses_east_asia_font(text: str) -> bool:
@@ -75,18 +95,20 @@ def _effective_run_properties(model: DocumentModel, paragraph: Paragraph, run: R
         "character_spacing": "0",
         "character_position": "0",
     }
-    props.update(defaults.get("run_properties", {}) or {})
+    _merge_run_properties(props, defaults.get("run_properties", {}) or {})
     style_id = paragraph.style_id or model.extras.get("default_paragraph_style_id")
     for definition in _style_chain(model, style_id):
-        props.update(definition.get("run_properties", {}) or {})
-    props.update({k: v for k, v in run.properties.items() if k not in {"content_tokens", "break_types"}})
+        _merge_run_properties(props, definition.get("run_properties", {}) or {})
+    _merge_run_properties(
+        props,
+        {
+            key: value
+            for key, value in run.properties.items()
+            if key not in {"content_tokens", "break_types"}
+        },
+    )
     scheme = model.extras.get("theme_font_scheme", {}) or {}
-    for font_key, theme_key in (
-        ("font_ascii", "font_ascii_theme"),
-        ("font_hansi", "font_hansi_theme"),
-        ("font_east_asia", "font_east_asia_theme"),
-        ("font_cs", "font_cs_theme"),
-    ):
+    for font_key, theme_key in FONT_PROPERTY_PAIRS:
         if not props.get(font_key) and props.get(theme_key) in scheme:
             props[font_key] = scheme[props[theme_key]]
     if run.hidden:
