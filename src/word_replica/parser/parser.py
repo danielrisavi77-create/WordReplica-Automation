@@ -333,7 +333,7 @@ def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage
         elif local == "r":
             runs.append(parse_run(child, ids, f"{path}/run/{r_index}"))
             r_index += 1
-        elif local in {"ins", "moveTo", "fldSimple"}:
+        elif local in {"ins", "moveTo", "fldSimple", "hyperlink"}:
             for nested_index, nested_run in enumerate(child.findall(".//w:r", namespaces=NS)):
                 runs.append(
                     parse_run(
@@ -403,6 +403,14 @@ def parse_blocks(parent, ids: ElementIdFactory, source_path: str, package: DocxP
         elif local == "tbl":
             from word_replica.parser.tables import parse_table
             blocks.append(parse_table(child, ids, path, package))
+        elif local == "sdt":
+            # A content control (e.g. Word's automatic Table of Contents,
+            # a rich-text placeholder). Its paragraphs/tables live one level
+            # deeper, in sdtContent — flatten it away so that content is not
+            # silently dropped from the reconstruction.
+            content = child.find("w:sdtContent", namespaces=NS)
+            if content is not None:
+                blocks.extend(parse_blocks(content, ids, path, package))
     return blocks
 
 

@@ -53,3 +53,80 @@ def test_parser_ignores_word_system_goback_bookmark_but_keeps_real_bookmarks(tmp
 
     model = DocxParser().parse(source)
     assert [bookmark.name for bookmark in model.bookmarks] == ['RealBookmark']
+
+
+def _save_with_document_xml_edit(tmp_path, filename, edit):
+    from zipfile import ZIP_DEFLATED, ZipFile
+    from lxml import etree
+    from docx import Document
+
+    source = tmp_path / filename
+    doc = Document(); doc.add_paragraph('Body'); doc.save(source)
+    with ZipFile(source, 'r') as src:
+        members = {name: src.read(name) for name in src.namelist()}
+    ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    root = etree.fromstring(members['word/document.xml'])
+    edit(root, ns)
+    members['word/document.xml'] = etree.tostring(root, xml_declaration=True, encoding='UTF-8', standalone='yes')
+    tmp = source.with_suffix('.tmp.docx')
+    with ZipFile(tmp, 'w', ZIP_DEFLATED) as dst:
+        for name, data in members.items(): dst.writestr(name, data)
+    tmp.replace(source)
+    return source
+
+
+def test_parser_flattens_sdt_content_control_paragraphs_into_the_body(tmp_path):
+    from lxml import etree
+    from word_replica.parser.parser import DocxParser
+
+    def edit(root, ns):
+        body = root.find(f'.//{{{ns}}}body')
+        first_p = body.find(f'{{{ns}}}p')
+        sdt = etree.Element(f'{{{ns}}}sdt')
+        sdt_content = etree.SubElement(sdt, f'{{{ns}}}sdtContent')
+        p = etree.SubElement(sdt_content, f'{{{ns}}}p')
+        r = etree.SubElement(p, f'{{{ns}}}r')
+        t = etree.SubElement(r, f'{{{ns}}}t'); t.text = 'Inside content control'
+        first_p.addprevious(sdt)
+
+    source = _save_with_document_xml_edit(tmp_path, 'sdt.docx', edit)
+    model = DocxParser().parse(source)
+    assert 'Inside content control' in model.plain_text()
+    assert any(p.__class__.__name__ == 'Paragraph' and 'Inside content control' in p.text() for p in model.body)
+
+
+def test_parser_flattens_nested_sdt_inside_sdt(tmp_path):
+    from lxml import etree
+    from word_replica.parser.parser import DocxParser
+
+    def edit(root, ns):
+        body = root.find(f'.//{{{ns}}}body')
+        first_p = body.find(f'{{{ns}}}p')
+        outer = etree.Element(f'{{{ns}}}sdt')
+        outer_content = etree.SubElement(outer, f'{{{ns}}}sdtContent')
+        inner = etree.SubElement(outer_content, f'{{{ns}}}sdt')
+        inner_content = etree.SubElement(inner, f'{{{ns}}}sdtContent')
+        p = etree.SubElement(inner_content, f'{{{ns}}}p')
+        r = etree.SubElement(p, f'{{{ns}}}r')
+        t = etree.SubElement(r, f'{{{ns}}}t'); t.text = 'Nested control'
+        first_p.addprevious(outer)
+
+    source = _save_with_document_xml_edit(tmp_path, 'nested-sdt.docx', edit)
+    model = DocxParser().parse(source)
+    assert 'Nested control' in model.plain_text()
+
+
+def test_parser_extracts_runs_wrapped_in_hyperlink(tmp_path):
+    from lxml import etree
+    from word_replica.parser.parser import DocxParser
+
+    def edit(root, ns):
+        body = root.find(f'.//{{{ns}}}body')
+        first_p = body.find(f'{{{ns}}}p')
+        hyperlink = etree.SubElement(first_p, f'{{{ns}}}hyperlink')
+        r = etree.SubElement(hyperlink, f'{{{ns}}}r')
+        t = etree.SubElement(r, f'{{{ns}}}t'); t.text = 'Click here'
+
+    source = _save_with_document_xml_edit(tmp_path, 'hyperlink.docx', edit)
+    model = DocxParser().parse(source)
+    assert 'Click here' in model.plain_text()

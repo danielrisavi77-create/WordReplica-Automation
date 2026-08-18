@@ -15,6 +15,55 @@ def test_renderer_creates_new_docx_with_document_xml(tmp_path):
         assert b"Hello" in z.read("word/document.xml")
 
 
+def test_renderer_writes_run_font_color_size_and_language_not_only_bold_italic(tmp_path):
+    model = DocumentModel(
+        source_sha256="abc",
+        body=[Paragraph("p1", runs=[Run("r1", text="Naslov", properties={
+            "font_ascii": "Times New Roman",
+            "font_hansi": "Times New Roman",
+            "font_cs": "Times New Roman",
+            "color": "000000",
+            "size_half_points": "28",
+            "strike": True,
+            "highlight": "yellow",
+            "vert_align": "superscript",
+            "language": "en-US",
+            "language_east_asia": "en-US",
+            "language_bidi": "ar-SA",
+            "character_spacing": "10",
+            "character_position": "4",
+        })])],
+    )
+    output = tmp_path / "out.docx"
+    PureDocxRenderer().render(model, output, context=None)
+    with ZipFile(output) as z:
+        xml = z.read("word/document.xml").decode("utf-8")
+    assert 'w:ascii="Times New Roman"' in xml
+    assert 'w:val="000000"' in xml
+    assert '<w:sz w:val="28"/>' in xml
+    assert '<w:szCs w:val="28"/>' in xml
+    assert "<w:strike/>" in xml
+    assert 'w:highlight w:val="yellow"' in xml
+    assert 'w:vertAlign w:val="superscript"' in xml
+    assert 'w:lang w:val="en-US" w:eastAsia="en-US" w:bidi="ar-SA"' in xml
+    assert '<w:spacing w:val="10"/>' in xml
+    assert '<w:position w:val="4"/>' in xml
+
+
+def test_renderer_prefers_theme_font_over_literal_name_when_both_present(tmp_path):
+    model = DocumentModel(
+        source_sha256="abc",
+        body=[Paragraph("p1", runs=[Run("r1", text="x", properties={
+            "font_ascii_theme": "majorHAnsi",
+        })])],
+    )
+    output = tmp_path / "out.docx"
+    PureDocxRenderer().render(model, output, context=None)
+    with ZipFile(output) as z:
+        xml = z.read("word/document.xml").decode("utf-8")
+    assert 'w:asciiTheme="majorHAnsi"' in xml
+
+
 def test_renderer_warns_when_preserved_part_cannot_be_safely_related(tmp_path):
     model = DocumentModel(source_sha256="abc")
     model.preserved_parts["word/embeddings/object.bin"] = PreservedPart(
@@ -135,6 +184,55 @@ def test_renderer_roundtrips_bookmarks_and_fields_without_adding_visible_paragra
     assert [b.name for b in rebuilt.bookmarks] == ['TargetBookmark']
     assert len(rebuilt.fields) == 1
     assert 'REF TargetBookmark' in rebuilt.fields[0].instruction
+
+
+def test_renderer_warns_that_field_codes_move_to_end_of_body(tmp_path):
+    from word_replica.domain.model import DocumentModel, Field, Paragraph, Run
+    from word_replica.renderers.pure_docx import PureDocxRenderer
+
+    model = DocumentModel('abc')
+    model.body = [Paragraph('p1', [Run('r1', 'Sadržaj')])]
+    model.fields = [Field('f1', 'TOC \\o "1-3" \\h \\z \\u', '', False)]
+    output = tmp_path / 'field-warning.docx'
+
+    result = PureDocxRenderer().render(model, output, context=None)
+    assert "PURE_DOCX_FIELD_POSITION_UNAVAILABLE" in [w.code for w in result.warnings]
+
+
+def test_renderer_keeps_field_at_its_original_paragraph_when_content_tokens_are_present(tmp_path):
+    from word_replica.domain.model import DocumentModel, Field, Paragraph, Run
+    from word_replica.renderers.pure_docx import PureDocxRenderer
+
+    model = DocumentModel('abc')
+    model.body = [
+        Paragraph('p1', [Run('r1', text='Naslov')]),
+        Paragraph('toc', [
+            Run('r2', properties={'content_tokens': [{'kind': 'field_begin'}]}),
+            Run('r3', properties={'content_tokens': [{'kind': 'field_instruction', 'value': ' TOC \\o "1-3" \\h \\z \\u '}]}),
+            Run('r4', properties={'content_tokens': [{'kind': 'field_separate'}]}),
+            Run('r5', text='1. Uvod\t1'),
+            Run('r6', properties={'content_tokens': [{'kind': 'field_end'}]}),
+        ]),
+        Paragraph('p3', [Run('r7', text='1. Uvod')]),
+        Paragraph('p4', [Run('r8', text='Zaključak')]),
+    ]
+    model.fields = [Field('f1', 'TOC \\o "1-3" \\h \\z \\u', '1. Uvod\t1', False)]
+    output = tmp_path / 'field-inline.docx'
+
+    result = PureDocxRenderer().render(model, output, context=None)
+    assert "PURE_DOCX_FIELD_POSITION_UNAVAILABLE" not in [w.code for w in result.warnings]
+
+    with ZipFile(output) as z:
+        xml = z.read('word/document.xml').decode('utf-8')
+    from lxml import etree
+    root = etree.fromstring(xml.encode('utf-8'))
+    ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+    paragraphs = root.findall('.//w:body/w:p', ns)
+    assert len(paragraphs) == 4
+    # The field markers stay in the second paragraph, not glued onto the last one.
+    assert paragraphs[1].find('.//w:fldChar', ns) is not None
+    assert paragraphs[-1].find('.//w:fldChar', ns) is None
+    assert 'Zaključak' in ''.join(t.text or '' for t in paragraphs[-1].findall('.//w:t', ns))
 
 
 def test_renderer_registers_content_type_for_installed_png_asset(tmp_path):

@@ -45,17 +45,58 @@ def _bool_element(parent, tag: str, value) -> None:
         _set_w(node, "val", "0")
 
 
+_RUN_FONT_ATTRS = (
+    ("ascii", "font_ascii"), ("hAnsi", "font_hansi"),
+    ("eastAsia", "font_east_asia"), ("cs", "font_cs"),
+    ("asciiTheme", "font_ascii_theme"), ("hAnsiTheme", "font_hansi_theme"),
+    ("eastAsiaTheme", "font_east_asia_theme"), ("cstheme", "font_cs_theme"),
+)
+_RUN_PR_KEYS = (
+    "bold", "italic", "underline", "strike",
+    "font_ascii", "font_hansi", "font_east_asia", "font_cs",
+    "font_ascii_theme", "font_hansi_theme", "font_east_asia_theme", "font_cs_theme",
+    "color", "highlight", "vert_align", "size_half_points",
+    "language", "language_east_asia", "language_bidi",
+    "character_spacing", "character_position",
+)
+
+
 def _run_element(run: Run):
     node = _w("r")
     r_pr = None
     props = run.properties
-    if any(key in props for key in ("bold", "italic", "underline", "hidden")) or run.hidden:
+    if any(key in props for key in _RUN_PR_KEYS) or run.hidden:
         r_pr = etree.SubElement(node, f"{W}rPr")
+        if any(props.get(key) is not None for _, key in _RUN_FONT_ATTRS):
+            r_fonts = etree.SubElement(r_pr, f"{W}rFonts")
+            for attr, key in _RUN_FONT_ATTRS:
+                _set_w(r_fonts, attr, props.get(key))
         _bool_element(r_pr, "b", props.get("bold"))
         _bool_element(r_pr, "i", props.get("italic"))
         _bool_element(r_pr, "u", props.get("underline"))
         _bool_element(r_pr, "vanish", run.hidden or props.get("hidden"))
-    if not run.text:
+        _bool_element(r_pr, "strike", props.get("strike"))
+        if props.get("color") is not None:
+            _set_w(etree.SubElement(r_pr, f"{W}color"), "val", props["color"])
+        if props.get("character_spacing") is not None:
+            _set_w(etree.SubElement(r_pr, f"{W}spacing"), "val", props["character_spacing"])
+        if props.get("character_position") is not None:
+            _set_w(etree.SubElement(r_pr, f"{W}position"), "val", props["character_position"])
+        if props.get("size_half_points") is not None:
+            _set_w(etree.SubElement(r_pr, f"{W}sz"), "val", props["size_half_points"])
+            _set_w(etree.SubElement(r_pr, f"{W}szCs"), "val", props["size_half_points"])
+        if props.get("highlight") is not None:
+            _set_w(etree.SubElement(r_pr, f"{W}highlight"), "val", props["highlight"])
+        if props.get("vert_align") is not None:
+            _set_w(etree.SubElement(r_pr, f"{W}vertAlign"), "val", props["vert_align"])
+        if any(props.get(key) is not None for key in ("language", "language_east_asia", "language_bidi")):
+            lang = etree.SubElement(r_pr, f"{W}lang")
+            _set_w(lang, "val", props.get("language"))
+            _set_w(lang, "eastAsia", props.get("language_east_asia"))
+            _set_w(lang, "bidi", props.get("language_bidi"))
+    content_tokens = props.get("content_tokens") or ()
+    has_field_tokens = any(token.get("kind") in _FIELD_TOKEN_KINDS for token in content_tokens)
+    if not run.text and not has_field_tokens:
         return node
     buffer = ""
 
@@ -82,7 +123,43 @@ def _run_element(run: Run):
         else:
             buffer += char
     flush()
+    if has_field_tokens:
+        _append_field_tokens(node, content_tokens)
     return node
+
+
+_FIELD_CHAR_TYPES = {"field_begin": "begin", "field_separate": "separate", "field_end": "end"}
+_FIELD_TOKEN_KINDS = {*_FIELD_CHAR_TYPES, "field_instruction"}
+
+
+def _append_field_tokens(node, content_tokens) -> None:
+    """Recreate a run's own field markers (fldChar/instrText) in place.
+
+    The parser keeps these per-run, at the exact position they were found,
+    so replaying them here (instead of the document-level fallback in
+    _inject_bookmarks_and_fields) preserves the field's original position —
+    e.g. a table of contents stays where it was instead of moving to the
+    end of the document.
+    """
+    for token in content_tokens:
+        kind = token.get("kind")
+        if kind in _FIELD_CHAR_TYPES:
+            _set_w(etree.SubElement(node, f"{W}fldChar"), "fldCharType", _FIELD_CHAR_TYPES[kind])
+        elif kind == "field_instruction":
+            value = str(token.get("value", ""))
+            instr = etree.SubElement(node, f"{W}instrText")
+            if value[:1].isspace() or value[-1:].isspace():
+                instr.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            instr.text = value
+
+
+def _document_has_inline_field_tokens(model: DocumentModel) -> bool:
+    for paragraph in model.iter_paragraphs():
+        for run in paragraph.runs:
+            tokens = run.properties.get("content_tokens") or ()
+            if any(token.get("kind") in _FIELD_TOKEN_KINDS for token in tokens):
+                return True
+    return False
 
 
 def _section_element(section: Section):
@@ -229,11 +306,15 @@ def _inject_bookmarks_and_fields(body, model: DocumentModel) -> None:
         _set_w(end, "id", bookmark_id)
         first.append(end)
 
-    if model.fields:
+    if model.fields and not body.findall(f".//{W}fldChar"):
+        # Real parsed documents already got their fields rendered in place by
+        # _run_element (from each run's own content_tokens), so this branch
+        # only fires for models that carry field definitions without any
+        # inline token representation (e.g. hand-built in tests). It recreates
+        # the instruction sequence without adding new visible text or a new
+        # paragraph, so L0/body structure remains unchanged — but, lacking any
+        # positional information, can only place it at the end of the body.
         target = paragraphs[-1]
-        # The parser models field definitions separately from visible result
-        # text. Recreate the instruction sequence without adding new visible
-        # text or a new paragraph, so L0/body structure remains unchanged.
         for field in model.fields:
             begin_run = etree.SubElement(target, f"{W}r")
             begin = etree.SubElement(begin_run, f"{W}fldChar")
@@ -470,6 +551,12 @@ class PureDocxRenderer:
         Document().save(shell)
         self._package = MutableDocxPackage.from_file(shell)
         self._package.initialize_truthful_lifecycle()
+        if model.fields and not _document_has_inline_field_tokens(model):
+            self._package.warnings.append(WarningItem(
+                code="PURE_DOCX_FIELD_POSITION_UNAVAILABLE",
+                message="Field codes (e.g. table of contents, cross-references) were retained but reinserted at the end of the document body instead of their original position",
+                affects_status=True,
+            ))
         stages = [
             ("body", lambda: self._package.set_document_body(build_body_xml(model))),
             ("styles", lambda: self._package.set_styles(model.styles_xml)),
