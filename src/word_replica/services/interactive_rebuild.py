@@ -8,6 +8,7 @@ import os
 import posixpath
 from pathlib import Path, PurePosixPath
 import tempfile
+import time
 from typing import Callable
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -36,6 +37,28 @@ from word_replica.services.audit import AuditLog
 from word_replica.services.checkpoints import CheckpointManager
 from word_replica.services.project_store import ProjectStore
 from word_replica.services.source_guard import sha256_file
+
+
+def _replace_with_retry(source: Path, destination: Path, *, attempts: int = 20, delay_seconds: float = 0.25) -> None:
+    """Finalization runs a long chain of package-cleanup passes, each
+    rewriting `destination` via a temp-file rename. Windows can transiently
+    deny that rename right after a file is written - antivirus/indexer
+    scanning is the common cause - even though no WordReplica-owned process
+    still holds a handle on it. Retry briefly before giving up so a real
+    permission problem still surfaces as an error.
+    """
+    last: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            source.replace(destination)
+            return
+        except OSError as exc:
+            last = exc
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(delay_seconds)
+    if last is not None:
+        raise last
 
 
 class _CompositeObserver:
@@ -371,7 +394,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return removed
@@ -441,7 +464,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return removed
@@ -483,7 +506,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return removed
@@ -520,7 +543,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return len(unexpected)
@@ -573,7 +596,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return restored
@@ -621,7 +644,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return restored
@@ -727,7 +750,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return restored
@@ -896,7 +919,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return restored
@@ -934,7 +957,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return restored
@@ -975,7 +998,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return restored
@@ -1019,7 +1042,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return restored
@@ -1056,7 +1079,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return 1
@@ -1185,7 +1208,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return restored_style_fonts
@@ -1224,7 +1247,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return restored
@@ -1264,7 +1287,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return restored
@@ -1518,7 +1541,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return restored
@@ -1615,7 +1638,7 @@ class InteractiveRebuildService:
             with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
                 for name, data in parts.items():
                     archive.writestr(name, data)
-            Path(temporary_name).replace(output_path)
+            _replace_with_retry(Path(temporary_name), output_path)
         finally:
             Path(temporary_name).unlink(missing_ok=True)
         return restored
