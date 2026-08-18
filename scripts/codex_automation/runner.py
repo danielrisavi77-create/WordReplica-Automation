@@ -250,7 +250,11 @@ class GoldenRunner:
                 report["full_pass"] = False
                 report["source_integrity_error"] = "Golden source SHA-256 changed during run"
 
-            state_path = self.config.state_dir / f"automation_state_{golden_id}.json"
+            # golden_1 keeps the legacy filename so existing accumulated
+            # production state (best_score, consecutive-pass streak) is not
+            # silently abandoned by introducing per-document state files.
+            state_filename = "automation_state.json" if golden_id == "golden_1" else f"automation_state_{golden_id}.json"
+            state_path = self.config.state_dir / state_filename
             state = load_state(state_path)
             decision = evaluate_run(state, report)
             if not source_unchanged:
@@ -261,7 +265,10 @@ class GoldenRunner:
             save_state(state_path, state)
             _write_json(report_path, report)
 
-            golden_diagnostics_dir = self.config.diagnostics_dir / golden_id
+            # golden_1 keeps the flat diagnostics_dir layout: AGENTS.md tells
+            # operators to read the latest run straight from diagnostics_dir,
+            # and it already holds real accumulated run history there.
+            golden_diagnostics_dir = self.config.diagnostics_dir if golden_id == "golden_1" else self.config.diagnostics_dir / golden_id
             final_dir = golden_diagnostics_dir / run.run_id
             final_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(run.run_dir), str(final_dir))

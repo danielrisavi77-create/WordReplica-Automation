@@ -76,10 +76,12 @@ def test_runner_produces_report_moves_run_and_preserves_golden(tmp_path):
     )
     report_path = runner.run()
 
-    assert report_path.parent.parent == root / "diagnostics" / "golden_1"
+    assert report_path.parent.parent == root / "diagnostics"
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["golden_id"] == "golden_1"
     assert report["gates_main_promotion"] is True
+    assert (root / "state" / "automation_state.json").exists()
+    assert not (root / "state" / "automation_state_golden_1.json").exists()
     assert report["commit_sha"] == "deadbeef"
     assert report["source_unchanged"] is True
     assert report["environment"] == {"os": {"system": "TestOS"}, "word": {"available": True, "build": "99.0"}}
