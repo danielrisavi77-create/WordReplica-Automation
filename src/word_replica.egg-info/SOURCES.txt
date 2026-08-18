@@ -26,7 +26,9 @@ src/word_replica/interactive/checkpoints.py
 src/word_replica/interactive/control.py
 src/word_replica/interactive/preflight.py
 src/word_replica/interactive/speed.py
+src/word_replica/interactive/table_batch.py
 src/word_replica/interactive/tables.py
+src/word_replica/interactive/text_preview.py
 src/word_replica/interactive/verification.py
 src/word_replica/opc/__init__.py
 src/word_replica/opc/package_reader.py

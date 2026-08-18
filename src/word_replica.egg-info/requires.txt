@@ -4,6 +4,8 @@ platformdirs<5,>=4
 pypdfium2<6,>=4
 Pillow<13,>=10
 Jinja2<4,>=3.1
+cryptography<51,>=50
+rfc8785<0.2,>=0.1.4
 
 [:sys_platform == "win32"]
 pywin32>=306

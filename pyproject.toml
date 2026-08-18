@@ -14,6 +14,8 @@ dependencies = [
   "Pillow>=10,<13",
   "Jinja2>=3.1,<4",
   "pywin32>=306; sys_platform == 'win32'",
+  "cryptography>=50,<51",
+  "rfc8785>=0.1.4,<0.2",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +27,9 @@ build = ["pyinstaller>=6,<8"]
 word-replica = "word_replica.cli:main"
 word-replica-gui = "word_replica.gui.app:main"
 word-replica-desktop = "word_replica.desktop:main"
+
+[tool.setuptools.package-data]
+word_replica = ["repair_contract/fixer_ids.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
