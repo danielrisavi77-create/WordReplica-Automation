@@ -59,7 +59,7 @@ def sanitize_word_bookmark_name(name: str, *, taken: set[str]) -> str:
     return candidate
 
 
-def _replace_with_retry(source: Path, destination: Path, *, attempts: int = 20, delay_seconds: float = 0.25) -> None:
+def _replace_with_retry(source: Path, destination: Path, *, attempts: int = 60, delay_seconds: float = 0.5) -> None:
     """Word can still hold a brief lock on a file immediately after SaveAs2
     returns, even though the COM call itself already completed. Retry a
     same-machine rename briefly before giving up so a real permission

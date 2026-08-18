@@ -39,7 +39,7 @@ from word_replica.services.project_store import ProjectStore
 from word_replica.services.source_guard import sha256_file
 
 
-def _replace_with_retry(source: Path, destination: Path, *, attempts: int = 20, delay_seconds: float = 0.25) -> None:
+def _replace_with_retry(source: Path, destination: Path, *, attempts: int = 60, delay_seconds: float = 0.5) -> None:
     """Finalization runs a long chain of package-cleanup passes, each
     rewriting `destination` via a temp-file rename. Windows can transiently
     deny that rename right after a file is written - antivirus/indexer
