@@ -2,8 +2,13 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from lxml import etree
+import pytest
 
-from word_replica.renderers.interactive_word import _restore_bookmark_names, sanitize_word_bookmark_name
+from word_replica.renderers.interactive_word import (
+    _replace_with_retry,
+    _restore_bookmark_names,
+    sanitize_word_bookmark_name,
+)
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
@@ -77,3 +82,52 @@ def test_restore_bookmark_names_is_a_noop_with_no_rewrites(tmp_path):
     _restore_bookmark_names(docx_path, {})
 
     assert docx_path.read_bytes() == before
+
+
+def test_replace_with_retry_recovers_from_transient_permission_error(tmp_path, monkeypatch):
+    source = tmp_path / "a.tmp"
+    destination = tmp_path / "a.docx"
+    source.write_bytes(b"data")
+    calls = {"count": 0}
+    real_replace = Path.replace
+
+    def flaky_replace(self, target):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise PermissionError(5, "Access is denied")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+
+    _replace_with_retry(source, destination, attempts=5, delay_seconds=0)
+
+    assert calls["count"] == 3
+    assert destination.read_bytes() == b"data"
+
+
+def test_restore_bookmark_names_cleans_up_temp_file_when_rename_never_succeeds(tmp_path, monkeypatch):
+    docx_path = tmp_path / "sample.docx"
+    document_xml = (
+        b"<?xml version='1.0' encoding='UTF-8' standalone='yes'?>"
+        b'<w:document xmlns:w="' + _W_NS.encode() + b'">'
+        b"<w:body>"
+        b'<w:p><w:bookmarkStart w:id="0" w:name="com_safe"/>'
+        b"<w:r><w:t>Text</w:t></w:r>"
+        b'<w:bookmarkEnd w:id="0"/></w:p>'
+        b"</w:body></w:document>"
+    )
+    with ZipFile(docx_path, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document_xml)
+
+    def always_denied(self, target):
+        raise PermissionError(5, "Access is denied")
+
+    import word_replica.renderers.interactive_word as interactive_word_module
+
+    monkeypatch.setattr(Path, "replace", always_denied)
+    monkeypatch.setattr(interactive_word_module, "_replace_with_retry", lambda src, dst: src.replace(dst))
+
+    with pytest.raises(PermissionError):
+        _restore_bookmark_names(docx_path, {"com_safe": "original-name"})
+
+    assert not docx_path.with_suffix(".docx.tmp").exists()
