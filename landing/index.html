@@ -1,0 +1,652 @@
+<title>Word Replica</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Lokalna rekonstrukcija .docx dokumenata kroz pravi Microsoft Word, s automatskom QA provjerom koja ne izmišlja rezultate.">
+<link rel="icon" type="image/png" href="data:image/png;base64,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">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400;1,6..72,500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --paper: #f2f5f9;
+    --surface: #ffffff;
+    --surface-sunken: #e8edf4;
+    --ink: #12213b;
+    --ink-soft: #48566f;
+    --ink-faint: #7c879c;
+    --line: #d7dee8;
+    --line-strong: #b9c4d4;
+    --accent: #2c62a8;
+    --accent-deep: #1e3a5f;
+    --accent-tint: #e3ecf7;
+    --verified: #1f8a6f;
+    --verified-tint: #e1f3ee;
+    --warn: #a9711a;
+    --warn-tint: #f7ecd9;
+    --shadow: 0 1px 2px rgba(18, 33, 59, 0.06), 0 12px 32px -16px rgba(18, 33, 59, 0.18);
+    --radius-s: 3px;
+    --radius-m: 6px;
+    --font-display: "Newsreader", Georgia, "Times New Roman", serif;
+    --font-body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+    --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0b1526;
+      --surface: #101e33;
+      --surface-sunken: #0d1a2c;
+      --ink: #e9edf6;
+      --ink-soft: #aab7cc;
+      --ink-faint: #7787a1;
+      --line: #24354e;
+      --line-strong: #34486a;
+      --accent: #6d9cdb;
+      --accent-deep: #9fc0ea;
+      --accent-tint: #17273f;
+      --verified: #4fbc9a;
+      --verified-tint: #12291f;
+      --warn: #d9a24f;
+      --warn-tint: #2c2412;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px -16px rgba(0, 0, 0, 0.5);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
+  }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  img { max-width: 100%; display: block; }
+
+  .wrap {
+    width: min(1040px, 100% - 3rem);
+    margin-inline: auto;
+  }
+
+  a { color: inherit; }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 500;
+  }
+
+  /* ---------- top bar ---------- */
+  header.site {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: color-mix(in srgb, var(--paper) 88%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  header.site .bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.9rem 0;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    text-decoration: none;
+  }
+  .brand img { width: 26px; height: 26px; }
+  .brand span {
+    font-family: var(--font-mono);
+    font-weight: 500;
+    font-size: 0.95rem;
+    letter-spacing: 0.01em;
+    color: var(--ink);
+  }
+  nav.links { display: flex; align-items: center; gap: 1.6rem; }
+  nav.links a.textlink {
+    font-size: 0.88rem;
+    color: var(--ink-soft);
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+  nav.links a.textlink:hover { color: var(--ink); border-color: var(--line-strong); }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: var(--font-body);
+    font-weight: 600;
+    font-size: 0.88rem;
+    padding: 0.62rem 1.1rem;
+    border-radius: var(--radius-m);
+    text-decoration: none;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn-primary {
+    background: var(--accent-deep);
+    color: #fbfcfe;
+    box-shadow: var(--shadow);
+  }
+  .btn-primary:hover { background: var(--accent); }
+  .btn-ghost {
+    background: transparent;
+    border-color: var(--line-strong);
+    color: var(--ink);
+  }
+  .btn-ghost:hover { border-color: var(--accent); color: var(--accent-deep); }
+  .btn-small { padding: 0.45rem 0.8rem; font-size: 0.8rem; }
+
+  /* ---------- hero ---------- */
+  .hero {
+    padding: clamp(3.2rem, 7vw, 6rem) 0 clamp(2.5rem, 6vw, 4.5rem);
+  }
+  .hero-grid {
+    display: grid;
+    grid-template-columns: 1.1fr 0.9fr;
+    gap: clamp(2rem, 5vw, 4rem);
+    align-items: center;
+  }
+  @media (max-width: 860px) {
+    .hero-grid { grid-template-columns: 1fr; }
+  }
+  .hero h1 {
+    font-family: var(--font-display);
+    font-weight: 500;
+    font-size: clamp(2.2rem, 4.6vw, 3.4rem);
+    line-height: 1.12;
+    letter-spacing: -0.01em;
+    margin: 0.7rem 0 1.1rem;
+    text-wrap: balance;
+    color: var(--ink);
+  }
+  .hero h1 em {
+    font-style: italic;
+    color: var(--accent-deep);
+  }
+  .hero p.lede {
+    font-size: 1.08rem;
+    color: var(--ink-soft);
+    max-width: 46ch;
+    margin: 0 0 1.9rem;
+  }
+  .cta-row { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }
+  .cta-note {
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+  }
+
+  /* ---------- QA report card (hero visual) ---------- */
+  .report-card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    font-family: var(--font-mono);
+    animation: rise 0.6s ease both;
+  }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .report-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.85rem 1.1rem;
+    background: var(--surface-sunken);
+    border-bottom: 1px solid var(--line);
+  }
+  .report-head .name { font-size: 0.78rem; color: var(--ink-soft); }
+  .status-pill {
+    font-size: 0.68rem;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    padding: 0.22rem 0.55rem;
+    border-radius: 999px;
+    text-transform: uppercase;
+  }
+  .status-pill.pass { background: var(--verified-tint); color: var(--verified); }
+  .status-pill.warn { background: var(--warn-tint); color: var(--warn); }
+
+  .report-body { padding: 1rem 1.1rem 1.15rem; }
+  .qa-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.5rem 0;
+    border-bottom: 1px dashed var(--line);
+    font-size: 0.78rem;
+  }
+  .qa-row:last-of-type { border-bottom: none; }
+  .qa-row .lvl { color: var(--ink-faint); width: 2.1rem; flex-shrink: 0; }
+  .qa-row .desc { color: var(--ink-soft); flex: 1; }
+
+  .report-foot {
+    margin-top: 0.9rem;
+    padding-top: 0.8rem;
+    border-top: 1px solid var(--line);
+    font-size: 0.7rem;
+    color: var(--ink-faint);
+    display: flex;
+    justify-content: space-between;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+  }
+  .report-foot .hash { color: var(--ink-soft); }
+
+  /* ---------- manifesto ---------- */
+  .manifesto {
+    padding: clamp(3rem, 7vw, 5rem) 0;
+    border-top: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
+  }
+  .manifesto blockquote {
+    margin: 0;
+    font-family: var(--font-display);
+    font-style: italic;
+    font-weight: 400;
+    font-size: clamp(1.35rem, 3vw, 1.9rem);
+    line-height: 1.45;
+    text-wrap: balance;
+    max-width: 34ch;
+    color: var(--ink);
+  }
+  .manifesto blockquote span { color: var(--accent-deep); font-style: normal; }
+  .manifesto cite {
+    display: block;
+    margin-top: 1.4rem;
+    font-family: var(--font-mono);
+    font-style: normal;
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+  }
+
+  /* ---------- section shell ---------- */
+  section.block { padding: clamp(3.2rem, 7vw, 5.5rem) 0; }
+  .block h2 {
+    font-family: var(--font-display);
+    font-weight: 500;
+    font-size: clamp(1.6rem, 3vw, 2.1rem);
+    margin: 0.5rem 0 0.6rem;
+    text-wrap: balance;
+  }
+  .block > .head { max-width: 56ch; margin-bottom: 2.6rem; }
+  .block > .head p { color: var(--ink-soft); margin: 0; }
+
+  /* ---------- steps ---------- */
+  .steps {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    overflow: hidden;
+  }
+  @media (max-width: 860px) {
+    .steps { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 520px) {
+    .steps { grid-template-columns: 1fr; }
+  }
+  .step {
+    background: var(--surface);
+    padding: 1.6rem 1.4rem;
+  }
+  .step .num {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--accent);
+    margin-bottom: 0.9rem;
+  }
+  .step h3 {
+    font-size: 0.98rem;
+    font-weight: 600;
+    margin: 0 0 0.5rem;
+  }
+  .step p {
+    font-size: 0.85rem;
+    color: var(--ink-soft);
+    margin: 0;
+  }
+
+  /* ---------- modes ---------- */
+  .modes { display: flex; flex-direction: column; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: var(--radius-m); overflow: hidden; }
+  .mode-row {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 1.2rem;
+    background: var(--surface);
+    padding: 1.3rem 1.6rem;
+  }
+  @media (max-width: 700px) {
+    .mode-row { grid-template-columns: 1fr; text-align: left; gap: 0.5rem; }
+    .mode-row .switch { justify-self: start; }
+  }
+  .mode-opt { font-size: 0.92rem; }
+  .mode-opt.left { text-align: right; }
+  .mode-opt .label { font-weight: 600; color: var(--ink); display: block; }
+  .mode-opt .sub { font-size: 0.8rem; color: var(--ink-faint); }
+  .mode-opt.right .label, .mode-opt.right .sub { text-align: left; }
+  @media (max-width: 700px) {
+    .mode-opt.left { text-align: left; }
+  }
+  .switch {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.08em;
+    color: var(--ink-faint);
+    background: var(--surface-sunken);
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+    padding: 0.3rem 0.7rem;
+    justify-self: center;
+  }
+
+  /* ---------- download ---------- */
+  .download-panel {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    box-shadow: var(--shadow);
+    padding: clamp(1.8rem, 4vw, 2.6rem);
+    display: grid;
+    grid-template-columns: 1.3fr 1fr;
+    gap: 2.5rem;
+  }
+  @media (max-width: 780px) {
+    .download-panel { grid-template-columns: 1fr; }
+  }
+  .download-panel h2 { margin-top: 0.3rem; }
+  .req-list { list-style: none; margin: 1.3rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.55rem; }
+  .req-list li {
+    font-size: 0.86rem;
+    color: var(--ink-soft);
+    padding-left: 1.15rem;
+    position: relative;
+  }
+  .req-list li::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0.5em;
+    width: 6px;
+    height: 6px;
+    background: var(--accent);
+    border-radius: 50%;
+  }
+  .release-box {
+    background: var(--surface-sunken);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    padding: 1.4rem 1.5rem;
+    font-family: var(--font-mono);
+  }
+  .release-box .row {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    font-size: 0.78rem;
+    padding: 0.5rem 0;
+    border-bottom: 1px dashed var(--line);
+  }
+  .release-box .row:last-of-type { border-bottom: none; }
+  .release-box .k { color: var(--ink-faint); }
+  .release-box .v { color: var(--ink-soft); text-align: right; }
+  .release-box .pending { color: var(--warn); }
+  .download-cta { margin-top: 1.6rem; display: flex; flex-direction: column; gap: 0.6rem; align-items: flex-start; }
+  .btn-primary[aria-disabled="true"] {
+    background: var(--surface-sunken);
+    color: var(--ink-faint);
+    border-color: var(--line-strong);
+    box-shadow: none;
+    cursor: default;
+  }
+  .btn-primary[aria-disabled="true"]:hover { background: var(--surface-sunken); }
+
+  /* ---------- footer ---------- */
+  footer.site {
+    border-top: 1px solid var(--line);
+    padding: 2.2rem 0;
+  }
+  footer.site .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 1rem;
+  }
+  footer.site .row p {
+    margin: 0;
+    font-size: 0.8rem;
+    color: var(--ink-faint);
+  }
+  footer.site nav { display: flex; gap: 1.4rem; }
+  footer.site nav a {
+    font-size: 0.8rem;
+    color: var(--ink-soft);
+    text-decoration: none;
+  }
+  footer.site nav a:hover { color: var(--accent-deep); }
+
+  .reveal { opacity: 0; transform: translateY(14px); transition: opacity 0.5s ease, transform 0.5s ease; }
+  .reveal.in { opacity: 1; transform: translateY(0); }
+</style>
+
+<header class="site">
+  <div class="wrap bar">
+    <a class="brand" href="#top">
+      <img src="data:image/png;base64,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" alt="">
+      <span>WORD REPLICA</span>
+    </a>
+    <nav class="links">
+      <a class="textlink" href="#kako-radi">Kako radi</a>
+      <a class="textlink" href="#integritet">Integritet</a>
+      <a class="textlink" href="https://github.com/danielrisavi77-create/WordReplica-Automation" target="_blank" rel="noopener">Izvorni kod</a>
+      <a class="btn btn-primary btn-small" href="#preuzimanje">Preuzmi</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div>
+        <p class="eyebrow">Lokalna rekonstrukcija .docx dokumenata</p>
+        <h1>Prepravi dokument.<br>Dokaži da je <em>ostao isti</em>.</h1>
+        <p class="lede">Word Replica ponovno izgradi tvoj .docx kroz kanonski model dokumenta — pravim Microsoft Wordom kad je dostupan, uz Pure DOCX kao alternativu — i svaki put ispiše QA izvještaj koji ne izmišlja rezultate.</p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="#preuzimanje">Preuzmi za Windows</a>
+          <a class="btn btn-ghost" href="https://github.com/danielrisavi77-create/WordReplica-Automation" target="_blank" rel="noopener">Pogledaj izvorni kod</a>
+        </div>
+        <p class="cta-note" style="margin-top:0.9rem;">Windows 10/11 · Microsoft Word desktop opcionalan</p>
+      </div>
+
+      <div class="report-card" aria-hidden="true">
+        <div class="report-head">
+          <span class="name">qa_report.html</span>
+          <span class="status-pill warn">WARN</span>
+        </div>
+        <div class="report-body">
+          <div class="qa-row"><span class="lvl">L0</span><span class="desc">Sadržaj — vidljivi tekst i bilješke</span><span class="status-pill pass">PASS</span></div>
+          <div class="qa-row"><span class="lvl">L1</span><span class="desc">Struktura — tijelo, tablice, objekti</span><span class="status-pill pass">PASS</span></div>
+          <div class="qa-row"><span class="lvl">L2</span><span class="desc">Formatiranje — model odlomka i runa</span><span class="status-pill pass">PASS</span></div>
+          <div class="qa-row"><span class="lvl">L3</span><span class="desc">Izgled — sekcije i stranice</span><span class="status-pill warn">WARN</span></div>
+          <div class="qa-row"><span class="lvl">L4</span><span class="desc">Render — vizualna usporedba stranica</span><span class="status-pill pass">PASS</span></div>
+          <div class="report-foot">
+            <span>izvor SHA-256 nepromijenjen</span>
+            <span class="hash">8f61…c4a2</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="manifesto">
+    <div class="wrap">
+      <blockquote>
+        Ne simulira kucanje. Ne izmišlja vrijeme uređivanja. Ne tvrdi da je vizualno <span>identično</span> kad to ne može provjeriti.
+        <cite>— granica integriteta, ugrađena u svaki rebuild</cite>
+      </blockquote>
+    </div>
+  </section>
+
+  <section class="block reveal" id="kako-radi">
+    <div class="wrap">
+      <div class="head">
+        <p class="eyebrow">Kako radi</p>
+        <h2>Četiri koraka, svaki zabilježen</h2>
+        <p>Od prvog dodira izvora do konačnog izvještaja, svaka faza ostavlja trag u <code>audit.jsonl</code>.</p>
+      </div>
+      <div class="steps">
+        <div class="step">
+          <div class="num">01</div>
+          <h3>Odabir izvora</h3>
+          <p>SHA-256 izvora se zabilježi prije početka. Originalni fajl ostaje read-only tokom cijelog procesa.</p>
+        </div>
+        <div class="step">
+          <div class="num">02</div>
+          <h3>Rekonstrukcija</h3>
+          <p>Microsoft Word COM (vidljivo ili u pozadini) ili Pure DOCX kada Word nije dostupan.</p>
+        </div>
+        <div class="step">
+          <div class="num">03</div>
+          <h3>QA provjera</h3>
+          <p>Pet razina, od sadržaja do vizualnog rendera — svaka razina dobije PASS, WARN ili FAIL.</p>
+        </div>
+        <div class="step">
+          <div class="num">04</div>
+          <h3>Audit trag</h3>
+          <p>Svaki save i svako upozorenje upisani su u log, s konačnim <code>qa_report.html</code>.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block reveal">
+    <div class="wrap">
+      <div class="head">
+        <p class="eyebrow">Postavke</p>
+        <h2>Tri para opcija, uvijek eksplicitni</h2>
+        <p>Ništa se ne bira automatski u tvoje ime — svaki rebuild jasno kaže koji je par odabran.</p>
+      </div>
+      <div class="modes">
+        <div class="mode-row">
+          <div class="mode-opt left"><span class="label">Vidljivo</span><span class="sub">Word prozor se vidi tokom rada</span></div>
+          <span class="switch">VIDLJIVOST</span>
+          <div class="mode-opt right"><span class="label">U pozadini</span><span class="sub">Rekonstrukcija bez prikaza prozora</span></div>
+        </div>
+        <div class="mode-row">
+          <div class="mode-opt left"><span class="label">Čista replika</span><span class="sub">Uklanja komentare, izmjene, skriveni tekst</span></div>
+          <span class="switch">VJERNOST</span>
+          <div class="mode-opt right"><span class="label">Puna vjernost</span><span class="sub">Čuva komentare, revizije, polja kao dokaz</span></div>
+        </div>
+        <div class="mode-row">
+          <div class="mode-opt left"><span class="label">Svježi metapodaci</span><span class="sub">Kreće od metapodataka novog dokumenta</span></div>
+          <span class="switch">METAPODACI</span>
+          <div class="mode-opt right"><span class="label">Sačuvani legitimni</span><span class="sub">Kopira samo eksplicitno dozvoljena polja</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block reveal" id="integritet">
+    <div class="wrap">
+      <div class="head">
+        <p class="eyebrow">Granica integriteta</p>
+        <h2>Ono što alat namjerno ne radi</h2>
+        <p>Word Replica automatizira rekonstrukciju dokumenta — ne oponaša ljudsko autorstvo i ne skriva ograničenja.</p>
+      </div>
+      <div class="steps" style="grid-template-columns: repeat(3, 1fr);">
+        <div class="step">
+          <h3>Bez lažnog autorstva</h3>
+          <p>Ne dodaje tipfelere, ispravke ni kašnjenja u tipkanju da bi automatizirani rad izgledao ljudski.</p>
+        </div>
+        <div class="step">
+          <h3>Bez izmišljene provenijencije</h3>
+          <p>Ne fabricira vrijeme uređivanja, broj revizija ni historiju spašavanja — samo stvarno zabilježene evente.</p>
+        </div>
+        <div class="step">
+          <h3>Bez skrivenih ograničenja</h3>
+          <p>Kad vizualna vjernost nije tehnički provjerljiva, izvještaj to kaže — nikad ne izmišlja PASS.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block reveal" id="preuzimanje">
+    <div class="wrap">
+      <div class="download-panel">
+        <div>
+          <p class="eyebrow">Preuzimanje</p>
+          <h2>Word Replica za Windows</h2>
+          <p style="color:var(--ink-soft); max-width:42ch;">Jedan .exe, bez instalacije trećih alata. Prečica se postavi na Desktop i u Start meni, izvor ostaje netaknut.</p>
+          <ul class="req-list">
+            <li>Windows 10 ili 11, 64-bit</li>
+            <li>Microsoft Word desktop — opcionalan, potreban samo za Puna vjernost render</li>
+            <li>Administratorska prava nisu potrebna</li>
+          </ul>
+          <div class="download-cta">
+            <a class="btn btn-primary" aria-disabled="true" href="https://github.com/danielrisavi77-create/WordReplica-Automation/releases" target="_blank" rel="noopener" title="Verzija se priprema — pratite GitHub izdanja">Preuzmi WordReplica.exe</a>
+            <span class="cta-note">verzija se priprema — pratite GitHub izdanja za obavijest</span>
+          </div>
+        </div>
+        <div class="release-box">
+          <div class="row"><span class="k">verzija</span><span class="v">2.0.4</span></div>
+          <div class="row"><span class="k">veličina</span><span class="v pending">u pripremi</span></div>
+          <div class="row"><span class="k">sha-256</span><span class="v pending">u pripremi</span></div>
+          <div class="row"><span class="k">renderer</span><span class="v">word · pure-docx</span></div>
+          <div class="row"><span class="k">licenca</span><span class="v">vidi repozitorij</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="site">
+  <div class="wrap row">
+    <p>Word Replica — lokalna rekonstrukcija i QA, bez slanja dokumenata na server.</p>
+    <nav>
+      <a href="https://github.com/danielrisavi77-create/WordReplica-Automation" target="_blank" rel="noopener">GitHub</a>
+      <a href="#integritet">Granica integriteta</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+  if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches && 'IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+      });
+    }, { threshold: 0.12 });
+    document.querySelectorAll('.reveal').forEach(function (el) { io.observe(el); });
+  } else {
+    document.querySelectorAll('.reveal').forEach(function (el) { el.classList.add('in'); });
+  }
+</script>

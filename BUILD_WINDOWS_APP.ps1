@@ -54,6 +54,7 @@ Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
     --onefile `
     --windowed `
     --name WordReplica `
+    --icon assets\icon.ico `
     --paths src `
     --hidden-import word_replica.desktop `
     --hidden-import pythoncom `
