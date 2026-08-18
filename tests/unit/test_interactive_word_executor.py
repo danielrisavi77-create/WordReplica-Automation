@@ -492,10 +492,11 @@ class NativeBatchCellRange(NativeBatchFormattingRange):
 
 
 class NativeBatchTableRange:
-    def __init__(self, after_range):
+    def __init__(self, after_range, cells=()):
         self.after_range = after_range
         self.duplicates = []
         self._returned_after_range = False
+        self.Cells = list(cells)
 
     @property
     def Duplicate(self):
@@ -513,7 +514,7 @@ class NativeBatchTable(FakeTable):
         for index, cell in enumerate(self._cells.values()):
             cell.Range = NativeBatchCellRange(start=index * 2, end=index * 2 + 2)
         self.after_range = FormattingRange()
-        self.Range = NativeBatchTableRange(self.after_range)
+        self.Range = NativeBatchTableRange(self.after_range, self._cells.values())
 
 
 class NativeBatchDocument(FakeDocument):
@@ -579,6 +580,10 @@ def test_native_table_batch_inserts_once_and_converts_without_tables_add():
     ]
     assert all(record[0] != "create_table" for record in log)
     assert controller.active_range is table.after_range
+    # Table.Cell(row, column) re-resolves from the table root on every call
+    # and gets dramatically slower as the table/document grows; geometry
+    # must come from a single Range.Cells enumeration instead.
+    assert all(record[0] != "lookup" for record in log)
 
 
 def test_native_table_batch_formats_exact_cell_and_run_ranges():

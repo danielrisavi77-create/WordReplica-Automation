@@ -1249,12 +1249,17 @@ class InteractiveWordController:
         )
         finish_phase("convert")
         start_phase("geometry")
-        word_cells = {
-            (row, column): _retry_rejected_com_call(
-                lambda row=row, column=column: table.Cell(row, column)
-            )
-            for row, column in expected_coordinates
-        }
+        # Word's Table.Cell(row, column) re-resolves from the table root on
+        # every call - O(n) or worse per call, so a per-cell loop is O(n^2)
+        # over the whole table and gets dramatically slower as the table (and
+        # the surrounding document) grows. A single pass over the table's own
+        # Range.Cells collection returns every cell in row-major order in one
+        # COM enumeration instead of `rows * columns` individual round trips.
+        table_range_for_cells = _retry_getattr(table, "Range")
+        cells_collection = _retry_rejected_com_call(lambda: list(table_range_for_cells.Cells))
+        if len(cells_collection) != len(expected_coordinates):
+            raise RuntimeError("InsertTableBatch cell collection size mismatch")
+        word_cells = dict(zip(expected_coordinates, cells_collection))
         table_range = _retry_getattr(table, "Range")
         after_range = self._duplicate_range(table_range)
         collapse = _retry_getattr(after_range, "Collapse", None)
