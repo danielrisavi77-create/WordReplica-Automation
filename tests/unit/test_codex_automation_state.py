@@ -37,3 +37,25 @@ def test_two_full_passes_on_same_commit_make_promotion_ready():
 
     assert first.promotion_ready is False
     assert second.promotion_ready is True
+
+
+def test_full_pass_on_different_word_build_does_not_count_as_consecutive():
+    state = AutomationState()
+    gates = _gates(*[f"G{i}" for i in range(10)])
+
+    def full_pass_report(build):
+        return {
+            "gates": gates,
+            "full_pass": True,
+            "commit_sha": "abc",
+            "environment": {"word": {"build": build}},
+        }
+
+    first = evaluate_run(state, full_pass_report("16.0.1"))
+    second = evaluate_run(state, full_pass_report("16.0.2"))
+    third = evaluate_run(state, full_pass_report("16.0.2"))
+
+    assert first.promotion_ready is False
+    assert second.promotion_ready is False
+    assert third.promotion_ready is True
+    assert state.consecutive_full_pass_same_commit == 2

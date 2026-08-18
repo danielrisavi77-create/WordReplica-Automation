@@ -69,6 +69,56 @@ def export_docx_to_pdf_with_word(docx_path: Path, pdf_path: Path, visible: bool 
             pythoncom.CoUninitialize()
 
 
+def _document_compatibility_mode(application, docx_path: Path) -> int | None:
+    doc = None
+    try:
+        doc = application.Documents.Open(
+            FileName=str(Path(docx_path).resolve()),
+            ReadOnly=True,
+            AddToRecentFiles=False,
+            Visible=False,
+        )
+        return int(doc.CompatibilityMode)
+    except Exception:
+        return None
+    finally:
+        if doc is not None:
+            with suppress(Exception):
+                doc.Close(SaveChanges=False)
+
+
+def read_docx_pair_compatibility_mode(
+    source_docx_path: Path,
+    output_docx_path: Path,
+) -> dict[str, int | None]:
+    import pythoncom
+    import win32com.client
+
+    application = None
+    owned_word_pid = None
+    existing_word_pids = word_process_pids()
+    pythoncom.CoInitialize()
+    try:
+        application = win32com.client.DispatchEx("Word.Application")
+        owned_word_pid = record_owned_word(
+            application, role="compatibility-mode-probe", existing_word_pids=existing_word_pids
+        )
+        application.Visible = False
+        with suppress(Exception):
+            application.DisplayAlerts = 0
+        return {
+            "source": _document_compatibility_mode(application, Path(source_docx_path)),
+            "output": _document_compatibility_mode(application, Path(output_docx_path)),
+        }
+    finally:
+        if application is not None:
+            with suppress(Exception):
+                application.Quit()
+        clear_owned_word(owned_word_pid)
+        with suppress(Exception):
+            pythoncom.CoUninitialize()
+
+
 def export_docx_pair_to_pdf_with_word(
     source_docx_path: Path,
     source_pdf_path: Path,

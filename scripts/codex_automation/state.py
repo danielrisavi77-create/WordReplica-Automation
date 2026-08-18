@@ -11,6 +11,7 @@ class AutomationState:
     best_score: int = 0
     no_improvement_count: int = 0
     last_full_pass_commit: str | None = None
+    last_full_pass_word_build: str | None = None
     consecutive_full_pass_same_commit: int = 0
 
 
@@ -27,16 +28,23 @@ def evaluate_run(state: AutomationState, report: dict) -> AutomationDecision:
     regressed = sorted(name for name, was_pass in state.last_gate_status.items() if was_pass and not current.get(name, False))
     score = sum(1 for value in current.values() if value)
     commit_sha = str(report.get("commit_sha") or "")
+    word_build = ((report.get("environment") or {}).get("word") or {}).get("build")
     full_pass = bool(report.get("full_pass")) and len(current) == 10 and all(current.values())
 
     if full_pass:
-        if state.last_full_pass_commit == commit_sha:
+        # Two consecutive FULL PASS results must land on the same commit AND the
+        # same Word build - a build change is an environment change, and a pass
+        # verified on a different Word build is not evidence the golden commit
+        # is stable on the build it was previously verified against.
+        if state.last_full_pass_commit == commit_sha and state.last_full_pass_word_build == word_build:
             state.consecutive_full_pass_same_commit += 1
         else:
             state.last_full_pass_commit = commit_sha
+            state.last_full_pass_word_build = word_build
             state.consecutive_full_pass_same_commit = 1
     else:
         state.last_full_pass_commit = None
+        state.last_full_pass_word_build = None
         state.consecutive_full_pass_same_commit = 0
 
     if regressed:

@@ -26,6 +26,7 @@ class GoldenRunPaths:
     source_copy: Path
     source_sha256_before: str
     ownership_file: Path
+    golden_id: str = "golden_1"
 
 
 class GoldenWorkspace:
@@ -64,9 +65,9 @@ class GoldenWorkspace:
         except FileNotFoundError:
             pass
 
-    def create_run(self, commit_sha: str) -> GoldenRunPaths:
+    def create_run(self, commit_sha: str, golden_id: str = "golden_1") -> GoldenRunPaths:
         self.ensure_layout()
-        golden = self.config.golden_path
+        golden = self.config.golden_path_for(golden_id)
         if not golden.is_file():
             raise FileNotFoundError(f"Golden source not found: {golden}")
         source_hash = sha256_file(golden)
@@ -86,7 +87,9 @@ class GoldenWorkspace:
             source_copy=source_copy,
             source_sha256_before=source_hash,
             ownership_file=run_dir / "owned_word.json",
+            golden_id=golden_id,
         )
 
     def verify_golden_unchanged(self, run: GoldenRunPaths) -> bool:
-        return self.config.golden_path.is_file() and sha256_file(self.config.golden_path) == run.source_sha256_before
+        golden = self.config.golden_path_for(run.golden_id)
+        return golden.is_file() and sha256_file(golden) == run.source_sha256_before

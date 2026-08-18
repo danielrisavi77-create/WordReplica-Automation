@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 
@@ -9,6 +9,11 @@ from pathlib import Path
 class CodexAutomationConfig:
     local_root: Path = Path(r"C:\WordReplica-Automation")
     golden_filename: str = "Glavna verzija rektorova (grupno)(1).docx"
+    # Golden #1 (golden_filename) is the sole promotion gate for `main`, per
+    # AGENTS.md. Additional golden documents are a regression-only layer:
+    # a regression on one still stops the autonomous loop, but reaching
+    # FULL PASS on them does not by itself make a commit promotable.
+    additional_golden_filenames: list[str] = field(default_factory=list)
     reconstruction_timeout_seconds: int = 14_400
     audit_timeout_seconds: int = 1800
     keep_success_runs: int = 1
@@ -27,6 +32,23 @@ class CodexAutomationConfig:
     @property
     def golden_path(self) -> Path:
         return self.golden_dir / self.golden_filename
+
+    @property
+    def golden_documents(self) -> list[tuple[str, str]]:
+        """(golden_id, filename) pairs, Golden #1 always first."""
+        documents = [("golden_1", self.golden_filename)]
+        for index, filename in enumerate(self.additional_golden_filenames, start=2):
+            documents.append((f"golden_{index}", filename))
+        return documents
+
+    def golden_filename_for(self, golden_id: str) -> str:
+        for doc_id, filename in self.golden_documents:
+            if doc_id == golden_id:
+                return filename
+        raise KeyError(f"unknown golden document id: {golden_id}")
+
+    def golden_path_for(self, golden_id: str) -> Path:
+        return self.golden_dir / self.golden_filename_for(golden_id)
 
     @property
     def work_dir(self) -> Path:

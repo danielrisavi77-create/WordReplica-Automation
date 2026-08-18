@@ -17,6 +17,7 @@ from word_replica.domain.results import RunResult, WarningItem
 from word_replica.opc.properties import DocumentProperties, build_output_metadata
 from word_replica.parser.fidelity import project_fidelity
 from word_replica.parser.parser import DocxParser
+from word_replica.qa.environment import capture_environment_fingerprint
 from word_replica.qa.policy import classify_run, run_l0_l3
 from word_replica.qa.report import write_qa_report
 from word_replica.renderers.base import Renderer
@@ -363,6 +364,7 @@ class RebuildService:
                 levels=qa_bundle.levels if qa_bundle is not None else {},
                 warnings=warnings,
                 render_result=qa_bundle.render if qa_bundle is not None else None,
+                environment=capture_environment_fingerprint(),
             )
             store.set_status(paths.project_id, status.value)
             audit.append(

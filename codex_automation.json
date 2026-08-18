@@ -1,6 +1,7 @@
 {
   "local_root": "C:\\WordReplica-Automation",
   "golden_filename": "Glavna verzija rektorova (grupno)(1).docx",
+  "additional_golden_filenames": ["Kasalo - diplomski (finalno).docx"],
   "reconstruction_timeout_seconds": 14400,
   "audit_timeout_seconds": 1800,
   "keep_success_runs": 1,

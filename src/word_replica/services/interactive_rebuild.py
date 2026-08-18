@@ -26,6 +26,7 @@ from word_replica.interactive.preflight import analyze_preflight
 from word_replica.interactive.verification import InteractiveProgressTracker, LiveVerifier
 from word_replica.parser.parser import DocxParser
 from word_replica.opc.properties import DocumentProperties, build_output_metadata
+from word_replica.qa.environment import capture_environment_fingerprint
 from word_replica.qa.policy import classify_run, run_l0_l3
 from word_replica.qa.render import compare_pdfs
 from word_replica.qa.report import write_qa_report
@@ -1798,6 +1799,7 @@ class InteractiveRebuildService:
             output_sha256=final_checkpoint.output_sha256, renderer="interactive-word",
             fidelity=prepared.options.interactive.fidelity.value, metadata=prepared.options.metadata.value,
             saves=saves, levels=bundle.levels, warnings=warnings, render_result=bundle.render,
+            environment=capture_environment_fingerprint(),
         )
         reasons: list[str] = []
         for level_name in ("L0", "L1"):

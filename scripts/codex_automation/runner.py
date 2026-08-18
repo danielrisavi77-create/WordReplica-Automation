@@ -16,6 +16,7 @@ from scripts.codex_automation.retention import prune_diagnostics
 from scripts.codex_automation.state import evaluate_run, load_state, save_state
 from scripts.codex_automation.trace_profile import profile_event_trace
 from scripts.codex_automation.workspace import GoldenWorkspace, sha256_file
+from word_replica.qa.environment import capture_environment_fingerprint
 
 
 def default_git_info(repo_root: Path) -> tuple[str, str]:
@@ -101,6 +102,7 @@ class GoldenRunner:
         python_executable: str | None = None,
         child_executor: Callable[..., ChildResult] = run_owned_child,
         git_info: Callable[[Path], tuple[str, str]] = default_git_info,
+        environment_capture: Callable[[], dict] = capture_environment_fingerprint,
         visible_word: bool = False,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
@@ -108,6 +110,7 @@ class GoldenRunner:
         self.python_executable = python_executable or sys.executable
         self.child_executor = child_executor
         self.git_info = git_info
+        self.environment_capture = environment_capture
         self.visible_word = bool(visible_word)
         self.workspace = GoldenWorkspace(config)
 
@@ -122,7 +125,7 @@ class GoldenRunner:
             env={"PYTHONPATH": os.pathsep.join([str(self.repo_root / "src"), str(self.repo_root)])},
         )
 
-    def run(self) -> Path:
+    def run(self, golden_id: str = "golden_1") -> Path:
         branch, commit_sha = self.git_info(self.repo_root)
         if branch != "automation-dev":
             raise RuntimeError(f"Autonomous Golden runs require branch automation-dev; current branch is {branch or '<detached>'}")
@@ -130,7 +133,7 @@ class GoldenRunner:
         self.workspace.acquire_lock()
         run = None
         try:
-            run = self.workspace.create_run(commit_sha)
+            run = self.workspace.create_run(commit_sha, golden_id)
             static_dir = run.run_dir / "static"
             interactive_dir = run.run_dir / "interactive"
             child_runner = self.repo_root / "scripts" / "remote_harness" / "child_runner.py"
@@ -220,8 +223,15 @@ class GoldenRunner:
                 report = _failure_report(run.run_id, run.source_sha256_before, commit_sha, reconstruction_status, reason)
 
             source_unchanged = self.workspace.verify_golden_unchanged(run)
+            try:
+                environment = self.environment_capture()
+            except Exception as exc:
+                environment = {"error": str(exc), "exception_type": type(exc).__name__}
             report.update({
                 "run_id": run.run_id,
+                "golden_id": golden_id,
+                "golden_filename": self.config.golden_filename_for(golden_id),
+                "gates_main_promotion": golden_id == "golden_1",
                 "commit_sha": commit_sha,
                 "branch": branch,
                 "source_sha256": run.source_sha256_before,
@@ -234,12 +244,13 @@ class GoldenRunner:
                 "interactive_result": interactive_payload,
                 "trace": _trace_summary(interactive_dir / "event_trace.jsonl"),
                 "performance_profile": _performance_profile(interactive_dir / "event_trace.jsonl"),
+                "environment": environment,
             })
             if not source_unchanged:
                 report["full_pass"] = False
                 report["source_integrity_error"] = "Golden source SHA-256 changed during run"
 
-            state_path = self.config.state_dir / "automation_state.json"
+            state_path = self.config.state_dir / f"automation_state_{golden_id}.json"
             state = load_state(state_path)
             decision = evaluate_run(state, report)
             if not source_unchanged:
@@ -250,12 +261,13 @@ class GoldenRunner:
             save_state(state_path, state)
             _write_json(report_path, report)
 
-            final_dir = self.config.diagnostics_dir / run.run_id
+            golden_diagnostics_dir = self.config.diagnostics_dir / golden_id
+            final_dir = golden_diagnostics_dir / run.run_id
             final_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(run.run_dir), str(final_dir))
             final_report = final_dir / "golden_report.json"
             prune_diagnostics(
-                self.config.diagnostics_dir,
+                golden_diagnostics_dir,
                 keep_success=self.config.keep_success_runs,
                 keep_failures=self.config.keep_failure_runs,
             )

@@ -444,6 +444,39 @@ def build_academic_supported(path: Path) -> Path:
     return path
 
 
+def build_academic_citations(path: Path) -> Path:
+    doc = Document()
+    doc.add_heading("Contents", 1)
+    doc.add_paragraph("TOC placeholder")
+    doc.add_heading("Introduction", 1)
+    doc.add_paragraph("This work builds on prior findings ")
+    doc.add_heading("Related Work", 2)
+    doc.add_paragraph("Earlier results established the baseline ")
+    doc.add_heading("Conclusion", 1)
+    doc.add_paragraph("In summary, the evidence supports the hypothesis ")
+    doc.add_heading("References", 1)
+    doc.add_paragraph("Target bibliography entry.")
+    doc.save(path)
+
+    def mutate(members):
+        root = etree.fromstring(members["word/document.xml"])
+        ps = root.xpath("//w:body/w:p", namespaces={"w": _W_NS})
+        _append_field_to_paragraph(ps[1], 'TOC \\o "1-3" \\h \\z \\u', "Introduction .... 1")
+        target = ps[-1]
+        start = etree.Element(f"{{{_W_NS}}}bookmarkStart")
+        start.set(f"{{{_W_NS}}}id", "9")
+        start.set(f"{{{_W_NS}}}name", "Ref1")
+        target.insert(0, start)
+        end = etree.SubElement(target, f"{{{_W_NS}}}bookmarkEnd")
+        end.set(f"{{{_W_NS}}}id", "9")
+        _append_field_to_paragraph(ps[3], "REF Ref1 \\h", "[1]")
+        members["word/document.xml"] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
+
+    _atomic_patch(path, mutate)
+    patch_notes(path, "Citation footnote", "Citation endnote")
+    return path
+
+
 BUILDERS = [
     ("01_plain_text.docx", build_plain_text),
     ("02_headings_styles.docx", build_headings_styles),
@@ -462,6 +495,7 @@ BUILDERS = [
     ("15_nested_table.docx", build_nested_table),
     ("16_table_shading_borders.docx", build_table_shading_borders),
     ("17_academic_supported.docx", build_academic_supported),
+    ("18_academic_citations.docx", build_academic_citations),
 ]
 
 

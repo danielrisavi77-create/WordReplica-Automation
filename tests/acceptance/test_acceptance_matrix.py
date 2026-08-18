@@ -15,13 +15,15 @@ PURE_REQUIRED = [
     "01_plain_text.docx", "02_headings_styles.docx", "03_lists.docx",
     "04_tables_merged.docx", "06_sections_orientations.docx",
     "07_headers_footers_numbers.docx", "08_footnotes_endnotes.docx",
+    "18_academic_citations.docx",
 ]
 
 WORD_REQUIRED = [
     f"{i:02d}_{name}.docx" for i, name in [
         (1,"plain_text"),(2,"headings_styles"),(3,"lists"),(4,"tables_merged"),(5,"images_inline_floating"),
         (6,"sections_orientations"),(7,"headers_footers_numbers"),(8,"footnotes_endnotes"),(9,"toc_fields"),
-        (10,"comments_tracked_changes"),(11,"bookmarks_crossrefs"),(12,"charts_embedded"),(13,"academic_complex")
+        (10,"comments_tracked_changes"),(11,"bookmarks_crossrefs"),(12,"charts_embedded"),(13,"academic_complex"),
+        (18,"academic_citations"),
     ]
 ]
 
