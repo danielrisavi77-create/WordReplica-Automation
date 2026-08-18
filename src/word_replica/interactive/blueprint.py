@@ -2,12 +2,29 @@ from __future__ import annotations
 
 import copy
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from word_replica.domain.model import DocumentModel, Paragraph, Run, Table
 from word_replica.interactive.tables import build_table_plan
 from word_replica.interactive.table_batch import build_table_batch_event
 from word_replica.domain.reconstruction import ReconstructionBlueprint, ReconstructionEvent, SemanticLocation
+
+
+def compile_blueprint_from_source(
+    source: Path, *, parser: Any = None, enable_table_fast_path: bool = True
+) -> ReconstructionBlueprint:
+    """Parse a .docx and compile its blueprint without any Word-specific service.
+
+    Lets renderer-agnostic consumers (e.g. a licence-free text preview) pace
+    themselves off the same event stream the Word renderer replays, without
+    depending on InteractiveRebuildService or Microsoft Word.
+    """
+    if parser is None:
+        from word_replica.parser.parser import DocxParser
+        parser = DocxParser()
+    model = parser.parse(Path(source)) if hasattr(parser, "parse") else parser(Path(source))
+    return BlueprintCompiler(enable_table_fast_path=enable_table_fast_path).compile(model)
 
 
 class BlueprintCompiler:

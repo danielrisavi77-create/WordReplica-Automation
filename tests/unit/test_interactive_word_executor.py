@@ -965,6 +965,49 @@ def test_renderer_can_resume_from_first_uncompleted_event():
     assert outcome.last_completed_index == 2
 
 
+def test_letter_by_letter_option_replays_insert_text_as_individual_characters():
+    from word_replica.config import InteractiveOptions
+    from word_replica.interactive.control import InteractiveRunControl
+    from word_replica.renderers.interactive_word import InteractiveWordRenderer
+
+    class RecordingController:
+        def __init__(self): self.events = []
+        def execute_event(self, event): self.events.append((event.event_type, event.payload.get("character")))
+
+    controller = RecordingController()
+    renderer = InteractiveWordRenderer(controller=controller, options=InteractiveOptions(letter_by_letter=True))
+    delays = []
+    renderer.speed._sleep = lambda seconds: delays.append(seconds)
+    bp = ReconstructionBlueprint.build(source_sha256="a" * 64, source_model_fingerprint="m", events=(
+        ReconstructionEvent("InsertText", "r", {"text": "AB"}),
+    ))
+    control = InteractiveRunControl(); control.start()
+    outcome = renderer.execute_blueprint(bp, control)
+    assert controller.events == [("InsertCharacter", "A"), ("InsertCharacter", "B")]
+    assert len(delays) == 2
+    assert outcome.status == "COMPLETED"
+
+
+def test_letter_by_letter_is_off_by_default_and_keeps_one_word_call_per_run():
+    from word_replica.config import InteractiveOptions
+    from word_replica.interactive.control import InteractiveRunControl
+    from word_replica.renderers.interactive_word import InteractiveWordRenderer
+
+    class RecordingController:
+        def __init__(self): self.events = []
+        def execute_event(self, event): self.events.append((event.event_type, event.payload.get("text")))
+
+    controller = RecordingController()
+    renderer = InteractiveWordRenderer(controller=controller, options=InteractiveOptions())
+    renderer.speed._sleep = lambda seconds: None
+    bp = ReconstructionBlueprint.build(source_sha256="a" * 64, source_model_fingerprint="m", events=(
+        ReconstructionEvent("InsertText", "r", {"text": "AB"}),
+    ))
+    control = InteractiveRunControl(); control.start()
+    renderer.execute_blueprint(bp, control)
+    assert controller.events == [("InsertText", "AB")]
+
+
 def test_restore_checkpoint_state_reanchors_body_append_boundary_to_reopened_document_end():
     from types import SimpleNamespace
     calls=[]
@@ -1674,6 +1717,66 @@ def test_begin_first_section_retries_rejected_sections_collection_call():
     controller.execute_event(ReconstructionEvent("BeginSection", "s1", {"section_index": 0}))
     assert sections.attempts == 2
     assert controller._active_section is sections.section
+
+
+class RejectOnceSectionsAdd:
+    def __init__(self, section):
+        self.attempts = 0
+        self._section = section
+
+    def Add(self, Range, Start):
+        self.attempts += 1
+        if self.attempts == 1:
+            raise RejectedCall("Word is busy")
+        return self._section
+
+
+def test_begin_next_section_retries_rejected_sections_add_and_reanchors_active_range():
+    from types import SimpleNamespace
+
+    new_range = object()
+    section = SimpleNamespace(Range=SimpleNamespace(Start=500))
+    sections = RejectOnceSectionsAdd(section)
+    range_calls = []
+
+    def document_range(start, end):
+        range_calls.append((start, end))
+        return new_range
+
+    controller = InteractiveWordController.for_testing(active_range=FakeWordRange())
+    controller.document = SimpleNamespace(Sections=sections, Range=document_range)
+    controller._section_started = True
+
+    controller.execute_event(ReconstructionEvent("BeginSection", "s2", {"section_index": 1, "break_type": "nextPage"}))
+
+    assert sections.attempts == 2
+    assert controller._active_section is section
+    assert controller.active_range is new_range
+    assert range_calls == [(500, 500)]
+
+
+def test_begin_next_section_raises_instead_of_silently_keeping_a_stale_active_range():
+    from types import SimpleNamespace
+
+    class BrokenRange:
+        @property
+        def Start(self):
+            raise RuntimeError("Object has been deleted.")
+
+    section = SimpleNamespace(Range=BrokenRange())
+    sections = SimpleNamespace(Add=lambda Range, Start: section)
+
+    def document_range(start, end):
+        raise AssertionError("Range() must not be reached when re-anchoring fails")
+
+    stale_range = FakeWordRange()
+    controller = InteractiveWordController.for_testing(active_range=stale_range)
+    controller.document = SimpleNamespace(Sections=sections, Range=document_range)
+    controller._section_started = True
+
+    with pytest.raises(RuntimeError, match="Object has been deleted"):
+        controller.execute_event(ReconstructionEvent("BeginSection", "s2", {"section_index": 1, "break_type": "nextPage"}))
+    assert controller.active_range is stale_range
 
 class ResettableRecordingObject(RecordingObject):
     def Reset(self):
