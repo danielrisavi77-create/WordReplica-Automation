@@ -3,8 +3,12 @@ from __future__ import annotations
 from contextlib import suppress
 from pathlib import Path
 import json
+import re
 import time
 from typing import Any
+from zipfile import ZIP_DEFLATED, ZipFile
+
+from lxml import etree
 
 from word_replica.domain.reconstruction import ExecutionOutcome, ReconstructionBlueprint, ReconstructionEvent, WordStateSnapshot
 from word_replica.interactive.speed import SpeedController
@@ -20,6 +24,72 @@ WD_PAGE_BREAK = 7
 WD_FORMAT_DOCX = 16
 
 RPC_E_CALL_REJECTED = -2147418111
+
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_VALID_BOOKMARK_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,39}$")
+_BOOKMARK_NAME_MAX_LENGTH = 40
+
+
+def sanitize_word_bookmark_name(name: str, *, taken: set[str]) -> str:
+    """Return a name Word's COM Bookmarks.Add will accept.
+
+    Word's automation API rejects any bookmark name containing characters
+    other than ASCII letters, digits, and underscores, or not starting with
+    a letter/underscore - a stricter rule than the OOXML file format itself
+    enforces. A source document can legitimately contain bookmarks that
+    violate this (e.g. slug-style names from a non-Word export tool), which
+    otherwise crashes interactive reconstruction with "Bad bookmark name".
+    Callers must restore the original name in the saved OOXML afterward
+    (see `_restore_bookmark_names`) so fidelity to the source is preserved.
+    """
+    if _VALID_BOOKMARK_NAME.match(name):
+        taken.add(name)
+        return name
+    sanitized = re.sub(r"[^A-Za-z0-9_]", "_", name)
+    if not sanitized or not re.match(r"[A-Za-z_]", sanitized[0]):
+        sanitized = f"_{sanitized}"
+    sanitized = sanitized[:_BOOKMARK_NAME_MAX_LENGTH] or "_bookmark"
+    candidate = sanitized
+    suffix = 1
+    while candidate in taken:
+        suffix += 1
+        tail = f"_{suffix}"
+        candidate = f"{sanitized[: _BOOKMARK_NAME_MAX_LENGTH - len(tail)]}{tail}"
+    taken.add(candidate)
+    return candidate
+
+
+def _restore_bookmark_names(docx_path: str | Path, rewrites: dict[str, str]) -> None:
+    """Rewrite `w:bookmarkStart/@w:name` in a saved .docx from the COM-safe
+    names `sanitize_word_bookmark_name` assigned back to the original
+    source names, across every XML part that may carry bookmarks."""
+    if not rewrites:
+        return
+    docx_path = Path(docx_path)
+    with ZipFile(docx_path, "r") as archive:
+        infos = archive.infolist()
+        members = {info.filename: archive.read(info.filename) for info in infos}
+    changed = False
+    for filename, data in list(members.items()):
+        if not filename.startswith("word/") or not filename.endswith(".xml") or b"bookmarkStart" not in data:
+            continue
+        root = etree.fromstring(data)
+        touched = False
+        for element in root.iter(f"{{{_W_NS}}}bookmarkStart"):
+            current = element.get(f"{{{_W_NS}}}name")
+            if current in rewrites:
+                element.set(f"{{{_W_NS}}}name", rewrites[current])
+                touched = True
+        if touched:
+            members[filename] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
+            changed = True
+    if not changed:
+        return
+    temp = docx_path.with_suffix(docx_path.suffix + ".tmp")
+    with ZipFile(temp, "w", ZIP_DEFLATED) as archive:
+        for info in infos:
+            archive.writestr(info, members[info.filename])
+    temp.replace(docx_path)
 
 
 def _is_rejected_com_call(exc: Exception) -> bool:
@@ -76,6 +146,8 @@ class InteractiveWordController:
         self._active_section: Any | None = None
         self._story_stack: list[tuple[Any, bool]] = []
         self._bookmark_starts: dict[str, int] = {}
+        self._bookmark_com_names: set[str] = set()
+        self._bookmark_name_rewrites: dict[str, str] = {}
         self._pending_note: Any | None = None
         self._active_note_index: int | None = None
         self._active_story = "body"
@@ -773,15 +845,20 @@ class InteractiveWordController:
         bookmark_id = str(event.payload.get("bookmark_id", "")); start = self._bookmark_starts.pop(bookmark_id, None)
         end = getattr(self._require_range(), "Start", None)
         if start is None or end is None: return
-        rng = self.document.Range(int(start), int(end))
-        self.document.Bookmarks.Add(Name=str(event.payload["name"]), Range=rng)
+        rng = _retry_rejected_com_call(lambda: self.document.Range(int(start), int(end)))
+        name = str(event.payload["name"])
+        com_name = sanitize_word_bookmark_name(name, taken=self._bookmark_com_names)
+        if com_name != name:
+            self._bookmark_name_rewrites[com_name] = name
+        _retry_rejected_com_call(lambda: self.document.Bookmarks.Add(Name=com_name, Range=rng))
 
     def _event_CreateField(self, event: ReconstructionEvent) -> None:
         if self.document is None: raise RuntimeError("interactive Word document is not open")
-        field = self.document.Fields.Add(
-            Range=self._require_range(), Type=-1,
-            Text=str(event.payload.get("instruction", "")), PreserveFormatting=True,
-        )
+        field_range = self._require_range()
+        instruction = str(event.payload.get("instruction", ""))
+        field = _retry_rejected_com_call(lambda: self.document.Fields.Add(
+            Range=field_range, Type=-1, Text=instruction, PreserveFormatting=True,
+        ))
         cached_result = event.payload.get("cached_result")
         cached_text = None
         if cached_result is not None:
@@ -804,7 +881,7 @@ class InteractiveWordController:
         if self.document is None: raise RuntimeError("interactive Word document is not open")
         target = self._require_range()
         collection = self.document.Footnotes if footnote else self.document.Endnotes
-        note = collection.Add(Range=target)
+        note = _retry_rejected_com_call(lambda: collection.Add(Range=target))
         self._active_note_index = int(getattr(note, "Index", getattr(collection, "Count", 1)))
         reference = self._duplicate_range(note.Reference)
         with suppress(Exception): reference.Collapse(WD_COLLAPSE_END)
@@ -837,10 +914,12 @@ class InteractiveWordController:
             self._section_started = True
         else:
             break_type = {"continuous": 0, "newColumn": 1, "nextPage": 2, "evenPage": 3, "oddPage": 4}.get(event.payload.get("break_type"), 2)
-            self._active_section = self.document.Sections.Add(Range=self._require_range(), Start=break_type)
-            with suppress(Exception):
-                start = int(self._active_section.Range.Start)
-                self.active_range = self.document.Range(start, start)
+            range_for_break = self._require_range()
+            self._active_section = _retry_rejected_com_call(
+                lambda: self.document.Sections.Add(Range=range_for_break, Start=break_type)
+            )
+            start = int(_retry_rejected_com_call(lambda: self._active_section.Range.Start))
+            self.active_range = _retry_rejected_com_call(lambda: self.document.Range(start, start))
         self._paragraph_started = False
 
     def _apply_page_number_start(self, section: Any, start: Any) -> None:
@@ -928,9 +1007,11 @@ class InteractiveWordController:
         if self._asset_resolver is None:
             raise RuntimeError("interactive image asset resolver is not configured")
         asset_path = self._asset_resolver(str(event.payload["asset_id"]))
-        inline = self.document.InlineShapes.AddPicture(
-            FileName=str(asset_path), LinkToFile=False, SaveWithDocument=True, Range=self._require_range()
-        )
+        image_range = self._require_range()
+        file_name = str(asset_path)
+        inline = _retry_rejected_com_call(lambda: self.document.InlineShapes.AddPicture(
+            FileName=file_name, LinkToFile=False, SaveWithDocument=True, Range=image_range
+        ))
         font_cs = (self._active_run_properties or {}).get("font_cs")
         if font_cs:
             with suppress(Exception):
@@ -1041,7 +1122,7 @@ class InteractiveWordController:
             raise RuntimeError("interactive Word document is not open")
         rows = int(event.payload["rows"]); columns = int(event.payload["columns"])
         parent_range = self._require_range()
-        table = self.document.Tables.Add(Range=parent_range, NumRows=rows, NumColumns=columns)
+        table = _retry_rejected_com_call(lambda: self.document.Tables.Add(Range=parent_range, NumRows=rows, NumColumns=columns))
         cells = {(r, c): table.Cell(r, c) for r in range(1, rows + 1) for c in range(1, columns + 1)}
         after_range = self._duplicate_range(table.Range)
         with suppress(Exception):
@@ -1381,7 +1462,7 @@ class InteractiveWordController:
         ctx = self._current_table(); p = event.payload
         start = ctx["cells"][(int(p["start_row"]), int(p["start_column"]))]
         end = ctx["cells"][(int(p["end_row"]), int(p["end_column"]))]
-        start.Merge(end)
+        _retry_rejected_com_call(lambda: start.Merge(end))
 
     def _event_EnterCell(self, event: ReconstructionEvent) -> None:
         self._active_cell_element_id = event.source_element_id
@@ -1444,16 +1525,17 @@ class InteractiveWordController:
             raise RuntimeError("interactive Word document is not open")
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        self.document.SaveAs2(str(destination), FileFormat=WD_FORMAT_DOCX)
+        _retry_rejected_com_call(lambda: self.document.SaveAs2(str(destination), FileFormat=WD_FORMAT_DOCX))
+        _restore_bookmark_names(destination, self._bookmark_name_rewrites)
 
     def set_custom_property(self, name: str, value: Any) -> None:
         if self.document is None:
             raise RuntimeError("interactive Word document is not open")
         properties = self.document.CustomDocumentProperties
         with suppress(Exception):
-            properties(name).Delete()
+            _retry_rejected_com_call(lambda: properties(name).Delete())
         # Office MsoDocProperties.msoPropertyTypeString = 4
-        properties.Add(name, False, 4, str(value))
+        _retry_rejected_com_call(lambda: properties.Add(name, False, 4, str(value)))
 
     def apply_metadata(self, policy: dict[str, str]) -> None:
         if self.document is None:
@@ -1601,8 +1683,12 @@ class InteractiveWordRenderer:
             started = getattr(observer, "event_started", None) if observer is not None else None
             if started is not None:
                 started(index, event, before_state)
+            letter_by_letter = event.event_type == "InsertText" and self.options.letter_by_letter
             try:
-                self.execute_event(event)
+                if letter_by_letter:
+                    self._execute_insert_text_letter_by_letter(event, control)
+                else:
+                    self.execute_event(event)
             except Exception as exc:
                 emit_table_batch_profile(index, event)
                 failed = getattr(observer, "event_failed", None) if observer is not None else None
@@ -1620,9 +1706,26 @@ class InteractiveWordRenderer:
                 halt_status = getattr(observer, "halt_status", None)
                 if halt_status:
                     return ExecutionOutcome(str(halt_status), index, min(blueprint.total_events, index + 1))
-            character_count = len(str(event.payload.get("text", ""))) if event.event_type == "InsertText" else 1
-            self.speed.delay_after(event.event_type, character_count=character_count)
+            if not letter_by_letter:
+                character_count = len(str(event.payload.get("text", ""))) if event.event_type == "InsertText" else 1
+                self.speed.delay_after(event.event_type, character_count=character_count)
         return ExecutionOutcome.completed(blueprint.total_events)
+
+    def _execute_insert_text_letter_by_letter(self, event: ReconstructionEvent, control) -> None:
+        """Replay one InsertText blueprint event as individual on-screen keystrokes.
+
+        The blueprint keeps whole-run InsertText events (stable checkpoints, compact
+        replay); only this replay step fans a run out into single characters so a
+        paused run can react between letters. A stop request is intentionally not
+        honored mid-word: the outer loop only ever resumes at whole-event boundaries,
+        so stopping partway through a run would leave the document with half of an
+        event applied and nothing to resume from.
+        """
+        text = str(event.payload.get("text", ""))
+        for character in text:
+            control.before_next_event(-1)
+            self.execute_event(ReconstructionEvent("InsertCharacter", event.source_element_id, {"character": character}))
+            self.speed.delay_after("InsertCharacter", character_count=1)
 
     def resume_state_snapshot(self) -> dict[str, Any]:
         return dict(getattr(self.controller, "resume_state_snapshot", self.current_state_snapshot)())
