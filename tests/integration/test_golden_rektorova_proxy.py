@@ -32,14 +32,15 @@ def test_golden_rektorova_source_and_blueprint_preserve_confirmed_fidelity_invar
     assert normal["paragraph_properties"]["spacing_line"] == "360"
     assert normal["paragraph_properties"]["spacing_line_rule"] == "auto"
 
-    first_cell = next(i for i, event in enumerate(blueprint.events) if event.event_type == "EnterCell")
-    cell_p = next(event for event in blueprint.events[first_cell:] if event.event_type == "ApplyParagraphProperties")
-    cell_r = next(event for event in blueprint.events[first_cell:] if event.event_type == "ApplyRunProperties")
-    assert cell_p.payload["style_id"] == "Normal"
-    assert cell_p.payload["spacing_after"] == "0"
-    assert cell_p.payload["spacing_line"] == "240"
-    assert cell_r.payload["font_ascii"] == "Times New Roman"
-    assert cell_r.payload["size_half_points"] == "20"
+    first_batch = next(event for event in blueprint.events if event.event_type == "InsertTableBatch")
+    first_cell = first_batch.payload["cells"][0]
+    cell_p = first_cell["paragraph_properties"]
+    cell_r = first_cell["runs"][0]["properties"]
+    assert cell_p["style_id"] == "Normal"
+    assert cell_p["spacing_after"] == "0"
+    assert cell_p["spacing_line"] == "240"
+    assert cell_r["font_ascii"] == "Times New Roman"
+    assert cell_r["size_half_points"] == "20"
 
     header = next(i for i, event in enumerate(blueprint.events) if event.event_type == "BeginHeader")
     header_p = next(event for event in blueprint.events[header:] if event.event_type == "ApplyParagraphProperties")
@@ -63,4 +64,10 @@ def test_golden_rektorova_source_and_blueprint_preserve_confirmed_fidelity_invar
         event.payload.get("style_id")
         for event in blueprint.events
         if event.event_type == "ApplyParagraphProperties"
+    )
+    assert all(
+        cell["paragraph_properties"].get("style_id")
+        for event in blueprint.events
+        if event.event_type == "InsertTableBatch"
+        for cell in event.payload["cells"]
     )

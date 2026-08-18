@@ -183,3 +183,49 @@ def test_nested_table_context_is_not_restart_safe_until_inner_table_exits():
     assert controller.is_restart_safe() is False
     controller._table_stack.pop()
     assert controller.is_restart_safe() is True
+
+
+def test_table_batch_saves_one_pre_event_restart_point_and_post_table_boundary(tmp_path):
+    import json
+    from word_replica.interactive.checkpoints import InteractiveCheckpointCoordinator
+    from word_replica.services.audit import AuditLog
+    from word_replica.services.checkpoints import CheckpointManager
+
+    source = tmp_path / "source.docx"
+    source.write_bytes(b"source")
+    output = tmp_path / "partial.docx"
+    batch = ReconstructionEvent("InsertTableBatch", "t", {
+        "rows": 1, "columns": 1, "cells": (), "text_projection": "A",
+    })
+    events = tuple(
+        ReconstructionEvent("InsertCharacter", f"r{i}", {"character": "A"})
+        for i in range(12)
+    ) + (batch,)
+    bp = ReconstructionBlueprint.build(
+        source_sha256=sha256_file(source), source_model_fingerprint="m", events=events,
+    )
+
+    class Renderer:
+        def is_restart_safe(self): return True
+        def save(self, path): Path(path).write_bytes(b"saved")
+        def current_state_snapshot(self):
+            return {"story": "body", "range_start": 12, "range_end": 12}
+
+    history = tmp_path / "history.jsonl"
+    manager = CheckpointManager(history, AuditLog(tmp_path / "audit.jsonl"))
+    store = InteractiveCheckpointStore(tmp_path / "cp.json")
+    coordinator = InteractiveCheckpointCoordinator(
+        project_id="p", source_path=source, blueprint=bp, output_path=output,
+        settings={"checkpoint_event_interval": 999, "checkpoint_after_tables": True},
+        renderer=Renderer(), save_manager=manager, checkpoint_store=store,
+    )
+
+    coordinator.event_started(12, batch, {"range_start": 12, "range_end": 12})
+    coordinator.event_started(12, batch, {"range_start": 12, "range_end": 12})
+    assert manager.sequence == 1
+    assert store.load_latest().last_completed_event_index == 11
+    assert json.loads(history.read_text(encoding="utf-8").splitlines()[0])["reason"] == "before_table_batch"
+
+    coordinator.event_completed(12, batch)
+    assert manager.sequence == 2
+    assert store.load_latest().last_completed_event_index == 12

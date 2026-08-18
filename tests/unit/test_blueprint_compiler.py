@@ -7,15 +7,69 @@ from word_replica.parser.parser import parse_run
 from word_replica.parser.text import W_NS
 
 
-def test_compiler_emits_one_insert_character_event_per_character():
+def test_compiler_legacy_character_assertion_is_superseded_by_text_batching():
     model = DocumentModel(
         source_sha256="a" * 64,
         body=[Paragraph("p1", [Run("r1", "Až B", {"bold": True})])],
     )
     blueprint = BlueprintCompiler().compile(model)
-    chars = [e.payload["character"] for e in blueprint.events if e.event_type == "InsertCharacter"]
-    assert chars == ["A", "ž", " ", "B"]
-    assert not any("text" in e.payload and len(str(e.payload["text"])) > 1 for e in blueprint.events)
+    text_events = [event for event in blueprint.events if event.event_type == "InsertText"]
+    assert [event.payload["text"] for event in text_events] == [model.body[0].runs[0].text]
+    assert not any(event.event_type == "InsertCharacter" for event in blueprint.events)
+
+
+def test_text_only_table_compiles_to_one_atomic_batch_event():
+    from word_replica.domain.model import Table, TableCell, TableRow
+
+    model = DocumentModel(
+        source_sha256="a" * 64,
+        body=[
+            Table(
+                "t",
+                [TableRow("row", [TableCell("c", [Paragraph("p", [Run("r", "Alpha")])])])],
+            )
+        ],
+    )
+
+    blueprint = BlueprintCompiler(enable_table_fast_path=True).compile(model)
+
+    assert [event.event_type for event in blueprint.events] == ["InsertTableBatch"]
+    assert blueprint.semantic_counts["tables"] == 1
+    assert blueprint.semantic_counts["paragraphs"] == 1
+    assert blueprint.total_visible_characters == 5
+
+
+def test_disabled_fast_path_keeps_legacy_table_events():
+    from word_replica.domain.model import Table, TableCell, TableRow
+
+    model = DocumentModel(
+        source_sha256="a" * 64,
+        body=[
+            Table(
+                "t",
+                [TableRow("row", [TableCell("c", [Paragraph("p", [Run("r", "Alpha")])])])],
+            )
+        ],
+    )
+
+    blueprint = BlueprintCompiler(enable_table_fast_path=False).compile(model)
+
+    event_types = [event.event_type for event in blueprint.events]
+    assert event_types[0] == "BeginTable"
+    assert event_types[-1] == "EndTable"
+    assert "InsertTableBatch" not in event_types
+
+
+def test_compiler_batches_contiguous_text_within_a_run_for_word_insertion():
+    model = DocumentModel(
+        source_sha256="a" * 64,
+        body=[Paragraph("p1", [Run("r1", "AÅ¾ B", {"bold": True})])],
+    )
+    events = BlueprintCompiler().compile(model).events
+    assert [(event.event_type, event.payload) for event in events if event.source_element_id == "r1"] == [
+        ("ApplyRunProperties", {"bold": True}),
+        ("InsertText", {"text": "AÅ¾ B"}),
+    ]
 
 
 def test_run_properties_precede_first_character_of_each_run():
@@ -33,13 +87,64 @@ def test_run_properties_precede_first_character_of_each_run():
     trace = [
         (event.event_type, event.source_element_id, event.payload)
         for event in events
-        if event.event_type in {"ApplyRunProperties", "InsertCharacter"}
+        if event.event_type in {"ApplyRunProperties", "InsertText"}
     ]
     assert trace == [
         ("ApplyRunProperties", "r1", {"bold": False}),
-        ("InsertCharacter", "r1", {"character": "A"}),
+        ("InsertText", "r1", {"text": "A"}),
         ("ApplyRunProperties", "r2", {"bold": True}),
-        ("InsertCharacter", "r2", {"character": "B"}),
+        ("InsertText", "r2", {"text": "B"}),
+    ]
+
+
+def test_compiler_merges_adjacent_text_runs_with_identical_effective_properties():
+    model = DocumentModel(
+        source_sha256="a" * 64,
+        body=[Paragraph(
+            "p1",
+            runs=[
+                Run("r1", "Adjacent ", {"bold": True, "font_ascii": "Aptos"}),
+                Run("r2", "text", {"bold": True, "font_ascii": "Aptos"}),
+                Run("r3", " normal", {"bold": False, "font_ascii": "Aptos"}),
+            ],
+        )],
+    )
+
+    events = BlueprintCompiler().compile(model).events
+    trace = [
+        (event.event_type, event.source_element_id, event.payload)
+        for event in events
+        if event.event_type in {"ApplyRunProperties", "InsertText"}
+    ]
+
+    assert trace == [
+        ("ApplyRunProperties", "r1", {"bold": True, "font_ascii": "Aptos"}),
+        ("InsertText", "r1", {"text": "Adjacent text"}),
+        ("ApplyRunProperties", "r3", {"bold": False, "font_ascii": "Aptos"}),
+        ("InsertText", "r3", {"text": " normal"}),
+    ]
+
+
+def test_compiler_does_not_merge_identically_formatted_runs_across_a_bookmark_boundary():
+    model = DocumentModel(
+        source_sha256="a" * 64,
+        body=[Paragraph(
+            "p1",
+            runs=[Run("r1", "A", {"bold": True}), Run("r2", "B", {"bold": True})],
+            properties={
+                "inline_markers": [
+                    {"kind": "bookmark_start", "run_index": 1, "bookmark_id": "1", "name": "Boundary"},
+                ],
+            },
+        )],
+    )
+
+    events = BlueprintCompiler().compile(model).events
+
+    assert [event.event_type for event in events if event.event_type in {
+        "ApplyRunProperties", "InsertText", "BookmarkStart"
+    }] == [
+        "ApplyRunProperties", "InsertText", "BookmarkStart", "ApplyRunProperties", "InsertText",
     ]
 
 
@@ -65,9 +170,9 @@ def test_tabs_and_breaks_use_semantic_events_in_source_order():
         if event.event_type.startswith("Insert")
     ]
     assert trace == [
-        ("InsertCharacter", {"character": "A"}),
+        ("InsertText", {"text": "A"}),
         ("InsertTab", {}),
-        ("InsertCharacter", {"character": "B"}),
+        ("InsertText", {"text": "B"}),
         ("InsertLineBreak", {}),
         ("InsertPageBreak", {}),
     ]
@@ -126,11 +231,38 @@ def test_section_transition_occurs_at_canonical_boundary_not_before_body(tmp_pat
     events = BlueprintCompiler().compile(model).events
     begin_sections = [i for i,e in enumerate(events) if e.event_type == "BeginSection"]
     assert len(begin_sections) == 2
-    first_text = next(i for i,e in enumerate(events) if e.event_type == "InsertCharacter")
+    first_text = next(i for i,e in enumerate(events) if e.event_type == "InsertText")
     assert begin_sections[0] < first_text
     # second section is not pre-created; it follows the first section's content/boundary.
     assert begin_sections[1] > first_text
     assert [e.payload["orientation"] for e in events if e.event_type == "ApplySectionProperties"][-1] == "landscape"
+
+
+def test_empty_section_boundary_paragraph_is_preserved_before_section_transition():
+    from word_replica.domain.model import Section
+
+    model = DocumentModel(
+        source_sha256="a" * 64,
+        body=[
+            Paragraph("before", [Run("before-run", "Before")]),
+            Paragraph("section-boundary", properties={"section_index": 0}),
+            Paragraph("after", [Run("after-run", "After")]),
+        ],
+        sections=[Section("section-0"), Section("section-1", {"break_type": "nextPage"})],
+    )
+
+    events = BlueprintCompiler().compile(model).events
+    boundary_start = next(
+        index for index, event in enumerate(events)
+        if event.event_type == "BeginParagraph" and event.source_element_id == "section-boundary"
+    )
+    boundary_end = next(
+        index for index, event in enumerate(events)
+        if event.event_type == "EndParagraph" and event.source_element_id == "section-boundary"
+    )
+    section_end = next(index for index, event in enumerate(events) if event.event_type == "EndSection")
+
+    assert boundary_start < boundary_end < section_end
 
 
 def test_header_footer_stories_use_same_character_events(tmp_path):
@@ -142,8 +274,31 @@ def test_header_footer_stories_use_same_character_events(tmp_path):
     assert any(e.event_type == "BeginFooter" for e in events)
     header_start = next(i for i,e in enumerate(events) if e.event_type == "BeginHeader")
     header_end = next(i for i,e in enumerate(events) if e.event_type == "EndHeader")
-    header_chars = [e.payload["character"] for e in events[header_start:header_end] if e.event_type == "InsertCharacter"]
-    assert "".join(header_chars) == "Header"
+    header_text = [e.payload["text"] for e in events[header_start:header_end] if e.event_type == "InsertText"]
+    assert "".join(header_text) == "Header"
+
+
+def test_repeated_section_story_reference_keeps_link_to_previous():
+    from word_replica.domain.model import RelationshipRef, Section
+
+    footer = Paragraph("footer-p", [Run("footer-r", "Footer")])
+    model = DocumentModel(
+        source_sha256="a" * 64,
+        body=[
+            Paragraph("body-p", [Run("body-r", "Body")]),
+            Paragraph("section-boundary", properties={"section_index": 0}),
+        ],
+        sections=[
+            Section("section-0", {"footer_refs": [{"type": "default", "rel_id": "rId1"}]}),
+            Section("section-1", {"footer_refs": [{"type": "default", "rel_id": "rId1"}]}),
+        ],
+        footers={"word/footer1.xml": [footer]},
+        relationships={"word/document.xml:rId1": RelationshipRef("rId1", "footer", "word/footer1.xml")},
+    )
+
+    events = BlueprintCompiler().compile(model).events
+    footer_events = [event for event in events if event.event_type == "BeginFooter"]
+    assert [event.payload["link_to_previous"] for event in footer_events] == [False, True]
 
 
 def test_list_paragraph_emits_list_binding_without_literal_marker(tmp_path):
@@ -152,7 +307,7 @@ def test_list_paragraph_emits_list_binding_without_literal_marker(tmp_path):
     model = DocxParser().parse(build_lists(tmp_path / "lists.docx"))
     events = BlueprintCompiler().compile(model).events
     assert sum(1 for e in events if e.event_type == "CreateListBinding") == 5
-    chars = "".join(e.payload["character"] for e in events if e.event_type == "InsertCharacter")
+    chars = "".join(e.payload["text"] for e in events if e.event_type == "InsertText")
     assert "First" in chars and "Alpha" in chars
     assert not chars.startswith("1.")
 
@@ -166,7 +321,7 @@ def test_notes_compile_at_reference_with_note_story_characters(tmp_path):
     assert any(e.event_type == "CreateEndnote" and e.payload["note_id"] == "1" for e in events)
     f0 = next(i for i,e in enumerate(events) if e.event_type == "BeginFootnoteStory")
     f1 = next(i for i,e in enumerate(events) if e.event_type == "EndFootnoteStory")
-    assert "".join(e.payload["character"] for e in events[f0:f1] if e.event_type == "InsertCharacter") == "Footnote evidence"
+    assert "".join(e.payload["text"] for e in events[f0:f1] if e.event_type == "InsertText") == "Footnote evidence"
 
 
 def test_field_result_is_not_typed_as_static_text_when_semantic_field_is_compiled(tmp_path):
@@ -177,7 +332,7 @@ def test_field_result_is_not_typed_as_static_text_when_semantic_field_is_compile
     fields = [e for e in events if e.event_type == "CreateField"]
     assert any("TOC" in e.payload["instruction"] for e in fields)
     # Result text comes from Word field update, not a static character replay.
-    chars = "".join(e.payload["character"] for e in events if e.event_type == "InsertCharacter")
+    chars = "".join(e.payload["text"] for e in events if e.event_type == "InsertText")
     assert "Chapter One .... 1" not in chars
 
 
@@ -226,7 +381,8 @@ def test_parsed_document_defaults_are_resolved_into_every_run_and_reset_sticky_f
         "Heading1": {"style_id": "Heading1", "name": "heading 1", "type": "paragraph", "run_properties": {"size_half_points": "28"}, "paragraph_properties": {}}
     }
     events = BlueprintCompiler().compile(model).events
-    assert not any(e.event_type == "ApplyDocumentDefaults" for e in events)
+    defaults = next(e for e in events if e.event_type == "ApplyDocumentDefaults")
+    assert defaults.payload["run_properties"]["font_ascii"] == "Times New Roman"
     runs = [e for e in events if e.event_type == "ApplyRunProperties"]
     assert runs[0].payload["font_ascii"] == "Times New Roman"
     assert runs[0].payload["size_half_points"] == "28"
@@ -235,9 +391,25 @@ def test_parsed_document_defaults_are_resolved_into_every_run_and_reset_sticky_f
     assert runs[1].payload["size_half_points"] == "28"
     assert runs[1].payload["bold"] is False
     paragraph = next(e for e in events if e.event_type == "ApplyParagraphProperties")
-    assert "spacing_before" not in paragraph.payload
-    assert "spacing_after" not in paragraph.payload
+    assert paragraph.payload["spacing_before"] == "0"
+    assert paragraph.payload["spacing_after"] == "0"
     assert "spacing_line_rule" not in paragraph.payload
+
+
+def test_blueprint_emits_document_defaults_for_word_normal_style():
+    model = DocumentModel(
+        source_sha256="a" * 64,
+        body=[Paragraph("p1", [Run("r1", "A")])],
+    )
+    model.extras["document_defaults"] = {
+        "run_properties": {"font_ascii": "Times New Roman", "size_half_points": "24"},
+        "paragraph_properties": {"spacing_line": "360", "spacing_line_rule": "auto"},
+    }
+
+    events = BlueprintCompiler().compile(model).events
+
+    defaults = next(event for event in events if event.event_type == "ApplyDocumentDefaults")
+    assert defaults.payload["paragraph_properties"]["spacing_line"] == "360"
 
 
 def test_theme_font_references_resolve_to_concrete_font_names_before_word_events():
@@ -309,12 +481,13 @@ def test_table_cell_without_explicit_style_resolves_normal_after_heading():
         "Heading1": {"style_id":"Heading1","name":"heading 1","type":"paragraph","based_on":"Normal","run_properties":{"bold":True,"size_half_points":"28"},"paragraph_properties":{"keepNext":True}},
     }
     events = BlueprintCompiler().compile(model).events
-    enter = next(i for i,e in enumerate(events) if e.event_type == "EnterCell")
-    cell_props = next(e for e in events[enter:] if e.event_type == "ApplyParagraphProperties")
-    cell_run = next(e for e in events[enter:] if e.event_type == "ApplyRunProperties")
-    assert cell_props.payload["style_id"] == "Normal"
-    assert cell_props.payload["alignment"] == "both"
-    assert cell_props.payload["spacing_after"] == "0"
-    assert cell_props.payload["spacing_line"] == "240"
-    assert cell_run.payload["font_ascii"] == "Times New Roman"
-    assert cell_run.payload["bold"] is False
+    batch = next(e for e in events if e.event_type == "InsertTableBatch")
+    cell = batch.payload["cells"][0]
+    cell_props = cell["paragraph_properties"]
+    cell_run = cell["runs"][0]["properties"]
+    assert cell_props["style_id"] == "Normal"
+    assert cell_props["alignment"] == "both"
+    assert cell_props["spacing_after"] == "0"
+    assert cell_props["spacing_line"] == "240"
+    assert cell_run["font_ascii"] == "Times New Roman"
+    assert cell_run["bold"] is False

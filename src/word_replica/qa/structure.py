@@ -9,10 +9,15 @@ def table_shape(table: Table) -> list[list[int]]:
 
 
 def l1_projection(model: DocumentModel) -> dict:
+    referenced_asset_ids = {drawing.asset_id for drawing in model.drawings}
     return {
         "body_kinds": [type(block).__name__ for block in model.body],
         "tables": [table_shape(block) for block in model.body if isinstance(block, Table)],
-        "asset_hashes": sorted(asset.sha256 for asset in model.assets.values()),
+        "asset_hashes": sorted(
+            asset.sha256
+            for asset_id, asset in model.assets.items()
+            if asset_id in referenced_asset_ids
+        ),
         "headers": len(model.headers),
         "footers": len(model.footers),
         "footnotes": len(model.footnotes),

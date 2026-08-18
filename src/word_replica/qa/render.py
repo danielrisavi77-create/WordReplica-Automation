@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageFilter
+
+
+ANTIALIASING_BLUR_RADIUS = 1.0
 
 
 @dataclass(slots=True)
@@ -13,6 +16,7 @@ class VisualMetric:
     mean_absolute_error: float
     source_size: tuple[int, int]
     rebuilt_size: tuple[int, int]
+    blurred_mean_absolute_error: float | None = None
 
 
 @dataclass(slots=True)
@@ -66,7 +70,24 @@ def compare_page_images(a: Path, b: Path) -> VisualMetric:
             for channel in range(3)
             for value in range(256)
         ) / max(1, pixels * 3)
-        return VisualMetric(True, changed_ratio, mae, ia.size, ib.size)
+        blurred_diff = ImageChops.difference(
+            ia.filter(ImageFilter.GaussianBlur(radius=ANTIALIASING_BLUR_RADIUS)),
+            ib.filter(ImageFilter.GaussianBlur(radius=ANTIALIASING_BLUR_RADIUS)),
+        )
+        blurred_hist = blurred_diff.histogram()
+        blurred_mae = sum(
+            value * blurred_hist[channel * 256 + value]
+            for channel in range(3)
+            for value in range(256)
+        ) / max(1, pixels * 3)
+        return VisualMetric(
+            True,
+            changed_ratio,
+            mae,
+            ia.size,
+            ib.size,
+            blurred_mean_absolute_error=blurred_mae,
+        )
 
 
 def _write_diff_image(a: Path, b: Path, destination: Path) -> Path | None:

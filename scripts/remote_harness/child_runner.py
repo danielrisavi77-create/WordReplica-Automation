@@ -26,6 +26,7 @@ from word_replica.domain.enums import (
 )
 from word_replica.domain.results import RunResult
 from word_replica.services.rebuild import RebuildService
+from word_replica.services.interactive_rebuild import InteractiveRebuildService
 
 
 def serialize_run_result(document: str, stage: str, result: RunResult, elapsed_seconds: float) -> dict:
@@ -72,18 +73,24 @@ def _copy_artifact(source: str | None, destination: Path) -> str | None:
     return str(destination)
 
 
-def _options_for(stage: str) -> RebuildOptions:
+def _options_for(
+    stage: str,
+    *,
+    visible_word: bool = False,
+    disable_table_fast_path: bool = False,
+) -> RebuildOptions:
+    visibility = VisibilityMode.VISIBLE if visible_word else VisibilityMode.BACKGROUND
     if stage == "instant":
         return RebuildOptions(
             renderer=RendererChoice.WORD,
-            visibility=VisibilityMode.BACKGROUND,
+            visibility=visibility,
             reconstruction_mode=ReconstructionMode.INSTANT,
         )
     fidelity = InteractiveFidelity.MAXIMUM if stage == "interactive_maximum" else InteractiveFidelity.STANDARD
     return RebuildOptions(
         reconstruction_mode=ReconstructionMode.INTERACTIVE,
         renderer=RendererChoice.WORD,
-        visibility=VisibilityMode.VISIBLE,
+        visibility=visibility,
         interactive=InteractiveOptions(
             speed_mode=InteractiveSpeedMode.MAXIMUM,
             object_step_delay_ms=0,
@@ -91,11 +98,27 @@ def _options_for(stage: str) -> RebuildOptions:
             checkpoint_event_interval=100000,
             verify_during_run=True,
             block_on_unsupported=True,
+            enable_table_fast_path=not disable_table_fast_path,
         ),
     )
 
 
-def run_stage(stage: str, source: Path, run_dir: Path, logs_only: bool = False) -> dict:
+def _interactive_service_for(stage: str, *, defer_l4_qa: bool = False):
+    if not stage.startswith("interactive_"):
+        return None
+    return InteractiveRebuildService(run_l4_qa=not defer_l4_qa)
+
+
+def run_stage(
+    stage: str,
+    source: Path,
+    run_dir: Path,
+    logs_only: bool = False,
+    defer_l4_qa: bool = False,
+    visible_word: bool = False,
+    disable_table_fast_path: bool = False,
+    resume_project_id: str | None = None,
+) -> dict:
     run_dir.mkdir(parents=True, exist_ok=True)
     if stage == "static":
         started = time.perf_counter()
@@ -126,9 +149,28 @@ def run_stage(stage: str, source: Path, run_dir: Path, logs_only: bool = False) 
         }
 
     trace = JsonlEventTraceObserver(run_dir / "event_trace.jsonl") if stage.startswith("interactive_") else None
-    service = RebuildService(app_root=run_dir / "projects")
+    service = RebuildService(
+        app_root=run_dir / "projects",
+        interactive_service=_interactive_service_for(stage, defer_l4_qa=defer_l4_qa),
+    )
     started = time.perf_counter()
-    result = service.rebuild(source, _options_for(stage), interactive_observer=trace)
+    if resume_project_id is not None:
+        if not stage.startswith("interactive_"):
+            raise ValueError("checkpoint resume is only valid for an interactive stage")
+        result = service.resume_interactive(
+            resume_project_id,
+            interactive_observer=trace,
+        )
+    else:
+        result = service.rebuild(
+            source,
+            _options_for(
+                stage,
+                visible_word=visible_word,
+                disable_table_fast_path=disable_table_fast_path,
+            ),
+            interactive_observer=trace,
+        )
     payload = serialize_run_result(source.name, stage, result, time.perf_counter() - started)
     payload["preflight_can_proceed"] = static.get("preflight", {}).get("can_proceed")
     payload["status"] = classify_run_result(payload).value
@@ -147,12 +189,25 @@ def main(argv=None) -> int:
     parser.add_argument("--source", required=True)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--logs-only", action="store_true")
+    parser.add_argument("--defer-l4-qa", action="store_true")
+    parser.add_argument("--visible-word", action="store_true")
+    parser.add_argument("--disable-table-fast-path", action="store_true")
+    parser.add_argument("--resume-project-id")
     args = parser.parse_args(argv)
     run_dir = Path(args.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     result_path = run_dir / "result.json"
     try:
-        payload = run_stage(args.stage, Path(args.source).resolve(), run_dir, args.logs_only)
+        payload = run_stage(
+            args.stage,
+            Path(args.source).resolve(),
+            run_dir,
+            args.logs_only,
+            args.defer_l4_qa,
+            args.visible_word,
+            args.disable_table_fast_path,
+            args.resume_project_id,
+        )
         result_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
         return 0
     except Exception as exc:

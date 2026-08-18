@@ -174,3 +174,55 @@ def test_service_observer_does_not_add_header_field_result_to_body_prefix():
     observer._track_expected_body_text(ReconstructionEvent("EndHeader", "h", {}))
     observer._track_expected_body_text(ReconstructionEvent("InsertCharacter", "r", {"character": "B"}))
     assert "".join(observer._expected_body_text) == "AB"
+
+
+def test_table_batch_updates_progress_text_prefix_and_safe_live_verification(tmp_path):
+    from types import SimpleNamespace
+    from word_replica.services.interactive_rebuild import _InteractiveServiceObserver
+
+    event = ReconstructionEvent("InsertTableBatch", "t", {
+        "rows": 2,
+        "columns": 2,
+        "cells": ({}, {}, {}, {}),
+        "paragraph_count": 4,
+        "text_projection": "AB",
+    })
+    bp = ReconstructionBlueprint.build(
+        source_sha256="a" * 64,
+        source_model_fingerprint="m",
+        events=(event,),
+        semantic_counts={"tables": 1, "paragraphs": 4},
+    )
+
+    class Control:
+        state = "RUNNING"
+        def pause(self): raise AssertionError("passing verification must not pause")
+
+    class Verifier:
+        def __init__(self): self.boundaries = []
+        def verify_boundary(self, source_model, output_path, boundary):
+            self.boundaries.append(boundary)
+            return SimpleNamespace(status="PASS", passed=True, reasons=())
+
+    verifier = Verifier()
+    observer = _InteractiveServiceObserver(
+        bp,
+        Control(),
+        SimpleNamespace(append=lambda *args, **kwargs: None),
+        live_verifier=verifier,
+        source_model=object(),
+        output_path=tmp_path / "output.docx",
+        settings={"verify_during_run": True},
+    )
+
+    observer.event_completed(0, event)
+
+    assert observer.tracker.completed_characters == 2
+    assert observer.tracker.completed_tables == 1
+    assert observer.tracker.table_index == 0
+    assert "".join(observer._expected_body_text) == "AB"
+    assert verifier.boundaries == [{
+        "name": "InsertTableBatch:t",
+        "expected_text_prefix": "AB",
+        "completed_tables": 1,
+    }]

@@ -44,10 +44,10 @@ def test_blueprint_builds_structure_and_merges_before_cell_characters():
     model = DocumentModel(source_sha256="a"*64, body=[table])
     events = BlueprintCompiler().compile(model).events
     types = [e.event_type for e in events]
-    first_char = types.index("InsertCharacter")
+    first_char = types.index("InsertText")
     assert types.index("BeginTable") < types.index("SetTableProperties") < types.index("MergeCells") < types.index("EnterCell") < first_char
-    chars = [e.payload["character"] for e in events if e.event_type == "InsertCharacter"]
-    assert chars == ["A", "1"]
+    chars = [e.payload["text"] for e in events if e.event_type == "InsertText"]
+    assert chars == ["A1"]
 
 
 def test_word_table_property_executor_applies_modeled_width_margins_shading_and_borders():
@@ -104,6 +104,7 @@ def test_word_cell_property_executor_applies_shading_borders_margins_and_directi
     class Cell:
         def __init__(self):
             self.VerticalAlignment=None; self.Width=None
+            self.PreferredWidthType=None; self.PreferredWidth=None
             self.TopPadding=self.BottomPadding=self.LeftPadding=self.RightPadding=None
             self.Shading=Shading(); self.Borders=Borders(); self.Range=SimpleNamespace(Orientation=None)
     cell=Cell(); table=SimpleNamespace()
@@ -115,7 +116,9 @@ def test_word_cell_property_executor_applies_shading_borders_margins_and_directi
         "borders":{"left":{"val":"single","sz":"8","color":"010203"}},
         "text_direction":"tbRl",
     }}))
-    assert cell.VerticalAlignment == 1 and cell.Width == 120.0
+    assert cell.VerticalAlignment == 1
+    assert cell.PreferredWidthType == 3 and cell.PreferredWidth == 120.0
+    assert cell.Width is None
     assert (cell.TopPadding,cell.BottomPadding,cell.LeftPadding,cell.RightPadding) == (1.0,2.0,3.0,4.0)
     assert cell.Shading.BackgroundPatternColor == controller._word_color("ABCDEF")
     assert cell.Borders(-2).LineStyle == 1 and cell.Borders(-2).LineWidth == 8

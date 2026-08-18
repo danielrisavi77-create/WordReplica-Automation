@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from pathlib import Path
+import json
 import time
 from typing import Any
 
@@ -9,9 +10,11 @@ from word_replica.domain.reconstruction import ExecutionOutcome, ReconstructionB
 from word_replica.interactive.speed import SpeedController
 from word_replica.config import InteractiveOptions
 from word_replica.interactive.verification import state_snapshots_match
+from word_replica.renderers.word_ownership import clear_owned_word, record_owned_word, word_process_pids
 
 
 WD_COLLAPSE_END = 0
+WD_CHARACTER = 1
 WD_LINE_BREAK = 6
 WD_PAGE_BREAK = 7
 WD_FORMAT_DOCX = 16
@@ -28,7 +31,7 @@ def _is_rejected_com_call(exc: Exception) -> bool:
     return hresult == RPC_E_CALL_REJECTED
 
 
-def _retry_rejected_com_call(operation, *, attempts: int = 60, delay_seconds: float = 0.1):
+def _retry_rejected_com_call(operation, *, attempts: int = 600, delay_seconds: float = 0.1):
     last = None
     for attempt in range(attempts):
         try:
@@ -56,13 +59,15 @@ def _retry_setattr(target: Any, name: str, value: Any) -> None:
 
 
 class InteractiveWordController:
-    def __init__(self) -> None:
+    def __init__(self, *, visible: bool = True) -> None:
+        self.visible = bool(visible)
         self.application: Any | None = None
         self.document: Any | None = None
         self.active_range: Any | None = None
         self._owns_com = False
         self._paragraph_started = False
         self._page_break_continuation_pending = False
+        self._post_table_paragraph_active = False
         self._table_stack: list[dict[str, Any]] = []
         self._asset_resolver = None
         self._active_image: Any | None = None
@@ -79,6 +84,15 @@ class InteractiveWordController:
         self._active_cell_element_id: str | None = None
         self._image_transaction_active = False
         self._floating_images: list[tuple[int, Any]] = []
+        self._owned_word_pid: int | None = None
+        self._formatting_context_generation = 0
+        self._last_run_properties_key: tuple[int, str, int] | None = None
+        self._active_run_properties: dict[str, Any] | None = None
+        self._reset_inherited_run_color_after_insert = False
+        self._paragraph_format_context_generation = 0
+        self._last_paragraph_properties_key: tuple[int, str, int] | None = None
+        self._paragraph_style_cache: dict[tuple[str, str], Any] = {}
+        self._table_batch_metrics: dict[str, object] | None = None
 
     @classmethod
     def for_testing(cls, *, active_range: Any) -> "InteractiveWordController":
@@ -90,28 +104,48 @@ class InteractiveWordController:
         import pythoncom
         import win32com.client
 
+        existing_word_pids = word_process_pids()
         pythoncom.CoInitialize()
         self._owns_com = True
         self.application = win32com.client.DispatchEx("Word.Application")
-        self.application.Visible = True
-        self.document = self.application.Documents.Add()
-        self.active_range = self.document.Range(0, 0)
+        self._owned_word_pid = record_owned_word(
+            self.application, role="interactive", existing_word_pids=existing_word_pids
+        )
+        _retry_setattr(self.application, "DisplayAlerts", 0)
+        if not self.visible:
+            _retry_setattr(self.application, "Visible", False)
+        documents = _retry_getattr(self.application, "Documents")
+        self.document = _retry_rejected_com_call(lambda: documents.Add())
+        self.active_range = _retry_rejected_com_call(lambda: self.document.Range(0, 0))
+        if self.visible:
+            _retry_setattr(self.application, "Visible", True)
+            activate_document = _retry_getattr(self.document, "Activate", None)
+            if callable(activate_document):
+                _retry_rejected_com_call(activate_document)
+            activate_application = _retry_getattr(self.application, "Activate", None)
+            if callable(activate_application):
+                _retry_rejected_com_call(activate_application)
         self._paragraph_started = False
 
     def open_existing(self, path: str | Path) -> None:
         import pythoncom
         import win32com.client
 
+        existing_word_pids = word_process_pids()
         pythoncom.CoInitialize()
         self._owns_com = True
         self.application = win32com.client.DispatchEx("Word.Application")
-        self.application.Visible = True
+        self._owned_word_pid = record_owned_word(
+            self.application, role="interactive", existing_word_pids=existing_word_pids
+        )
+        self.application.Visible = self.visible
         self.document = self.application.Documents.Open(
             str(Path(path).resolve()), ReadOnly=False, AddToRecentFiles=False
         )
         end = max(int(self.document.Content.Start), int(self.document.Content.End) - 1)
         self.active_range = self.document.Range(end, end)
         self._paragraph_started = True
+
 
     def _resume_range_for_story(self, story: str, start: int, end: int, *, section_index: int | None = None, note_index: int | None = None):
         if self.document is None:
@@ -160,13 +194,22 @@ class InteractiveWordController:
             self._active_section = self.document.Sections(self._active_section_index + 1)
         story = str(getattr(checkpoint, "story", "body"))
         note_index = state.get("note_index")
-        self.active_range = self._resume_range_for_story(
-            story, int(start), int(end), section_index=self._active_section_index, note_index=note_index
-        )
+        active_table_element_id = getattr(checkpoint, "table_element_id", None)
+        if story == "body" and active_table_element_id is None:
+            content = _retry_getattr(self.document, "Content")
+            content_start = int(_retry_getattr(content, "Start"))
+            content_end = max(content_start, int(_retry_getattr(content, "End")) - 1)
+            self.active_range = _retry_rejected_com_call(
+                lambda: self.document.Range(content_end, content_end)
+            )
+        else:
+            self.active_range = self._resume_range_for_story(
+                story, int(start), int(end), section_index=self._active_section_index, note_index=note_index
+            )
         self._paragraph_started = bool(getattr(checkpoint, "paragraph_started", False))
         self._active_story = story
         self._active_note_index = int(note_index) if note_index is not None else None
-        self._active_table_element_id = getattr(checkpoint, "table_element_id", None)
+        self._active_table_element_id = active_table_element_id
         self._active_cell_element_id = getattr(checkpoint, "cell_element_id", None)
         self._story_stack.clear()
         return_start = state.get("return_range_start")
@@ -216,6 +259,11 @@ class InteractiveWordController:
     def set_asset_resolver(self, resolver) -> None:
         self._asset_resolver = resolver
 
+    def consume_table_batch_metrics(self) -> dict[str, object] | None:
+        metrics = self._table_batch_metrics
+        self._table_batch_metrics = None
+        return metrics
+
     @staticmethod
     def _emu_to_points(value: Any) -> float:
         return float(value) / 12700.0
@@ -227,13 +275,27 @@ class InteractiveWordController:
 
     def _collapse_end(self) -> None:
         target = self._require_range()
-        _retry_rejected_com_call(lambda: target.Collapse(WD_COLLAPSE_END))
+        collapse = _retry_getattr(target, "Collapse", None)
+        if callable(collapse):
+            _retry_rejected_com_call(lambda: collapse(WD_COLLAPSE_END))
+            return
+        end = _retry_getattr(target, "End", None)
+        if end is None:
+            raise AttributeError("Word range exposes neither Collapse nor End")
+        _retry_setattr(target, "Start", end)
 
     def execute_event(self, event: ReconstructionEvent) -> None:
         handler = getattr(self, f"_event_{event.event_type}", None)
         if handler is None:
             # Structural/property events are implemented progressively by later tasks.
             return
+        text_events = {"InsertCharacter", "InsertText", "InsertTab", "InsertLineBreak"}
+        if event.event_type not in {"ApplyRunProperties", *text_events}:
+            self._formatting_context_generation += 1
+            self._last_run_properties_key = None
+        if event.event_type not in {"ApplyRunProperties", "ApplyParagraphProperties", "BeginParagraph", "EndParagraph", *text_events}:
+            self._paragraph_format_context_generation += 1
+            self._last_paragraph_properties_key = None
         handler(event)
 
     @staticmethod
@@ -355,8 +417,24 @@ class InteractiveWordController:
 
     def _event_ApplyRunProperties(self, event: ReconstructionEvent) -> None:
         target = self._require_range()
-        font = _retry_getattr(target, "Font")
         props = event.payload
+        previous_color = (self._active_run_properties or {}).get("color")
+        current_color = props.get("color")
+        previous_color_is_explicit = bool(
+            previous_color and str(previous_color).lower() not in {"auto", "none"}
+        )
+        current_color_is_explicit = bool(
+            current_color and str(current_color).lower() not in {"auto", "none"}
+        )
+        self._reset_inherited_run_color_after_insert = (
+            previous_color_is_explicit and not current_color_is_explicit
+        )
+        self._active_run_properties = dict(props)
+        properties_key = json.dumps(props, sort_keys=True, ensure_ascii=False, default=str)
+        cache_key = (id(target), properties_key, self._formatting_context_generation)
+        if cache_key == self._last_run_properties_key:
+            return
+        font = _retry_getattr(target, "Font")
         reset = _retry_getattr(font, "Reset", None)
         if callable(reset):
             _retry_rejected_com_call(reset)
@@ -414,10 +492,94 @@ class InteractiveWordController:
         if props.get("language") in language_ids:
             with suppress(Exception):
                 font.LanguageID = language_ids[props["language"]]
+        self._last_run_properties_key = cache_key
+
+    @staticmethod
+    def _contains_east_asia_text(text: str) -> bool:
+        return any(
+            "\u2e80" <= character <= "\u9fff"
+            or "\u3040" <= character <= "\u30ff"
+            or "\uac00" <= character <= "\ud7af"
+            or "\uf900" <= character <= "\ufaff"
+            for character in text
+        )
+
+    def _apply_post_insert_run_properties(self, props: dict[str, Any], text: str) -> None:
+        """Apply only properties Word does not reliably inherit into inserted text."""
+        target = self._require_range()
+        font = _retry_getattr(target, "Font")
+        reset_inherited_color = self._reset_inherited_run_color_after_insert
+        self._reset_inherited_run_color_after_insert = False
+        if reset_inherited_color:
+            reset = _retry_getattr(font, "Reset", None)
+            if callable(reset):
+                _retry_rejected_com_call(reset)
+        for key, attribute in (
+            ("bold", "Bold"),
+            ("italic", "Italic"),
+            ("strike", "StrikeThrough"),
+        ):
+            if key in props:
+                _retry_setattr(font, attribute, self._word_bool(props[key]))
+        if "underline" in props:
+            _retry_setattr(font, "Underline", 1 if props["underline"] else 0)
+
+        font_name = props.get("font_ascii") or props.get("font_hansi")
+        if font_name:
+            _retry_setattr(font, "Name", str(font_name))
+        if self._contains_east_asia_text(text) and props.get("font_east_asia"):
+            with suppress(Exception):
+                _retry_setattr(font, "NameFarEast", str(props["font_east_asia"]))
+        if props.get("font_cs"):
+            with suppress(Exception):
+                _retry_setattr(font, "NameBi", str(props["font_cs"]))
+        if props.get("size_half_points") is not None:
+            _retry_setattr(font, "Size", self._half_points_to_points(props["size_half_points"]))
+
+        color = props.get("color")
+        if color and str(color).lower() not in {"auto", "none"}:
+            _retry_setattr(font, "Color", self._word_color(str(color)))
+        if props.get("hidden"):
+            with suppress(Exception):
+                _retry_setattr(font, "Hidden", self._word_bool(props["hidden"]))
+        vert = props.get("vert_align")
+        if vert == "superscript":
+            _retry_setattr(font, "Superscript", -1)
+            _retry_setattr(font, "Subscript", 0)
+        elif vert == "subscript":
+            _retry_setattr(font, "Subscript", -1)
+            _retry_setattr(font, "Superscript", 0)
+        if props.get("character_spacing") not in {None, "0", 0}:
+            with suppress(Exception):
+                _retry_setattr(font, "Spacing", float(props["character_spacing"]) / 20.0)
+        if props.get("character_position") not in {None, "0", 0}:
+            with suppress(Exception):
+                _retry_setattr(font, "Position", float(props["character_position"]) / 2.0)
+
+        highlight_map = {
+            "black": 1, "blue": 2, "turquoise": 3, "brightGreen": 4,
+            "pink": 5, "red": 6, "yellow": 7, "white": 8,
+            "darkBlue": 9, "teal": 10, "green": 11, "violet": 12,
+            "darkRed": 13, "darkYellow": 14, "gray50": 15, "gray25": 16,
+        }
+        if props.get("highlight") in highlight_map:
+            with suppress(Exception):
+                target.HighlightColorIndex = highlight_map[props["highlight"]]
+        language_ids = {"hr-HR": 1050, "en-US": 1033, "en-GB": 2057, "de-DE": 1031}
+        if props.get("language") in language_ids and props["language"] != "en-US":
+            with suppress(Exception):
+                font.LanguageID = language_ids[props["language"]]
+        self._last_run_properties_key = None
 
     def _ensure_paragraph_style(self, definition: dict[str, Any] | None, style_id: str | None):
         if self.document is None or not style_id:
             return None
+        cache_key = (
+            str(style_id),
+            json.dumps(definition or {}, sort_keys=True, ensure_ascii=False, default=str),
+        )
+        if cache_key in self._paragraph_style_cache:
+            return self._paragraph_style_cache[cache_key]
         styles = _retry_getattr(self.document, "Styles", None)
         if styles is None:
             return None
@@ -445,6 +607,7 @@ class InteractiveWordController:
             if "strike" in run_props: _retry_setattr(font, "StrikeThrough", self._word_bool(run_props["strike"]))
             font_name = run_props.get("font_ascii") or run_props.get("font_hansi")
             if font_name: _retry_setattr(font, "Name", str(font_name))
+            if run_props.get("font_cs"): _retry_setattr(font, "NameBi", str(run_props["font_cs"]))
             if run_props.get("size_half_points") is not None: _retry_setattr(font, "Size", self._half_points_to_points(run_props["size_half_points"]))
             color = run_props.get("color")
             if color and str(color).lower() not in {"auto", "none"}: _retry_setattr(font, "Color", self._word_color(str(color)))
@@ -468,11 +631,27 @@ class InteractiveWordController:
         next_style = (definition or {}).get("next_style")
         if next_style:
             with suppress(Exception): style.NextParagraphStyle = styles(str(next_style))
+        self._paragraph_style_cache[cache_key] = style
         return style
 
     def _event_ApplyParagraphProperties(self, event: ReconstructionEvent) -> None:
         target = self._require_range()
         props = event.payload
+        try:
+            if int(_retry_getattr(target, "Start")) == int(_retry_getattr(target, "End")):
+                expanded = self._duplicate_range(target)
+                if expanded is not target:
+                    start = int(_retry_getattr(expanded, "Start"))
+                    end = int(_retry_getattr(expanded, "End"))
+                    if end == start:
+                        _retry_setattr(expanded, "End", end + 1)
+                    target = expanded
+        except Exception:
+            target = self._require_range()
+        properties_key = json.dumps(props, sort_keys=True, ensure_ascii=False, default=str)
+        cache_key = (id(target), properties_key, self._paragraph_format_context_generation)
+        if cache_key == self._last_paragraph_properties_key:
+            return
         if props.get("style_id"):
             style = self._ensure_paragraph_style(props.get("style_definition"), str(props["style_id"]))
             _retry_setattr(target, "Style", style if style is not None else props["style_id"])
@@ -517,33 +696,47 @@ class InteractiveWordController:
                         Alignment=tab_align.get(tab.get("val"), 0),
                         Leader=tab_leader.get(tab.get("leader"), 0),
                     ))
+        self._last_paragraph_properties_key = cache_key
 
     def _event_InsertCharacter(self, event: ReconstructionEvent) -> None:
         character = event.payload.get("character")
         if not isinstance(character, str) or len(character) != 1:
             raise ValueError("InsertCharacter payload must contain exactly one character")
+        self._insert_text(character)
+
+    def _event_InsertText(self, event: ReconstructionEvent) -> None:
+        text = event.payload.get("text")
+        if not isinstance(text, str) or not text:
+            raise ValueError("InsertText payload must contain non-empty text")
+        self._insert_text(text)
+
+    def _insert_text(self, text: str) -> None:
         target = self._require_range()
-        _retry_rejected_com_call(lambda: target.InsertAfter(character))
+        _retry_rejected_com_call(lambda: target.InsertAfter(text))
+        if self._active_run_properties is not None:
+            self._apply_post_insert_run_properties(self._active_run_properties, text)
         self._collapse_end()
         self._page_break_continuation_pending = False
+        self._post_table_paragraph_active = False
 
     def _event_InsertTab(self, event: ReconstructionEvent) -> None:
-        target = self._require_range()
-        _retry_rejected_com_call(lambda: target.InsertAfter("\t"))
-        self._collapse_end()
-        self._page_break_continuation_pending = False
+        self._insert_text("\t")
 
     def _event_InsertLineBreak(self, event: ReconstructionEvent) -> None:
         target = self._require_range()
         _retry_rejected_com_call(lambda: target.InsertBreak(Type=WD_LINE_BREAK))
         self._collapse_end()
         self._page_break_continuation_pending = False
+        self._post_table_paragraph_active = False
 
     def _event_InsertPageBreak(self, event: ReconstructionEvent) -> None:
         target = self._require_range()
-        _retry_rejected_com_call(lambda: target.InsertBreak(Type=WD_PAGE_BREAK))
+        _retry_rejected_com_call(lambda: target.InsertAfter("\f"))
+        if self._active_run_properties is not None:
+            self._apply_post_insert_run_properties(self._active_run_properties, "\f")
         self._collapse_end()
-        self._page_break_continuation_pending = True
+        self._page_break_continuation_pending = False
+        self._post_table_paragraph_active = False
 
     @staticmethod
     def _duplicate_range(value: Any) -> Any:
@@ -590,12 +783,21 @@ class InteractiveWordController:
             Text=str(event.payload.get("instruction", "")), PreserveFormatting=True,
         )
         cached_result = event.payload.get("cached_result")
+        cached_text = None
         if cached_result is not None:
-            with suppress(Exception): field.Result.Text = str(cached_result)
+            cached_text = str(cached_result)
+            with suppress(Exception): field.Result.Text = cached_text
         # Do not refresh a field while later source content may not exist yet.
         # The source cached result remains visible and the output remains a real field.
         result = self._duplicate_range(field.Result)
+        if cached_text is not None and self._active_run_properties is not None:
+            self.active_range = result
+            self._apply_post_insert_run_properties(self._active_run_properties, cached_text)
         with suppress(Exception): result.Collapse(WD_COLLAPSE_END)
+        move = _retry_getattr(result, "Move", None)
+        if not callable(move):
+            raise RuntimeError("Word field result range does not support Move")
+        _retry_rejected_com_call(lambda: move(WD_CHARACTER, 1))
         self.active_range = result
 
     def _create_note(self, *, footnote: bool) -> None:
@@ -682,13 +884,13 @@ class InteractiveWordController:
     def _event_EndSection(self, event: ReconstructionEvent) -> None:
         return
 
-    def _begin_story(self, story_type: str, *, header: bool) -> None:
+    def _begin_story(self, story_type: str, *, header: bool, link_to_previous: bool = False) -> None:
         section = self._active_section
         if section is None: raise RuntimeError("story event outside active section")
         index = {"default": 1, "first": 2, "even": 3}.get(story_type, 1)
         collection = section.Headers if header else section.Footers
         story = collection(index)
-        with suppress(Exception): story.LinkToPrevious = False
+        with suppress(Exception): story.LinkToPrevious = self._word_bool(link_to_previous)
         self._story_stack.append((self._require_range(), self._paragraph_started, self._active_story))
         self._active_story = f"{'header' if header else 'footer'}:{story_type}"
         target = self._duplicate_range(story.Range)
@@ -700,13 +902,21 @@ class InteractiveWordController:
         self.active_range, self._paragraph_started, self._active_story = self._story_stack.pop()
 
     def _event_BeginHeader(self, event: ReconstructionEvent) -> None:
-        self._begin_story(str(event.payload.get("story_type", "default")), header=True)
+        self._begin_story(
+            str(event.payload.get("story_type", "default")),
+            header=True,
+            link_to_previous=bool(event.payload.get("link_to_previous", False)),
+        )
 
     def _event_EndHeader(self, event: ReconstructionEvent) -> None:
         self._end_story()
 
     def _event_BeginFooter(self, event: ReconstructionEvent) -> None:
-        self._begin_story(str(event.payload.get("story_type", "default")), header=False)
+        self._begin_story(
+            str(event.payload.get("story_type", "default")),
+            header=False,
+            link_to_previous=bool(event.payload.get("link_to_previous", False)),
+        )
 
     def _event_EndFooter(self, event: ReconstructionEvent) -> None:
         self._end_story()
@@ -721,6 +931,11 @@ class InteractiveWordController:
         inline = self.document.InlineShapes.AddPicture(
             FileName=str(asset_path), LinkToFile=False, SaveWithDocument=True, Range=self._require_range()
         )
+        font_cs = (self._active_run_properties or {}).get("font_cs")
+        if font_cs:
+            with suppress(Exception):
+                image_font = _retry_getattr(_retry_getattr(inline, "Range"), "Font")
+                _retry_setattr(image_font, "NameBi", str(font_cs))
         after_range = self._duplicate_range(inline.Range)
         with suppress(Exception): after_range.Collapse(WD_COLLAPSE_END)
         representation = str(event.payload.get("representation", "inline"))
@@ -735,12 +950,28 @@ class InteractiveWordController:
     def _event_SetImageSize(self, event: ReconstructionEvent) -> None:
         image = self._active_image
         if image is None: raise RuntimeError("image geometry event without active image")
-        if event.payload.get("lock_aspect_ratio") is not None:
-            with suppress(Exception): image.LockAspectRatio = self._word_bool(event.payload["lock_aspect_ratio"])
-        if event.payload.get("width_emu") is not None:
-            image.Width = self._emu_to_points(event.payload["width_emu"])
-        if event.payload.get("height_emu") is not None:
-            image.Height = self._emu_to_points(event.payload["height_emu"])
+        lock_aspect_ratio = event.payload.get("lock_aspect_ratio")
+        width_emu = event.payload.get("width_emu")
+        height_emu = event.payload.get("height_emu")
+        unlock_for_exact_size = width_emu is not None and height_emu is not None
+        restore_lock = None
+        if unlock_for_exact_size:
+            restore_lock = (
+                self._word_bool(lock_aspect_ratio)
+                if lock_aspect_ratio is not None
+                else _retry_getattr(image, "LockAspectRatio", None)
+            )
+            _retry_setattr(image, "LockAspectRatio", self._word_bool(False))
+        elif lock_aspect_ratio is not None:
+            _retry_setattr(image, "LockAspectRatio", self._word_bool(lock_aspect_ratio))
+        try:
+            if width_emu is not None:
+                image.Width = self._emu_to_points(width_emu)
+            if height_emu is not None:
+                image.Height = self._emu_to_points(height_emu)
+        finally:
+            if unlock_for_exact_size and restore_lock is not None:
+                _retry_setattr(image, "LockAspectRatio", restore_lock)
 
     def _event_SetImageWrap(self, event: ReconstructionEvent) -> None:
         image = self._active_image
@@ -818,6 +1049,271 @@ class InteractiveWordController:
         self._table_stack.append({"table": table, "cells": cells, "parent_range": parent_range, "after_range": after_range, "element_id": event.source_element_id, "structure_complete": False})
         self._paragraph_started = False
 
+    def _event_InsertTableBatch(self, event: ReconstructionEvent) -> None:
+        started = time.perf_counter()
+        cells = list(event.payload.get("cells") or ())
+        metrics: dict[str, object] = {
+            "table_id": event.source_element_id,
+            "row_count": int(event.payload.get("rows") or 0),
+            "cell_count": len(cells),
+            "run_count": sum(len(cell.get("runs") or ()) for cell in cells),
+            "insert_seconds": 0.0,
+            "convert_seconds": 0.0,
+            "geometry_seconds": 0.0,
+            "formatting_seconds": 0.0,
+            "verification_seconds": 0.0,
+            "total_seconds": 0.0,
+            "failed_phase": None,
+            "success": False,
+            "_phase": "validation",
+            "_phase_started": started,
+        }
+        self._table_batch_metrics = None
+        try:
+            self._execute_table_batch(event, metrics)
+        except Exception:
+            failed_phase = str(metrics.pop("_phase", "unknown"))
+            phase_started = float(metrics.pop("_phase_started", started))
+            phase_metric = f"{failed_phase}_seconds"
+            if phase_metric in metrics and float(metrics[phase_metric]) == 0.0:
+                metrics[phase_metric] = max(0.0, time.perf_counter() - phase_started)
+            metrics["failed_phase"] = failed_phase
+            metrics["total_seconds"] = max(0.0, time.perf_counter() - started)
+            self._table_batch_metrics = metrics
+            raise
+        metrics.pop("_phase", None)
+        metrics.pop("_phase_started", None)
+        metrics["success"] = True
+        metrics["total_seconds"] = max(0.0, time.perf_counter() - started)
+        self._table_batch_metrics = metrics
+
+    def _execute_table_batch(
+        self,
+        event: ReconstructionEvent,
+        metrics: dict[str, object],
+    ) -> None:
+        def start_phase(name: str) -> None:
+            metrics["_phase"] = name
+            metrics["_phase_started"] = time.perf_counter()
+
+        def finish_phase(name: str) -> None:
+            metrics[f"{name}_seconds"] = max(
+                0.0,
+                time.perf_counter() - float(metrics["_phase_started"]),
+            )
+
+        if self.document is None:
+            raise RuntimeError("interactive Word document is not open")
+        rows = int(event.payload["rows"])
+        columns = int(event.payload["columns"])
+        cells = list(event.payload["cells"])
+        if len(cells) != rows * columns:
+            raise ValueError("InsertTableBatch payload must contain every table cell")
+        expected_coordinates = [
+            (row, column)
+            for row in range(1, rows + 1)
+            for column in range(1, columns + 1)
+        ]
+        actual_coordinates = [
+            (int(cell["row"]), int(cell["column"]))
+            for cell in cells
+        ]
+        if actual_coordinates != expected_coordinates:
+            raise ValueError("InsertTableBatch cells must be in complete row-major order")
+
+        payload_text = "\r".join(
+            "\t".join(
+                str(cells[(row - 1) * columns + column - 1]["text"])
+                for column in range(1, columns + 1)
+            )
+            for row in range(1, rows + 1)
+        )
+        start_phase("insert")
+        parent_range = self._require_range()
+        insertion_start = int(_retry_getattr(parent_range, "Start"))
+        _retry_rejected_com_call(lambda: parent_range.InsertAfter(payload_text))
+        inserted_range = _retry_rejected_com_call(
+            lambda: self.document.Range(insertion_start, insertion_start + len(payload_text))
+        )
+        finish_phase("insert")
+        start_phase("convert")
+        table = _retry_rejected_com_call(
+            lambda: inserted_range.ConvertToTable(
+                Separator=1,
+                NumRows=rows,
+                NumColumns=columns,
+            )
+        )
+        finish_phase("convert")
+        start_phase("geometry")
+        word_cells = {
+            (row, column): _retry_rejected_com_call(
+                lambda row=row, column=column: table.Cell(row, column)
+            )
+            for row, column in expected_coordinates
+        }
+        table_range = _retry_getattr(table, "Range")
+        after_range = self._duplicate_range(table_range)
+        collapse = _retry_getattr(after_range, "Collapse", None)
+        if callable(collapse):
+            _retry_rejected_com_call(lambda: collapse(WD_COLLAPSE_END))
+        context = {
+            "table": table,
+            "cells": word_cells,
+            "parent_range": parent_range,
+            "after_range": after_range,
+            "element_id": event.source_element_id,
+            "structure_complete": True,
+        }
+        self._table_stack.append(context)
+        self._active_table_element_id = event.source_element_id
+        try:
+            self._event_SetTableProperties(ReconstructionEvent(
+                "SetTableProperties",
+                event.source_element_id,
+                dict(event.payload.get("table_properties") or {}),
+            ))
+            for width in event.payload.get("column_widths") or ():
+                self._event_SetColumnWidth(ReconstructionEvent(
+                    "SetColumnWidth", event.source_element_id, dict(width)
+                ))
+            for row_record in event.payload.get("row_properties") or ():
+                self._event_SetRowProperties(ReconstructionEvent(
+                    "SetRowProperties", event.source_element_id, dict(row_record)
+                ))
+            for cell_record in cells:
+                cell_id = str(cell_record["source_element_id"])
+                row = int(cell_record["row"])
+                column = int(cell_record["column"])
+                self._event_SetCellProperties(ReconstructionEvent(
+                    "SetCellProperties",
+                    cell_id,
+                    {
+                        "row": row,
+                        "column": column,
+                        "properties": dict(cell_record.get("properties") or {}),
+                    },
+                ))
+
+            finish_phase("geometry")
+            start_phase("formatting")
+            paragraph_keys = [
+                json.dumps(
+                    dict(cell.get("paragraph_properties") or {}),
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    default=str,
+                )
+                for cell in cells
+            ]
+            common_paragraph_properties = (
+                dict(cells[0].get("paragraph_properties") or {})
+                if len(cells) > 1 and len(set(paragraph_keys)) == 1
+                else None
+            )
+            run_properties_by_key: dict[str, dict[str, Any]] = {}
+            run_property_counts: dict[str, int] = {}
+            for cell_record in cells:
+                for run_record in cell_record.get("runs") or ():
+                    properties = dict(run_record.get("properties") or {})
+                    key = json.dumps(
+                        properties,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    run_properties_by_key.setdefault(key, properties)
+                    run_property_counts[key] = run_property_counts.get(key, 0) + 1
+            baseline_run_key = None
+            if run_property_counts:
+                candidate = max(run_property_counts, key=run_property_counts.get)
+                if run_property_counts[candidate] > 1:
+                    baseline_run_key = candidate
+
+            common_range = None
+            if common_paragraph_properties is not None or baseline_run_key is not None:
+                common_range = self._duplicate_range(table_range)
+            if common_paragraph_properties is not None:
+                self.active_range = common_range
+                self._event_ApplyParagraphProperties(ReconstructionEvent(
+                    "ApplyParagraphProperties",
+                    event.source_element_id,
+                    common_paragraph_properties,
+                ))
+
+            for cell_record in cells:
+                cell_id = str(cell_record["source_element_id"])
+                key = (int(cell_record["row"]), int(cell_record["column"]))
+                self._active_cell_element_id = cell_id
+                word_cell_range = _retry_getattr(word_cells[key], "Range")
+                cell_start = int(_retry_getattr(word_cell_range, "Start"))
+                if common_paragraph_properties is None:
+                    cell_range = self._duplicate_range(word_cell_range)
+                    cell_end = int(_retry_getattr(cell_range, "End"))
+                    _retry_setattr(cell_range, "End", max(cell_start, cell_end - 1))
+                    self.active_range = cell_range
+                    self._event_ApplyParagraphProperties(ReconstructionEvent(
+                        "ApplyParagraphProperties",
+                        cell_id,
+                        dict(cell_record.get("paragraph_properties") or {}),
+                    ))
+
+            if baseline_run_key is not None:
+                self.active_range = common_range
+                self._event_ApplyRunProperties(ReconstructionEvent(
+                    "ApplyRunProperties",
+                    event.source_element_id,
+                    run_properties_by_key[baseline_run_key],
+                ))
+
+            for cell_record in cells:
+                cell_id = str(cell_record["source_element_id"])
+                key = (int(cell_record["row"]), int(cell_record["column"]))
+                self._active_cell_element_id = cell_id
+                word_cell_range = _retry_getattr(word_cells[key], "Range")
+                cell_start = int(_retry_getattr(word_cell_range, "Start"))
+                for run_record in cell_record.get("runs") or ():
+                    run_properties = dict(run_record.get("properties") or {})
+                    run_key = json.dumps(
+                        run_properties,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    if run_key == baseline_run_key:
+                        continue
+                    run_start = cell_start + int(run_record["start"])
+                    run_end = cell_start + int(run_record["end"])
+                    run_range = _retry_rejected_com_call(
+                        lambda run_start=run_start, run_end=run_end: self.document.Range(
+                            run_start, run_end
+                        )
+                    )
+                    self.active_range = run_range
+                    self._event_ApplyRunProperties(ReconstructionEvent(
+                        "ApplyRunProperties",
+                        str(run_record["source_element_id"]),
+                        run_properties,
+                    ))
+            finish_phase("formatting")
+        except Exception:
+            self._table_stack.pop()
+            self._active_table_element_id = None
+            self._active_cell_element_id = None
+            raise
+
+        self._table_stack.pop()
+        self.active_range = after_range
+        self._active_table_element_id = None
+        self._active_cell_element_id = None
+        self._active_run_properties = None
+        self._paragraph_started = False
+        self._post_table_paragraph_active = True
+        start_phase("verification")
+        if len(word_cells) != rows * columns or self.active_range is not after_range:
+            raise RuntimeError("InsertTableBatch postcondition failed")
+        finish_phase("verification")
+
     def _event_SetTableProperties(self, event: ReconstructionEvent) -> None:
         table = self._current_table()["table"]; props = event.payload
         if props.get("style_id"):
@@ -869,7 +1365,9 @@ class InteractiveWordController:
             if props["vertical_alignment"] in mapping:
                 cell.VerticalAlignment = mapping[props["vertical_alignment"]]
         if props.get("width") is not None and props.get("width_type") in {None, "dxa"}:
-            with suppress(Exception): cell.Width = self._twips_to_points(props["width"])
+            with suppress(Exception):
+                cell.PreferredWidthType = 3
+                cell.PreferredWidth = self._twips_to_points(props["width"])
         self._apply_padding(cell, props.get("cell_margins"))
         self._apply_shading(cell, props.get("shading_fill"))
         self._apply_borders(cell, props.get("borders"))
@@ -913,6 +1411,7 @@ class InteractiveWordController:
         # Word keeps a real paragraph immediately after a table. Reuse it for
         # the next source paragraph instead of inserting an extra blank one.
         self._paragraph_started = False
+        self._post_table_paragraph_active = True
 
     def _event_BeginParagraph(self, event: ReconstructionEvent) -> None:
         if self._page_break_continuation_pending:
@@ -925,6 +1424,7 @@ class InteractiveWordController:
         target = self._require_range()
         _retry_rejected_com_call(lambda: target.InsertParagraphAfter())
         self._collapse_end()
+        self._post_table_paragraph_active = False
 
     def _event_EndParagraph(self, event: ReconstructionEvent) -> None:
         return
@@ -953,7 +1453,7 @@ class InteractiveWordController:
         with suppress(Exception):
             properties(name).Delete()
         # Office MsoDocProperties.msoPropertyTypeString = 4
-        properties.Add(Name=name, LinkToContent=False, Type=4, Value=str(value))
+        properties.Add(name, False, 4, str(value))
 
     def apply_metadata(self, policy: dict[str, str]) -> None:
         if self.document is None:
@@ -988,11 +1488,15 @@ class InteractiveWordController:
     def close(self) -> None:
         if self.document is not None:
             with suppress(Exception):
-                self.document.Close(False)
+                _retry_rejected_com_call(lambda: self.document.Close(False))
             self.document = None
+        application_quit = self.application is None
         if self.application is not None:
-            with suppress(Exception):
-                self.application.Quit()
+            try:
+                _retry_rejected_com_call(lambda: self.application.Quit())
+                application_quit = True
+            except Exception:
+                application_quit = False
             self.application = None
         self.active_range = None
         if self._owns_com:
@@ -1000,6 +1504,12 @@ class InteractiveWordController:
                 import pythoncom
                 pythoncom.CoUninitialize()
             self._owns_com = False
+        if application_quit and (
+            self._owned_word_pid is None
+            or self._owned_word_pid not in word_process_pids()
+        ):
+            clear_owned_word(self._owned_word_pid)
+            self._owned_word_pid = None
 
 
 class InteractiveWordRenderer:
@@ -1045,12 +1555,28 @@ class InteractiveWordRenderer:
                     callback(index, event, phase, exc)
                 raise
 
+        def emit_table_batch_profile(index, event) -> None:
+            if event.event_type != "InsertTableBatch":
+                return
+            consume = getattr(self.controller, "consume_table_batch_metrics", None)
+            metrics = consume() if callable(consume) else None
+            callback = getattr(observer, "table_batch_profile", None) if observer is not None else None
+            if metrics is not None and callback is not None:
+                callback(index, event, metrics)
+
         initial_event = blueprint.events[start_index] if start_index < blueprint.total_events else None
         expected_state = take_snapshot(start_index, initial_event, "initial_state") if initial_event is not None else None
+        previous_event_type = None
         for index in range(start_index, blueprint.total_events):
             event = blueprint.events[index]
             actual_state = None
-            if expected_state is not None and callable(snapshot_fn):
+            text_events = {"InsertCharacter", "InsertText", "InsertTab", "InsertLineBreak", "InsertPageBreak"}
+            reuse_post_snapshot = (
+                expected_state is not None
+                and event.event_type in text_events
+                and previous_event_type == "ApplyRunProperties"
+            )
+            if expected_state is not None and callable(snapshot_fn) and not reuse_post_snapshot:
                 actual_state = take_snapshot(index, event, "pre_state_check")
                 if not state_snapshots_match(expected_state, actual_state):
                     control.pause()
@@ -1065,18 +1591,27 @@ class InteractiveWordRenderer:
                     return ExecutionOutcome.stopped(index - 1)
             # The verified pre-event snapshot is also the observer's before-state.
             # Avoid a redundant COM Range poll for every single character event.
-            before_state = actual_state if actual_state is not None else take_snapshot(index, event, "before_event")
+            before_state = (
+                actual_state
+                if actual_state is not None
+                else expected_state
+                if reuse_post_snapshot
+                else take_snapshot(index, event, "before_event")
+            )
             started = getattr(observer, "event_started", None) if observer is not None else None
             if started is not None:
                 started(index, event, before_state)
             try:
                 self.execute_event(event)
             except Exception as exc:
+                emit_table_batch_profile(index, event)
                 failed = getattr(observer, "event_failed", None) if observer is not None else None
                 if failed is not None:
                     failed(index, event, before_state, exc)
                 raise
+            emit_table_batch_profile(index, event)
             expected_state = take_snapshot(index, event, "post_event")
+            previous_event_type = event.event_type
             if observer is not None:
                 observer.event_completed(index, event)
                 finished = getattr(observer, "event_finished", None)
@@ -1085,7 +1620,8 @@ class InteractiveWordRenderer:
                 halt_status = getattr(observer, "halt_status", None)
                 if halt_status:
                     return ExecutionOutcome(str(halt_status), index, min(blueprint.total_events, index + 1))
-            self.speed.delay_after(event.event_type)
+            character_count = len(str(event.payload.get("text", ""))) if event.event_type == "InsertText" else 1
+            self.speed.delay_after(event.event_type, character_count=character_count)
         return ExecutionOutcome.completed(blueprint.total_events)
 
     def resume_state_snapshot(self) -> dict[str, Any]:

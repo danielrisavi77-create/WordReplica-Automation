@@ -123,6 +123,10 @@ class InteractiveCheckpointCoordinator:
             self.section_element_id = sid
         if et in {"BeginParagraph", "BeginTable"}:
             self.block_element_id = sid
+        if et == "InsertTableBatch":
+            self.block_element_id = sid
+            self.table_element_id = None
+            self.cell_element_id = None
         if et == "BeginTable":
             self.table_element_id = sid
         elif et == "EndTable":
@@ -137,7 +141,7 @@ class InteractiveCheckpointCoordinator:
         if not bool(getattr(self.renderer, "is_restart_safe", lambda: True)()):
             return None
         et = event.event_type
-        if et == "EndTable" and self.settings.get("checkpoint_after_tables", False):
+        if et in {"EndTable", "InsertTableBatch"} and self.settings.get("checkpoint_after_tables", False):
             return "table_boundary"
         if et == "SetImageZOrder" and self.settings.get("checkpoint_after_images", False):
             return "image_boundary"
@@ -147,6 +151,14 @@ class InteractiveCheckpointCoordinator:
         if interval > 0 and (index + 1) % interval == 0:
             return "event_interval"
         return None
+
+    def event_started(self, index: int, event, snapshot) -> None:
+        if event.event_type != "InsertTableBatch":
+            return
+        previous_index = int(index) - 1
+        if self.last_checkpoint_event_index == previous_index:
+            return
+        self.checkpoint(previous_index, status="RUNNING", reason="before_table_batch")
 
     def event_completed(self, index: int, event) -> None:
         self._update_context(event)

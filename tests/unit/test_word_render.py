@@ -1,6 +1,6 @@
 import pytest
 
-from word_replica.qa.word_render import _export_with_application
+from word_replica.qa.word_render import _export_pair_with_application, _export_with_application
 
 
 class FakeDocument:
@@ -44,3 +44,19 @@ def test_export_failure_is_not_overwritten_by_cleanup_failure(tmp_path):
     source=tmp_path/"source.docx"; source.write_bytes(b"x")
     with pytest.raises(RuntimeError, match="real export failure"):
         _export_with_application(app, source, tmp_path/"out.pdf")
+
+
+def test_pair_export_uses_one_application_for_both_documents(tmp_path):
+    log=[]; doc=FakeDocument(log); app=FakeApplication(log,doc)
+    source=tmp_path/"source.docx"; source.write_bytes(b"x")
+    output=tmp_path/"output.docx"; output.write_bytes(b"y")
+
+    _export_pair_with_application(
+        app,
+        source,
+        tmp_path/"source.pdf",
+        output,
+        tmp_path/"output.pdf",
+    )
+
+    assert [event[0] for event in log] == ["open", "export", "close", "open", "export", "close"]

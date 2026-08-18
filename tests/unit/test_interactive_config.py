@@ -19,6 +19,13 @@ def test_interactive_options_have_deterministic_release_defaults():
     assert options.checkpoint_event_interval == 500
     assert options.verify_during_run is True
     assert options.block_on_unsupported is True
+    assert options.enable_table_fast_path is True
+
+
+def test_interactive_options_can_disable_table_fast_path_for_paired_benchmarking():
+    options = InteractiveOptions(enable_table_fast_path=False)
+
+    assert options.enable_table_fast_path is False
 
 
 def test_rebuild_options_default_to_existing_instant_behavior():
