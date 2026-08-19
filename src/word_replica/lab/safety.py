@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 import re
+from urllib.parse import urlsplit
 from typing import Any
 from zipfile import BadZipFile, ZipFile
 
@@ -68,6 +69,12 @@ _DANGEROUS_EXTERNAL_REL_TYPES = frozenset({
 _DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 _EXECUTABLE_MAGIC = (b"MZ", b"\x7fELF")
 _MACRO_PARTS = frozenset({"word/vbaproject.bin", "word/vbadata.xml"})
+
+# Extensions that make a link a payload path regardless of where it points.
+_EXECUTABLE_SUFFIXES = frozenset({
+    ".exe", ".dll", ".scr", ".com", ".bat", ".cmd", ".ps1", ".vbs", ".vbe",
+    ".js", ".jse", ".wsf", ".wsh", ".hta", ".msi", ".cpl", ".jar", ".lnk",
+})
 _INSTR_TEXT_TAG = f"{{{_W_NS}}}instrText"
 
 
@@ -388,17 +395,53 @@ def read_package(
     )
 
 
+def _target_suffix(target: str) -> str:
+    """Extension of a relationship target's *path*, never of its host.
+
+    Reading the suffix off the whole string treats https://example.com/ as a
+    DOS executable, because ".com" is both a top-level domain and an old
+    Windows extension. Splitting the URL first is what keeps an ordinary
+    hyperlink out of the hostile bucket.
+    """
+    split = urlsplit(target.replace("\\", "/"))
+    path = split.path if split.scheme or split.netloc else target.replace("\\", "/")
+    path = path.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    return PurePosixPath(path).suffix.lower() if path else ""
+
+
+def _is_remote_target(target: str) -> bool:
+    """True for a target that reaches another machine at open time."""
+    lowered = target.lower()
+    if lowered.startswith(("http://", "https://", "ftp://", "ftps://")):
+        return True
+    # UNC, either raw or spelled as a file: URL with an authority.
+    return target.startswith(("\\\\", "//")) or lowered.startswith(("file://///", "file:////"))
+
+
 def _external_relationship_hazards(root: Any) -> list[str]:
+    """Only genuinely dangerous external references.
+
+    Calibrated against the real corpus rather than guessed. Flagging every
+    external reference to a local path classified 57 of the first 105 HOSTILE
+    documents on nothing more than their own attached template -- Word records
+    the user's Normal.dotm in essentially every file it saves, and chart parts
+    routinely link the workbook they were built from. Quarantining those would
+    have cost a large share of any real-world corpus for no security gain.
+
+    What is actually dangerous: a reference that reaches another machine at
+    open time (remote template injection, remote OLE), or one that names an
+    executable no matter where it lives.
+    """
     hazards: list[str] = []
     for node in root.findall(f"{{{_REL_NS}}}Relationship"):
         if node.get("TargetMode") != "External":
             continue
         target = (node.get("Target") or "").strip()
         rel_type = (node.get("Type") or "").rsplit("/", 1)[-1]
-        if target.lower().startswith("file:") or target.startswith(("\\\\", "//")) or _DRIVE_PREFIX.match(target):
-            hazards.append(f"external reference to a local or UNC path: {target[:120]}")
-        elif rel_type in _DANGEROUS_EXTERNAL_REL_TYPES:
-            hazards.append(f"external {rel_type} reference: {target[:120]}")
+        if _target_suffix(target) in _EXECUTABLE_SUFFIXES:
+            hazards.append(f"external reference to an executable: {target[:120]}")
+        elif rel_type in _DANGEROUS_EXTERNAL_REL_TYPES and _is_remote_target(target):
+            hazards.append(f"remote {rel_type} reference: {target[:120]}")
     return hazards
 
 

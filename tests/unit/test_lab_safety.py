@@ -232,19 +232,55 @@ def test_entity_declaration_anywhere_is_hostile(tmp_path):
     assert any("entity" in reason.lower() or "doctype" in reason.lower() for reason in triage.reasons)
 
 
-def test_external_unc_relationship_target_is_hostile(tmp_path):
-    rels = _external_rel(b"oleObject", b"\\\\attacker\\share\\payload.dll")
+def test_a_remote_unc_reference_is_hostile(tmp_path):
+    rels = _external_rel(b"oleObject", rb"\\attacker\share\payload.dll")
     path = _docx(tmp_path / "unc.docx", MINIMAL, extra={"word/_rels/document.xml.rels": rels})
 
     assert triage_document(path).risk_class is RiskClass.HOSTILE
 
 
-def test_external_file_scheme_relationship_target_is_hostile(tmp_path):
-    rels = _external_rel(b"attachedTemplate", b"file:///c:/evil.dotm")
-    path = _docx(tmp_path / "tpl.docx", MINIMAL, extra={"word/_rels/document.xml.rels": rels})
+def test_a_remote_http_template_is_hostile(tmp_path):
+    # Remote template injection: opening the document fetches whatever is at
+    # that URL and runs its macros.
+    rels = _external_rel(b"attachedTemplate", b"https://attacker.example/payload.dotm")
+    path = _docx(tmp_path / "tpl.docx", MINIMAL, extra={"word/_rels/settings.xml.rels": rels})
 
     assert triage_document(path).risk_class is RiskClass.HOSTILE
 
+
+def test_the_local_attached_template_every_word_document_has_is_not_hostile(tmp_path):
+    # Measured against the real corpus: 57 of 105 documents first classified
+    # HOSTILE were flagged only for recording their own Normal.dotm at a local
+    # path. Word writes that into essentially every document it saves, so the
+    # rule was quarantining ordinary files.
+    rels = _external_rel(b"attachedTemplate", b"file:///C:/Program%20Files/Templates/Normal.dotm")
+    path = _docx(tmp_path / "normal.docx", MINIMAL, extra={"word/_rels/settings.xml.rels": rels})
+
+    assert triage_document(path).risk_class is RiskClass.VALID
+
+
+def test_a_bare_local_template_name_is_not_hostile(tmp_path):
+    rels = _external_rel(b"attachedTemplate", b"Normal.dotm")
+    path = _docx(tmp_path / "bare.docx", MINIMAL, extra={"word/_rels/settings.xml.rels": rels})
+
+    assert triage_document(path).risk_class is RiskClass.VALID
+
+
+def test_a_local_reference_to_an_executable_is_still_hostile(tmp_path):
+    # Local is not the same as harmless: a link to an executable is a payload
+    # path wherever it points.
+    rels = _external_rel(b"oleObject", b"file:///C:/Users/x/AppData/payload.exe")
+    path = _docx(tmp_path / "exe.docx", MINIMAL, extra={"word/_rels/document.xml.rels": rels})
+
+    assert triage_document(path).risk_class is RiskClass.HOSTILE
+
+
+def test_a_local_linked_workbook_is_not_hostile(tmp_path):
+    # Chart parts routinely link the spreadsheet they were built from.
+    rels = _external_rel(b"oleObject", b"file:///C:/Users/x/Documents/data.xlsx")
+    path = _docx(tmp_path / "chart.docx", MINIMAL, extra={"word/charts/_rels/chart1.xml.rels": rels})
+
+    assert triage_document(path).risk_class is RiskClass.VALID
 
 def test_ordinary_external_hyperlink_is_not_hostile(tmp_path):
     # Hyperlinks are ubiquitous; treating them as hostile would quarantine a
@@ -253,6 +289,23 @@ def test_ordinary_external_hyperlink_is_not_hostile(tmp_path):
     path = _docx(tmp_path / "link.docx", MINIMAL, extra={"word/_rels/document.xml.rels": rels})
 
     assert triage_document(path).risk_class is RiskClass.VALID
+
+
+def test_a_dot_com_hostname_is_not_read_as_a_dos_executable(tmp_path):
+    # ".com" is both a top-level domain and an old Windows executable
+    # extension. Reading the suffix off the whole target rather than off its
+    # path classified every link to a .com site as a payload.
+    rels = _external_rel(b"hyperlink", b"https://example.com/")
+    path = _docx(tmp_path / "tld.docx", MINIMAL, extra={"word/_rels/document.xml.rels": rels})
+
+    assert triage_document(path).risk_class is RiskClass.VALID
+
+
+def test_an_executable_below_a_dot_com_host_is_still_hostile(tmp_path):
+    rels = _external_rel(b"hyperlink", b"https://example.com/payload.exe")
+    path = _docx(tmp_path / "tldexe.docx", MINIMAL, extra={"word/_rels/document.xml.rels": rels})
+
+    assert triage_document(path).risk_class is RiskClass.HOSTILE
 
 
 def test_missing_content_type_override_is_recoverable_not_hostile(tmp_path):
