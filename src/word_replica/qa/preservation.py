@@ -238,15 +238,27 @@ def _is_provenance_only(root: Any) -> bool:
     )
 
 
-def g10_projection(path: Path, *, limits: PackageLimits = DEFAULT_LIMITS) -> dict[str, Any]:
-    """Everything about a package that survives normalization. Never raises."""
+def g10_projection(
+    path: Path,
+    *,
+    limits: PackageLimits = DEFAULT_LIMITS,
+    ignore_parts: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Everything about a package that survives normalization. Never raises.
+
+    ``ignore_parts`` lets a caller project a package as if a part were absent.
+    Doing it here rather than trimming the finished projection is what keeps it
+    exact: namespaces and relationship counts are recomputed, so a namespace the
+    ignored part shares with another (docPropsVTypes appears in both
+    custom.xml and app.xml) is not wrongly removed.
+    """
     scan = read_package(Path(path), limits=limits)
     if not scan.ok:
         return {"unreadable": scan.error or "package could not be read"}
 
     content_types = _content_type_map(scan.parts, scan.roots)
 
-    ignored: set[str] = set()
+    ignored: set[str] = set(ignore_parts)
     custom_props = scan.roots.get(_CUSTOM_PROPS_PART)
     if custom_props is not None and _is_provenance_only(custom_props):
         ignored.add(_CUSTOM_PROPS_PART)
@@ -287,39 +299,6 @@ _CUSTOM_PROPS_CONTENT_TYPE = (
 )
 
 
-def _without_custom_properties(expected: dict[str, Any], actual: dict[str, Any]) -> dict[str, Any]:
-    """Remove the source's custom-properties part from what the output is held to.
-
-    Only when the output does not have one: a policy that drops properties
-    cannot explain an output that has some.
-    """
-    if _CUSTOM_PROPS_CONTENT_TYPE in actual.get("part_kinds", {}):
-        return expected
-    trimmed = dict(expected)
-    trimmed["part_kinds"] = {
-        name: count
-        for name, count in expected.get("part_kinds", {}).items()
-        if name != _CUSTOM_PROPS_CONTENT_TYPE
-    }
-    trimmed["relationship_graph"] = {
-        name: entry
-        for name, entry in expected.get("relationship_graph", {}).items()
-        if name != "custom-properties"
-    }
-    # The two namespaces only ever appear in that part, so dropping the part
-    # means dropping its namespaces too.
-    trimmed["namespaces"] = [
-        uri for uri in expected.get("namespaces", []) if uri not in _CUSTOM_PROPS_NAMESPACES
-    ]
-    return trimmed
-
-
-_CUSTOM_PROPS_NAMESPACES = frozenset({
-    "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties",
-    "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes",
-})
-
-
 def build_preservation_gate(
     source: Path,
     output: Path,
@@ -341,10 +320,13 @@ def build_preservation_gate(
     """
     from word_replica.qa.policy import compare_projection
 
-    expected = g10_projection(source, limits=limits)
     actual = g10_projection(output, limits=limits)
-    if custom_properties_dropped_by_policy:
-        expected = _without_custom_properties(expected, actual)
+    ignore: frozenset[str] = frozenset()
+    if custom_properties_dropped_by_policy and _CUSTOM_PROPS_CONTENT_TYPE not in actual.get("part_kinds", {}):
+        # Project the source as if it had never had the part, so the comparison
+        # is exact rather than a subtraction from a finished projection.
+        ignore = frozenset({_CUSTOM_PROPS_PART})
+    expected = g10_projection(source, limits=limits, ignore_parts=ignore)
     findings = compare_projection("G10", expected, actual)
 
     if not findings:
