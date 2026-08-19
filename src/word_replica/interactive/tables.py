@@ -37,14 +37,28 @@ class TablePlan:
 
 
 def build_table_plan(table: Table) -> TablePlan:
+    declared_grid_columns = len(table.properties.get("grid_column_widths") or ())
     cells: list[CellPlan] = []
     row_maps: list[dict[int, CellPlan]] = []
     max_columns = 0
     for r_idx, row in enumerate(table.rows, start=1):
+        row_cells = list(row.cells)
+        spans = [max(1, int(cell.properties.get("grid_span", 1) or 1)) for cell in row_cells]
+        if declared_grid_columns and row_cells:
+            shortfall = declared_grid_columns - sum(spans)
+            if shortfall > 0:
+                # Word tolerates a row whose cells fall short of the table's
+                # declared grid column count - seen in real documents with no
+                # explicit gridSpan covering the gap - by letting the last
+                # cell in the row silently absorb the remaining columns when
+                # rendering. Match that so reconstruction doesn't end up with
+                # a phantom, never-populated extra cell that shifts every
+                # subsequent cell's structural comparison for the rest of
+                # the table.
+                spans[-1] += shortfall
         col = 1
         row_map: dict[int, CellPlan] = {}
-        for cell in row.cells:
-            span = max(1, int(cell.properties.get("grid_span", 1) or 1))
+        for cell, span in zip(row_cells, spans):
             continuation = cell.properties.get("v_merge") == "continue"
             cp = CellPlan(
                 cell_id=cell.element_id,

@@ -32,6 +32,35 @@ def test_horizontal_and_vertical_merges_are_stable_premerge_coordinates():
     assert [c.cell_id for c in plan.cells if not c.continuation] == ["a", "b", "b2"]
 
 
+def test_row_short_of_declared_grid_columns_extends_last_cell_without_explicit_gridspan():
+    # Real-world source: a table declares 5 grid columns, but a row's own
+    # <w:tc> elements only cover 4 of them with no gridSpan explaining the
+    # gap. Word tolerates this when rendering by letting the last cell
+    # silently absorb the remaining column; reconstruction must match or a
+    # phantom, never-populated 5th cell drifts every later structural
+    # comparison for the rest of the table.
+    table = Table(
+        "t",
+        [TableRow("r0", [cell("c0", "A"), cell("c1", "B"), cell("c2", "C"), cell("c3", "D")])],
+        properties={"grid_column_widths": [96, 2811, 3027, 436, 1475]},
+    )
+    plan = build_table_plan(table)
+    assert plan.column_count == 5
+    assert [(c.column, c.column_span) for c in plan.cells] == [(1, 1), (2, 1), (3, 1), (4, 2)]
+    assert [(m.start_row, m.start_column, m.end_row, m.end_column) for m in plan.merges] == [(1, 4, 1, 5)]
+
+
+def test_row_matching_declared_grid_columns_is_left_untouched():
+    table = Table(
+        "t",
+        [TableRow("r0", [cell("c0", "A"), cell("c1", "B")])],
+        properties={"grid_column_widths": [1000, 1000]},
+    )
+    plan = build_table_plan(table)
+    assert [(c.column, c.column_span) for c in plan.cells] == [(1, 1), (2, 1)]
+    assert plan.merges == ()
+
+
 def test_nested_table_is_retained_in_logical_cell_blocks():
     nested = Table("nested", [TableRow("nr", [cell("nc", "N")])])
     outer_cell = cell("outer", "", blocks=[nested])
