@@ -6,7 +6,7 @@ from pathlib import Path
 import os
 import shutil
 import tempfile
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from docx import Document
 from lxml import etree
@@ -338,6 +338,22 @@ def build_body_xml(model: DocumentModel):
     return body
 
 
+# Pinned so a seed produces byte-identical output across runs and machines.
+# The 1980-01-01 epoch is the earliest a ZIP member timestamp can express.
+_DETERMINISTIC_ZIP_DATE_TIME = (1980, 1, 1, 0, 0, 0)
+_DETERMINISTIC_COMPRESSLEVEL = 6
+
+
+def _canonical_part_order(parts: dict[str, bytes]) -> list[str]:
+    """OPC readers accept any member order; pin one so the bytes are stable.
+
+    [Content_Types].xml must be first for the package to be recognised by
+    strict readers, the package relationships follow, then everything sorted.
+    """
+    lead = [name for name in ("[Content_Types].xml", "_rels/.rels") if name in parts]
+    return lead + sorted(name for name in parts if name not in lead)
+
+
 class MutableDocxPackage:
     def __init__(self, parts: dict[str, bytes]) -> None:
         self.parts = parts
@@ -522,6 +538,36 @@ class MutableDocxPackage:
         text = etree.SubElement(existing, f"{{{VT_NS}}}lpwstr")
         text.text = str(value)
         self._write_xml(part, root)
+
+    def write_deterministic(self, output_path: Path) -> None:
+        """Write the package so identical parts always produce identical bytes.
+
+        write_atomic cannot promise this: ZipFile.writestr stamps every member
+        with the current local time, and it iterates self.parts in insertion
+        order. The fidelity lab addresses generated documents by content hash,
+        so a seed has to yield the same bytes forever -- otherwise a Python or
+        zlib upgrade silently rebaselines GOLDEN-CORE and orphans every
+        regression history attached to it.
+
+        Four things are pinned: a fixed member timestamp, an explicit
+        compression level (zlib's default has changed between versions), fixed
+        permission bits, and a canonical member order -- OPC readers tolerate
+        any order, but a stable one is what makes the bytes stable.
+        """
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=output_path.name, suffix=".tmp", dir=output_path.parent)
+        os.close(fd)
+        try:
+            with ZipFile(temp_name, "w", ZIP_DEFLATED, compresslevel=_DETERMINISTIC_COMPRESSLEVEL) as archive:
+                for name in _canonical_part_order(self.parts):
+                    info = ZipInfo(name, date_time=_DETERMINISTIC_ZIP_DATE_TIME)
+                    info.compress_type = ZIP_DEFLATED
+                    info.external_attr = 0o600 << 16
+                    archive.writestr(info, self.parts[name])
+            Path(temp_name).replace(output_path)
+        finally:
+            Path(temp_name).unlink(missing_ok=True)
 
     def write_atomic(self, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
