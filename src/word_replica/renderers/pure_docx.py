@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import os
 import shutil
 import tempfile
@@ -354,6 +354,26 @@ def _canonical_part_order(parts: dict[str, bytes]) -> list[str]:
     return lead + sorted(name for name in parts if name not in lead)
 
 
+def _rels_part_for(part_name: str) -> str:
+    parent, _, name = part_name.rpartition("/")
+    return f"{parent}/_rels/{name}.rels" if parent else f"_rels/{name}.rels"
+
+
+def _resolve_rel_target(rels_part: str, target: str) -> str:
+    owner = PurePosixPath(rels_part).parent
+    if owner.name == "_rels":
+        owner = owner.parent
+    candidate = target.lstrip("/") if target.startswith("/") else str(PurePosixPath(owner, target))
+    resolved: list[str] = []
+    for piece in PurePosixPath(candidate).parts:
+        if piece == "..":
+            if resolved:
+                resolved.pop()
+        elif piece not in (".", ""):
+            resolved.append(piece)
+    return "/".join(resolved)
+
+
 class MutableDocxPackage:
     def __init__(self, parts: dict[str, bytes]) -> None:
         self.parts = parts
@@ -386,6 +406,61 @@ class MutableDocxPackage:
             node.set("PartName", f"/{part_name}")
             node.set("ContentType", content_type)
             self._write_xml("[Content_Types].xml", root)
+
+    # python-docx's default template is the starting shell for every rebuild,
+    # and it ships a custom XML datastore and a thumbnail of its own. Left in
+    # place they end up in documents that never had them -- a foreign customXml
+    # store is real content, not decoration, and no gate that compares parsed
+    # models can see it because the parser does not model custom XML at all.
+    _TEMPLATE_DEBRIS = (
+        "customXml/item1.xml",
+        "customXml/itemProps1.xml",
+        "docProps/thumbnail.jpeg",
+        "word/stylesWithEffects.xml",
+    )
+
+    def drop_template_debris(self) -> list[str]:
+        """Remove parts that came from the shell template rather than the source."""
+        dropped = [name for name in self._TEMPLATE_DEBRIS if self.drop_part(name)]
+        # customXml/_rels/item1.xml.rels has no override and is only reachable
+        # from the part just removed.
+        for leftover in [n for n in list(self.parts) if n.lower().startswith("customxml/")]:
+            del self.parts[leftover]
+            dropped.append(leftover)
+        return dropped
+
+    def drop_part(self, part_name: str) -> bool:
+        """Remove a part together with everything that refers to it.
+
+        Removing the bytes alone would leave a content-type override and a
+        relationship pointing at nothing, which Word repairs on open -- a worse
+        defect than the one being fixed. Returns whether anything was removed.
+        """
+        if part_name not in self.parts:
+            return False
+        del self.parts[part_name]
+        self.parts.pop(_rels_part_for(part_name), None)
+
+        root = self._xml("[Content_Types].xml")
+        removed_override = False
+        for node in root.xpath(f"//*[local-name()='Override'][@PartName='/{part_name}']"):
+            root.remove(node)
+            removed_override = True
+        if removed_override:
+            self._write_xml("[Content_Types].xml", root)
+
+        for rels_name in [name for name in self.parts if name.endswith(".rels")]:
+            rels_root = self._xml(rels_name)
+            changed = False
+            for node in list(rels_root):
+                if node.get("TargetMode") == "External":
+                    continue
+                if _resolve_rel_target(rels_name, node.get("Target") or "") == part_name:
+                    rels_root.remove(node)
+                    changed = True
+            if changed:
+                self._write_xml(rels_name, rels_root)
+        return True
 
     def _ensure_relationship(self, rels_part: str, rel_type: str, target: str) -> str:
         root = self._xml(rels_part)
@@ -596,6 +671,7 @@ class PureDocxRenderer:
         shell.parent.mkdir(parents=True, exist_ok=True)
         Document().save(shell)
         self._package = MutableDocxPackage.from_file(shell)
+        self._package.drop_template_debris()
         self._package.initialize_truthful_lifecycle()
         if model.fields and not _document_has_inline_field_tokens(model):
             self._package.warnings.append(WarningItem(
