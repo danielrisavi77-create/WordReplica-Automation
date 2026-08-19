@@ -171,6 +171,46 @@ def test_interval_checkpoint_skips_non_resumable_atomic_structure(tmp_path):
     assert store.load_latest().last_completed_event_index == 1
 
 
+def test_checkpoint_snapshot_failure_leaves_no_desynced_state(tmp_path):
+    # Regression for the golden_2 incident: current_state_snapshot() is a Word COM
+    # round-trip and can fail (RPC errors, Word crashes). It must run BEFORE the save,
+    # so a failure there aborts cleanly instead of leaving save_history.jsonl / the
+    # on-disk output ahead of a checkpoint.json that never got written for that save
+    # (which would then permanently fail every future resume attempt).
+    from word_replica.interactive.checkpoints import InteractiveCheckpointCoordinator
+    from word_replica.services.audit import AuditLog
+    from word_replica.services.checkpoints import CheckpointManager
+
+    source = tmp_path / "source.docx"
+    source.write_bytes(b"source")
+    output = tmp_path / "partial.docx"
+    bp = blueprint()
+
+    class FlakyRenderer:
+        def save(self, path):
+            Path(path).write_bytes(b"actual-word-save")
+
+        def current_state_snapshot(self):
+            raise RuntimeError("RPC_E_DISCONNECTED")
+
+    history = tmp_path / "history.jsonl"
+    manager = CheckpointManager(history, AuditLog(tmp_path / "audit.jsonl"))
+    store = InteractiveCheckpointStore(tmp_path / "interactive_checkpoint.json")
+    coordinator = InteractiveCheckpointCoordinator(
+        project_id="p1", source_path=source, blueprint=bp, output_path=output,
+        settings={"checkpoint_event_interval": 1}, renderer=FlakyRenderer(),
+        save_manager=manager, checkpoint_store=store,
+    )
+
+    with pytest.raises(RuntimeError, match="RPC_E_DISCONNECTED"):
+        coordinator.event_completed(0, bp.events[0])
+
+    assert not output.exists()
+    assert not store.path.exists()
+    assert not history.exists()
+    assert manager.sequence == 0
+
+
 def test_nested_table_context_is_not_restart_safe_until_inner_table_exits():
     from types import SimpleNamespace
     from word_replica.renderers.interactive_word import InteractiveWordController

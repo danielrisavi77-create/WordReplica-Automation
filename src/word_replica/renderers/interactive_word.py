@@ -170,6 +170,7 @@ class InteractiveWordController:
         self._bookmark_starts: dict[str, int] = {}
         self._bookmark_com_names: set[str] = set()
         self._bookmark_name_rewrites: dict[str, str] = {}
+        self._last_saved_path: Path | None = None
         self._pending_note: Any | None = None
         self._active_note_index: int | None = None
         self._active_story = "body"
@@ -1553,7 +1554,21 @@ class InteractiveWordController:
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         _retry_rejected_com_call(lambda: self.document.SaveAs2(str(destination), FileFormat=WD_FORMAT_DOCX))
-        _restore_bookmark_names(destination, self._bookmark_name_rewrites)
+        # Bookmark-name restoration is deferred to close() rather than done here:
+        # Word keeps this exact file open (and locked) as its active document for
+        # as long as this session runs, so a rename-based rewrite against it here
+        # deterministically fails with WinError 5 (confirmed - even hidden/hasn't-
+        # yet-been-touched-again, the file stays locked the entire time the
+        # document stays open, not just briefly after SaveAs2 returns).
+        self._last_saved_path = destination
+
+    def restore_pending_bookmark_names(self) -> None:
+        """Rewrite sanitized COM-safe bookmark names back to their source names
+        in the last-saved file. Must run after close() - Word only releases its
+        lock on the file once the document is closed."""
+        if self._last_saved_path is None or not self._bookmark_name_rewrites:
+            return
+        _restore_bookmark_names(self._last_saved_path, self._bookmark_name_rewrites)
 
     def set_custom_property(self, name: str, value: Any) -> None:
         if self.document is None:
