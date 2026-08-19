@@ -7,8 +7,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+from typing import Callable
 
 from scripts.codex_automation.config import CodexAutomationConfig
+from word_replica.renderers.word_ownership import process_creation_filetime
 
 
 def sha256_file(path: Path) -> str:
@@ -17,6 +19,69 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+# OpenProcess sets ERROR_INVALID_PARAMETER when the pid does not exist. Every
+# other failure -- ERROR_ACCESS_DENIED above all -- means the process may well
+# be alive and we simply cannot see it.
+_ERROR_INVALID_PARAMETER = 87
+
+
+def _process_identity(pid: int) -> int | None:
+    """Creation FILETIME of a live process, or None when no such process exists.
+
+    Raises RuntimeError when the answer cannot be established -- a platform that
+    cannot report process identity, or a process we are not allowed to query.
+    Callers must treat that as "unknown", never as "gone".
+    """
+    try:
+        return process_creation_filetime(pid)
+    except OSError as exc:
+        if exc.errno == _ERROR_INVALID_PARAMETER or getattr(exc, "winerror", None) == _ERROR_INVALID_PARAMETER:
+            return None
+        raise RuntimeError(f"cannot determine whether PID {pid} is alive: {exc}") from exc
+
+
+def _self_creation_filetime() -> int | None:
+    try:
+        return _process_identity(os.getpid())
+    except RuntimeError:
+        return None
+
+
+def _read_lock_record(path: Path) -> dict | None:
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def lock_holder_state(record: dict | None, *, identity_probe: Callable[[int], int | None]) -> str:
+    """One of "held", "stale", "unknown"."""
+    if not record:
+        return "unknown"
+    try:
+        pid = int(record["pid"])
+    except (KeyError, TypeError, ValueError):
+        return "unknown"
+    try:
+        live_identity = identity_probe(pid)
+    except RuntimeError:
+        return "unknown"
+    if live_identity is None:
+        return "stale"
+    recorded = record.get("creation_filetime")
+    if isinstance(recorded, int) and int(live_identity) != recorded:
+        return "stale"
+    return "held"
+
+
+def _lock_busy_message(record: dict | None) -> str:
+    pid = (record or {}).get("pid")
+    if pid is None:
+        return "a Golden Word run is already active"
+    return f"a Golden Word run is already active (holder pid {pid})"
 
 
 @dataclass(slots=True)
@@ -45,14 +110,34 @@ class GoldenWorkspace:
         ):
             path.mkdir(parents=True, exist_ok=True)
 
-    def acquire_lock(self) -> None:
+    def acquire_lock(self, *, identity_probe: Callable[[int], int | None] | None = None) -> None:
+        """Take the machine-wide "one Golden Word run at a time" lock.
+
+        The lock is reclaimed only when the recorded holder can be *proved*
+        gone: its pid no longer exists, or it exists with a different process
+        creation FILETIME (i.e. the pid was reused). Anything we cannot prove
+        -- an unreadable record, a platform that cannot answer -- counts as
+        held, because wrongly clearing this lock lets two Word runs overlap.
+        This mirrors the pid + creation-FILETIME ownership proof AGENTS.md
+        already requires before terminating a Word process.
+        """
         self.ensure_layout()
-        try:
-            self._lock_fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError as exc:
-            raise RuntimeError("a Golden Word run is already active") from exc
+        probe = identity_probe or _process_identity
+        for attempt in range(2):
+            try:
+                self._lock_fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError as exc:
+                holder = _read_lock_record(self._lock_path)
+                if attempt == 1 or lock_holder_state(holder, identity_probe=probe) != "stale":
+                    raise RuntimeError(_lock_busy_message(holder)) from exc
+                try:
+                    self._lock_path.unlink()
+                except FileNotFoundError:
+                    pass
         os.write(self._lock_fd, json.dumps({
             "pid": os.getpid(),
+            "creation_filetime": _self_creation_filetime(),
             "created_utc": datetime.now(timezone.utc).isoformat(),
         }).encode("utf-8"))
 
