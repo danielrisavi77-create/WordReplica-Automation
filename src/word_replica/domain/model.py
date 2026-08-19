@@ -149,11 +149,32 @@ class RevisionSpan:
 
 @dataclass(slots=True)
 class PreservedPart:
+    """A package part the document model does not otherwise represent.
+
+    How it is reached decides what a renderer can do with it:
+
+    * ``relationship_type`` set -- a document-level attachment. Part plus one
+      relationship off document.xml.rels is the whole of it, so it can be
+      restored exactly.
+    * ``sidecar`` -- reached from the attachment's own .rels (a customXml
+      item's properties part). Restored as a part; its relationship comes back
+      with the .rels file itself.
+    * neither -- reached from inside the document body (charts, embedded
+      objects, diagrams). A renderer that rebuilds the body cannot restore the
+      reference, so writing the part alone would only produce an orphan. It is
+      captured so the loss can be reported rather than hidden.
+    """
+
     part_name: str
     content_type: str | None
     relationship_type: str | None
     sha256: str
     data: bytes
+    sidecar: bool = False
+    # Which .rels file carries the relationship reaching this part. Almost
+    # everything hangs off the document; the package thumbnail hangs off the
+    # package itself.
+    owner_rels: str = "word/_rels/document.xml.rels"
 
 
 @dataclass(slots=True)

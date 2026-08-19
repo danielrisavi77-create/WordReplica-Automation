@@ -18,6 +18,7 @@ from word_replica.renderers.base import RenderResult
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 CP_NS = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
 DC_NS = "http://purl.org/dc/elements/1.1/"
@@ -374,6 +375,13 @@ def _resolve_rel_target(rels_part: str, target: str) -> str:
     return "/".join(resolved)
 
 
+def _relative_to_word(part_name: str) -> str:
+    """Express a part name as a target relative to word/document.xml."""
+    if part_name.startswith("word/"):
+        return part_name[len("word/"):]
+    return "../" + part_name
+
+
 class MutableDocxPackage:
     def __init__(self, parts: dict[str, bytes]) -> None:
         self.parts = parts
@@ -390,12 +398,19 @@ class MutableDocxPackage:
     def _write_xml(self, name: str, root) -> None:
         self.parts[name] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
 
-    def set_document_body(self, body) -> None:
+    def set_document_body(self, body, *, ignorable: str | None = None) -> None:
         root = self._xml("word/document.xml")
         current = root.find(f"{W}body")
         if current is None:
             raise RuntimeError("Fresh DOCX shell has no document body")
         root.replace(current, deepcopy(body))
+        # The shell template declares its own mc:Ignorable. Left alone, every
+        # rebuilt document inherits it whether or not the source said anything.
+        key = f"{{{MC_NS}}}Ignorable"
+        if ignorable:
+            root.set(key, ignorable)
+        elif key in root.attrib:
+            del root.attrib[key]
         self._write_xml("word/document.xml", root)
 
     def _ensure_override(self, part_name: str, content_type: str) -> None:
@@ -524,6 +539,26 @@ class MutableDocxPackage:
             for node in root.findall(f"{W}trackRevisions"):
                 root.remove(node)
         self._write_xml("word/settings.xml", root)
+
+    def install_attachment(
+        self,
+        part_name: str,
+        data: bytes,
+        content_type: str | None,
+        relationship_type: str,
+        *,
+        owner_rels: str = "word/_rels/document.xml.rels",
+    ) -> None:
+        """Restore an attachment and the relationship reaching it.
+
+        Writing the bytes without the relationship would leave an OPC part
+        nothing references, which is litter rather than preserved content.
+        """
+        self.parts[part_name] = data
+        if content_type:
+            self._ensure_override(part_name, content_type)
+        target = _relative_to_word(part_name) if owner_rels.startswith("word/") else part_name
+        self._ensure_relationship(owner_rels, relationship_type, target)
 
     def install_asset(self, part_name: str, data: bytes, content_type: str | None = None) -> None:
         self.parts[part_name] = data
@@ -680,7 +715,13 @@ class PureDocxRenderer:
                 affects_status=True,
             ))
         stages = [
-            ("body", lambda: self._package.set_document_body(build_body_xml(model))),
+            (
+                "body",
+                lambda: self._package.set_document_body(
+                    build_body_xml(model),
+                    ignorable=model.extras.get("document_ignorable"),
+                ),
+            ),
             ("styles", lambda: self._package.set_styles(model.styles_xml)),
             ("numbering", lambda: self._package.set_numbering(model.numbering_xml)),
             (
@@ -728,6 +769,25 @@ class PureDocxRenderer:
                 affects_status=True,
             ))
         for part in model.preserved_parts.values():
+            if part.relationship_type:
+                # A document-level attachment: part plus one relationship is the
+                # whole of it, so it can be restored byte-for-byte.
+                self._package.install_attachment(
+                    part.part_name,
+                    part.data,
+                    part.content_type,
+                    part.relationship_type,
+                    owner_rels=part.owner_rels,
+                )
+                continue
+            if part.sidecar:
+                # Reached from the attachment's own .rels, which is itself
+                # restored here, so no new relationship is needed.
+                self._package.install_asset(part.part_name, part.data, part.content_type)
+                continue
+            # Body-referenced. Writing the bytes without the reference the
+            # rebuilt body no longer carries would only produce an orphan, so
+            # report the loss instead of pretending to have transferred it.
             self._package.warnings.append(
                 WarningItem(
                     code="UNSUPPORTED_TRANSFER_PART",

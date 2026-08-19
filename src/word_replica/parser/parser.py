@@ -394,6 +394,73 @@ def parse_section(node, ids: ElementIdFactory, path: str) -> Section:
     return Section(ids.make("section", path), properties=properties)
 
 
+_MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+# Parts reached from inside the document body. Capturing them lets a caller
+# report what was lost; restoring them without the body reference would only
+# produce an orphan.
+_BODY_REFERENCED_PREFIXES = ("word/charts/", "word/embeddings/", "word/diagrams/")
+
+# Document-level attachments, keyed by relationship type. Nothing else in the
+# model represents what these hold, so they survive verbatim or they are gone.
+#
+# This is an allow-list on purpose. "Anything with a document-level
+# relationship" would also match styles.xml, settings.xml, numbering.xml,
+# fontTable.xml and theme1.xml -- parts the renderer builds itself, which
+# restoring verbatim would silently overwrite.
+_ATTACHMENT_RELATIONSHIP_TYPES = frozenset({
+    "customXml",
+    "customXmlProps",
+    "bibliography",
+    "people",
+    "commentsExtended",
+    "commentsIds",
+    "commentsExtensible",
+    "glossaryDocument",
+    "font",
+    # The renderer writes styles, numbering and settings itself, but never
+    # these. Left out, every rebuild silently ships the shell template's
+    # theme, font table and web settings instead of the source's.
+    "stylesWithEffects",
+    "webSettings",
+    "fontTable",
+    "theme",
+})
+
+
+def _sidecars(package: DocxPackage, part_name: str) -> list[tuple[str, str]]:
+    """(target, rels-part) for every internal relationship an attachment owns."""
+    parent, _, name = part_name.rpartition("/")
+    rels_part = f"{parent}/_rels/{name}.rels" if parent else f"_rels/{name}.rels"
+    if rels_part not in package.parts:
+        return []
+    found: list[tuple[str, str]] = []
+    for rel in package.relationships(part_name).values():
+        if rel.target_mode == "External":
+            continue
+        target = rel.target.lstrip("/") if rel.target.startswith("/") else f"{parent}/{rel.target}"
+        found.append((target, rels_part))
+    return found
+
+
+def _resolve_document_target(target: str) -> str:
+    """Resolve a word/document.xml.rels target to a package part name."""
+    from pathlib import PurePosixPath
+
+    if target.startswith("/"):
+        candidate = target.lstrip("/")
+    else:
+        candidate = str(PurePosixPath("word", target))
+    resolved: list[str] = []
+    for piece in PurePosixPath(candidate).parts:
+        if piece == "..":
+            if resolved:
+                resolved.pop()
+        elif piece not in (".", ""):
+            resolved.append(piece)
+    return "/".join(resolved)
+
+
 def parse_blocks(parent, ids: ElementIdFactory, source_path: str, package: DocxPackage) -> list[object]:
     blocks: list[object] = []
     for index, child in enumerate(parent):
@@ -642,17 +709,60 @@ class DocxParser:
                 settings_root = package.read_xml("word/settings.xml")
                 tracked_changes = settings_root.find("w:trackRevisions", namespaces=NS) is not None
 
+            def _preserve(
+                part: str,
+                relationship_type: str | None,
+                *,
+                sidecar: bool = False,
+                owner_rels: str = "word/_rels/document.xml.rels",
+            ) -> None:
+                if part in model.preserved_parts or part not in package.parts:
+                    return
+                data = package.read_bytes(part)
+                model.preserved_parts[part] = PreservedPart(
+                    part,
+                    content_type_for(package, part),
+                    relationship_type,
+                    sha256_file_bytes(data),
+                    data,
+                    sidecar,
+                    owner_rels,
+                )
+
             for part in sorted(package.parts):
-                if part.startswith(("word/charts/", "word/embeddings/", "word/diagrams/")) and not part.endswith(".rels"):
-                    data = package.read_bytes(part)
-                    digest = sha256_file_bytes(data)
-                    model.preserved_parts[part] = PreservedPart(
-                        part,
-                        content_type_for(package, part),
-                        None,
-                        digest,
-                        data,
-                    )
+                # Body-referenced parts are reached from inside document.xml, so
+                # a renderer that rebuilds the body cannot restore them without
+                # the reference. Captured anyway, so the loss can be reported.
+                if part.startswith(_BODY_REFERENCED_PREFIXES) and not part.endswith(".rels"):
+                    _preserve(part, None)
+
+            for rel in package.relationships("word/document.xml").values():
+                if rel.target_mode == "External":
+                    continue
+                if rel.rel_type.rsplit("/", 1)[-1] not in _ATTACHMENT_RELATIONSHIP_TYPES:
+                    continue
+                anchor = _resolve_document_target(rel.target)
+                _preserve(anchor, rel.rel_type)
+                # An attachment can own a sidecar: a customXml item points at
+                # its properties part through its own .rels. Restoring the item
+                # without them would leave that reference dangling.
+                for sidecar, sidecar_rels in _sidecars(package, anchor):
+                    _preserve(sidecar, None, sidecar=True)
+                    _preserve(sidecar_rels, None, sidecar=True)
+
+            # The package thumbnail hangs off _rels/.rels rather than the
+            # document, so it needs its own pass. It is the file preview
+            # Explorer shows -- shipping the shell template's is user-visible.
+            for rel in package.relationships("").values():
+                if rel.target_mode == "External":
+                    continue
+                if rel.rel_type.rsplit("/", 1)[-1] != "thumbnail":
+                    continue
+                _preserve(
+                    rel.target.lstrip("/"),
+                    rel.rel_type,
+                    owner_rels="_rels/.rels",
+                )
 
             model.extras["comments"] = model.comments
             model.extras["revisions"] = model.revisions
@@ -660,6 +770,12 @@ class DocxParser:
             model.extras["fields"] = model.fields
             model.extras["preserved_parts"] = model.preserved_parts
             model.extras["tracked_changes_enabled"] = tracked_changes
+            # mc:Ignorable on the document root declares which namespace
+            # prefixes a reader may skip. The pure-docx shell template carries
+            # its own, so without recording the source's, every rebuild
+            # silently adopts the template's declaration -- a difference no
+            # model gate can see.
+            model.extras["document_ignorable"] = root.get(f"{{{_MC_NS}}}Ignorable")
 
             section_index = 0
             block_index = 0
