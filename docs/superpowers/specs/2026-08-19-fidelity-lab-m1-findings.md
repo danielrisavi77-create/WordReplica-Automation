@@ -145,9 +145,74 @@ python -m scripts.fidelity_lab.scan_cli --root C:\WordReplica-Automation\lab\doc
 Corpus bytes and the database live under `C:\WordReplica-Automation\lab\`,
 outside git, per `AGENTS.md` § "Data and storage".
 
-## What Milestone 1 did not do
+## G10 — built, and what it found
 
-No Word lane, no G10 gate wired in, no minimizer, no generators, no tier
-scheduler, and no docx-corpus ingest. The next step is G10 — and unlike when
-this work started, there is now a measured 32.9 % of a real corpus saying why
-it is needed.
+`src/word_replica/qa/preservation.py`, 21 tests. It compares raw package bytes:
+which namespaces appear anywhere, how many parts of each content type exist,
+the relationship graph by type, whether anything dangles, and the bytes of
+every opaque part (OLE payloads, custom XML, embeddings, diagrams, embedded
+fonts) — content with no model projection at all, where byte identity is the
+only available assertion.
+
+It normalizes away what is not a defect: `w:rsid*`, `w15:paraId`, core-property
+timestamps and `cp:revision`, ZIP member order, concrete part names, and
+WordReplica's own provenance properties. Half the test file asserts the gate
+does *not* fire. That is deliberate — a gate that fails on every document for
+an intended reason gets switched off, and then the blind spot reopens.
+
+### Lane P: the false-pass rate, measured
+
+`scripts/fidelity_lab/lane_p_cli.py` reconstructs corpus documents through the
+pure-docx path and reports G0–G7 against G10. Over 60 documents sampled across
+the complexity range:
+
+| | Documents |
+|---|---|
+| G0–G7 fail (already visible today) | 41 |
+| **G0–G7 pass but G10 fails** | **18** |
+| G0–G7 pass and G10 passes | 1 |
+
+**Exactly one of sixty real documents round-trips cleanly.** Eighteen are
+reported as perfect reconstructions by every gate the project had before today,
+and are not.
+
+### The two defect classes behind that number
+
+**Content the reconstruction gains.** `PureDocxRenderer.render` starts from
+python-docx's default template and mutates it, so every output inherited the
+template's `customXml/item1.xml`, `customXml/itemProps1.xml`,
+`docProps/thumbnail.jpeg` and `word/stylesWithEffects.xml`. A foreign customXml
+store is real content — in Word documents it carries structured business data
+and content-control bindings. Fixed via `MutableDocxPackage.drop_part`, which
+removes a part together with its content-type override and every relationship
+resolving to it (removing bytes alone would leave references Word repairs on
+open — a worse defect than the one being fixed).
+
+Still outstanding in this class: the template's `mc:Ignorable="w14 wp14"` on the
+document root, present in 6 of the 18.
+
+**Content the reconstruction loses.** Measured over the failing documents, by
+namespace present in the source and absent from the output:
+
+| Lost | Documents |
+|---|---|
+| VML (`urn:schemas-microsoft-com:vml`) | 5 |
+| bibliography sources | 4 |
+| the source's own custom XML | 4 |
+| legacy `office:word` markup | 2 |
+| wordprocessingShape / wordprocessingDrawing | 1 each |
+
+These are user content, silently discarded, and invisible to every G0–G9 gate.
+Each needs its own root-cause fix; G10 now reports them rather than hiding them.
+
+## What is still not done
+
+No Word lane (G8/G9 over the corpus), no minimizer, no generators, no tier
+scheduler, and no docx-corpus ingest. Three occurrences of the non-element-node
+crash remain in `parser/tables.py`, deferred while that file carried
+uncommitted work from the autonomous harness.
+
+Golden #1 remains on ten gates. `G10_GATE_NAMES` exists for callers that opt in
+to eleven via `build_golden_report(gate_names=...)`; turning it on for the
+Golden pipeline should wait until the loss classes above are closed, or the
+gate will report a red the pipeline cannot yet act on.
