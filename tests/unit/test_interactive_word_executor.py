@@ -563,6 +563,34 @@ def _native_batch_payload():
     }
 
 
+def test_set_column_width_below_word_com_minimum_is_clamped_and_recorded_for_fixup():
+    from word_replica.renderers.interactive_word import _WORD_MIN_COM_COLUMN_WIDTH_POINTS
+
+    log = []
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = FakeDocument(log)
+    controller.execute_event(ReconstructionEvent("BeginTable", "t", {"rows": 1, "columns": 2}))
+    controller.execute_event(
+        ReconstructionEvent("SetColumnWidth", "t", {"column": 1, "width_twips": 96})
+    )
+
+    assert ("column1.Width", _WORD_MIN_COM_COLUMN_WIDTH_POINTS) in log
+    assert controller._narrow_column_fixups == [(0, 1, 96)]
+
+
+def test_set_column_width_above_word_com_minimum_is_untouched():
+    log = []
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = FakeDocument(log)
+    controller.execute_event(ReconstructionEvent("BeginTable", "t", {"rows": 1, "columns": 2}))
+    controller.execute_event(
+        ReconstructionEvent("SetColumnWidth", "t", {"column": 1, "width_twips": 1440})
+    )
+
+    assert ("column1.Width", 72.0) in log
+    assert controller._narrow_column_fixups == []
+
+
 def test_native_table_batch_inserts_once_and_converts_without_tables_add():
     log = []
     root = NativeBatchRootRange(start=7)

@@ -25,6 +25,13 @@ WD_FORMAT_DOCX = 16
 
 RPC_E_CALL_REJECTED = -2147418111
 
+# Empirically the lowest width Word's COM layer (Columns(i).Width, Cell.Width,
+# and Cell/Columns.SetWidth all tried) accepts without raising "Value out of
+# range" - confirmed 10pt fails and 12pt succeeds regardless of cell padding.
+# A source document can still legitimately declare a narrower column (the
+# OOXML format has no such floor); see _event_SetColumnWidth.
+_WORD_MIN_COM_COLUMN_WIDTH_POINTS = 12.0
+
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _VALID_BOOKMARK_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,39}$")
 _BOOKMARK_NAME_MAX_LENGTH = 40
@@ -114,6 +121,62 @@ def _restore_bookmark_names(docx_path: str | Path, rewrites: dict[str, str]) -> 
         temp.unlink(missing_ok=True)
 
 
+def _restore_narrow_column_widths(
+    docx_path: str | Path, fixups: list[tuple[int, int, int]]
+) -> None:
+    """Correct table columns that were set to a COM-safe placeholder width
+    (see `_WORD_MIN_COM_COLUMN_WIDTH_POINTS`) back to their true, narrower
+    source width directly in the saved OOXML's `w:tblGrid`/`w:tcW`, where
+    there is no such minimum. `fixups` entries are
+    `(table_sequence, column, width_twips)`, where `table_sequence` is the
+    0-based order tables were inserted in - matched against `w:tbl` elements
+    in `word/document.xml` in document order, so this only covers tables in
+    the main body, not headers/footers/footnotes.
+    """
+    if not fixups:
+        return
+    docx_path = Path(docx_path)
+    with ZipFile(docx_path, "r") as archive:
+        infos = archive.infolist()
+        members = {info.filename: archive.read(info.filename) for info in infos}
+    filename = "word/document.xml"
+    if filename not in members:
+        return
+    root = etree.fromstring(members[filename])
+    tables = list(root.iter(f"{{{_W_NS}}}tbl"))
+    changed = False
+    for sequence, column, width_twips in fixups:
+        if sequence >= len(tables):
+            continue
+        table_element = tables[sequence]
+        grid = table_element.find(f"{{{_W_NS}}}tblGrid")
+        if grid is not None:
+            grid_columns = grid.findall(f"{{{_W_NS}}}gridCol")
+            if column - 1 < len(grid_columns):
+                grid_columns[column - 1].set(f"{{{_W_NS}}}w", str(width_twips))
+                changed = True
+        for row in table_element.findall(f"{{{_W_NS}}}tr"):
+            row_cells = row.findall(f"{{{_W_NS}}}tc")
+            if column - 1 >= len(row_cells):
+                continue
+            cell_properties = row_cells[column - 1].find(f"{{{_W_NS}}}tcPr")
+            cell_width = cell_properties.find(f"{{{_W_NS}}}tcW") if cell_properties is not None else None
+            if cell_width is not None:
+                cell_width.set(f"{{{_W_NS}}}w", str(width_twips))
+                changed = True
+    if not changed:
+        return
+    members[filename] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
+    temp = docx_path.with_suffix(docx_path.suffix + ".tmp")
+    try:
+        with ZipFile(temp, "w", ZIP_DEFLATED) as archive:
+            for info in infos:
+                archive.writestr(info, members[info.filename])
+        _replace_with_retry(temp, docx_path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def _is_rejected_com_call(exc: Exception) -> bool:
     hresult = getattr(exc, "hresult", None)
     if hresult is None and getattr(exc, "args", None):
@@ -161,6 +224,8 @@ class InteractiveWordController:
         self._page_break_continuation_pending = False
         self._post_table_paragraph_active = False
         self._table_stack: list[dict[str, Any]] = []
+        self._table_insertion_sequence = 0
+        self._narrow_column_fixups: list[tuple[int, int, int]] = []
         self._asset_resolver = None
         self._active_image: Any | None = None
         self._active_image_representation: str | None = None
@@ -1150,7 +1215,9 @@ class InteractiveWordController:
         after_range = self._duplicate_range(table.Range)
         with suppress(Exception):
             after_range.Collapse(WD_COLLAPSE_END)
-        self._table_stack.append({"table": table, "cells": cells, "parent_range": parent_range, "after_range": after_range, "element_id": event.source_element_id, "structure_complete": False})
+        sequence = self._table_insertion_sequence
+        self._table_insertion_sequence += 1
+        self._table_stack.append({"table": table, "cells": cells, "parent_range": parent_range, "after_range": after_range, "element_id": event.source_element_id, "structure_complete": False, "sequence": sequence})
         self._paragraph_started = False
 
     def _event_InsertTableBatch(self, event: ReconstructionEvent) -> None:
@@ -1266,6 +1333,8 @@ class InteractiveWordController:
         collapse = _retry_getattr(after_range, "Collapse", None)
         if callable(collapse):
             _retry_rejected_com_call(lambda: collapse(WD_COLLAPSE_END))
+        sequence = self._table_insertion_sequence
+        self._table_insertion_sequence += 1
         context = {
             "table": table,
             "cells": word_cells,
@@ -1273,6 +1342,7 @@ class InteractiveWordController:
             "after_range": after_range,
             "element_id": event.source_element_id,
             "structure_complete": True,
+            "sequence": sequence,
         }
         self._table_stack.append(context)
         self._active_table_element_id = event.source_element_id
@@ -1452,8 +1522,23 @@ class InteractiveWordController:
         self._apply_borders(table, props.get("borders"))
 
     def _event_SetColumnWidth(self, event: ReconstructionEvent) -> None:
-        table = self._current_table()["table"]
-        table.Columns(int(event.payload["column"])).Width = self._twips_to_points(event.payload["width_twips"])
+        ctx = self._current_table()
+        table = ctx["table"]
+        column = int(event.payload["column"])
+        width_twips = int(event.payload["width_twips"])
+        width_points = self._twips_to_points(width_twips)
+        if width_points < _WORD_MIN_COM_COLUMN_WIDTH_POINTS:
+            # Word's Columns(i).Width setter (and Cell.Width/SetWidth - all
+            # tried) reject anything below ~11pt with "Value out of range",
+            # even with zero cell padding - a hard floor in the COM layer,
+            # not a margins issue. The OOXML format itself has no such floor,
+            # so set a COM-safe width now and correct the true value directly
+            # in the saved file's tblGrid/tcW after close() (see
+            # _restore_narrow_column_widths), the same pattern used for
+            # bookmark names.
+            self._narrow_column_fixups.append((int(ctx["sequence"]), column, width_twips))
+            width_points = _WORD_MIN_COM_COLUMN_WIDTH_POINTS
+        table.Columns(column).Width = width_points
 
     def _event_SetRowProperties(self, event: ReconstructionEvent) -> None:
         table = self._current_table()["table"]; row = table.Rows(int(event.payload["row"])); props = event.payload.get("properties", {})
@@ -1570,6 +1655,15 @@ class InteractiveWordController:
             return
         _restore_bookmark_names(self._last_saved_path, self._bookmark_name_rewrites)
 
+    def restore_pending_narrow_column_widths(self) -> None:
+        """Correct table columns that were widened to a COM-safe placeholder
+        (see `_WORD_MIN_COM_COLUMN_WIDTH_POINTS`) back to their true source
+        width in the last-saved file. Must run after close() for the same
+        reason as `restore_pending_bookmark_names`."""
+        if self._last_saved_path is None or not self._narrow_column_fixups:
+            return
+        _restore_narrow_column_widths(self._last_saved_path, self._narrow_column_fixups)
+
     def set_custom_property(self, name: str, value: Any) -> None:
         if self.document is None:
             raise RuntimeError("interactive Word document is not open")
@@ -1618,6 +1712,8 @@ class InteractiveWordController:
             # saved file (see restore_pending_bookmark_names / save()).
             with suppress(Exception):
                 self.restore_pending_bookmark_names()
+            with suppress(Exception):
+                self.restore_pending_narrow_column_widths()
         application_quit = self.application is None
         if self.application is not None:
             try:
