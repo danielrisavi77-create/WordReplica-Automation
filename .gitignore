@@ -25,3 +25,8 @@ golden_report.json
 build/
 dist/
 *.spec
+
+# Fidelity lab DATA root (heavy artifacts stay outside git, per AGENTS.md).
+# Anchored: an unanchored "lab/" also matches src/word_replica/lab, which is
+# source and must be committed.
+/lab/

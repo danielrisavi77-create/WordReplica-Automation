@@ -90,6 +90,8 @@ NAMESPACE_BITS: tuple[str, ...] = (
     "xdr",         # 35 spreadsheet drawing (embedded workbooks)
     "wpc",         # 36 wordprocessingCanvas
     "cdr",         # 37 chart drawing
+    "bib",         # 38 bibliography (standard; was being counted as unknown)
+    "cxml",        # 39 customXml part schema (standard; likewise)
 )
 
 _NAMESPACE_URIS: dict[str, str] = {
@@ -131,6 +133,8 @@ _NAMESPACE_URIS: dict[str, str] = {
     "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
     "wpc": "http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas",
     "cdr": "http://schemas.openxmlformats.org/drawingml/2006/chartDrawing",
+    "bib": "http://schemas.openxmlformats.org/officeDocument/2006/bibliography",
+    "cxml": "http://schemas.openxmlformats.org/officeDocument/2006/customXml",
 }
 _URI_TO_BIT: dict[str, int] = {
     _NAMESPACE_URIS[prefix]: index for index, prefix in enumerate(NAMESPACE_BITS)
@@ -377,6 +381,19 @@ def _measure(
     ct_root = roots.get("[Content_Types].xml")
     missing_content_types = len(content_type_gaps(parts, ct_root)) if ct_root is not None else 0
 
+    # w:cols appears in every sectPr, so the element alone says nothing; only a
+    # w:num above one is actually a multi-column section.
+    multicolumn_sections = 0
+    for name, root in roots.items():
+        if not name.lower().endswith(".xml"):
+            continue
+        for node in root.iter(_w("cols")):
+            try:
+                if int(node.get(_w("num")) or "1") > 1:
+                    multicolumn_sections += 1
+            except ValueError:
+                continue
+
     instructions = " ".join(scan.field_instructions).upper()
     pagination_fields = sum(instructions.count(token) for token in _PAGINATION_FIELDS)
 
@@ -435,7 +452,7 @@ def _measure(
         cell_count=counts[_w("tc")],
         merged_cell_count=counts[_w("gridSpan")] + counts[_w("vMerge")],
         section_count=counts[_w("sectPr")],
-        multicolumn_section_count=counts[_w("cols")],
+        multicolumn_section_count=multicolumn_sections,
         drawing_inline_count=counts[_ns("wp", "inline")],
         drawing_anchor_count=counts[_ns("wp", "anchor")],
         behind_text_count=counts[_ns("wp", "wrapNone")],
@@ -466,8 +483,8 @@ def _measure(
         page_break_before_count=counts[_w("pageBreakBefore")],
         frame_pr_count=counts[_w("framePr")],
         tbl_layout_auto_count=counts[_w("tblLayout")],
-        tab_leader_count=counts[_w("tab")],
-        complex_script_run_count=counts[_w("rFonts")],
+        tab_leader_count=counts[_w("tabs")],
+        complex_script_run_count=counts[_w("cs")] + counts[_w("szCs")],
         rtl_run_count=counts[_w("rtl")] + counts[_w("bidi")],
         embedded_font_count=embedded_fonts,
         custom_xml_part_count=custom_xml_parts,
