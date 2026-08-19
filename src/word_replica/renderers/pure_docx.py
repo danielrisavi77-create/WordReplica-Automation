@@ -97,7 +97,8 @@ def _run_element(run: Run):
             _set_w(lang, "bidi", props.get("language_bidi"))
     content_tokens = props.get("content_tokens") or ()
     has_field_tokens = any(token.get("kind") in _FIELD_TOKEN_KINDS for token in content_tokens)
-    if not run.text and not has_field_tokens:
+    preserved = [token for token in content_tokens if token.get("kind") == "preserved_xml"]
+    if not run.text and not has_field_tokens and not preserved:
         return node
     buffer = ""
 
@@ -126,7 +127,24 @@ def _run_element(run: Run):
     flush()
     if has_field_tokens:
         _append_field_tokens(node, content_tokens)
+    _append_preserved_inline(node, preserved)
     return node
+
+
+def _append_preserved_inline(node, preserved) -> None:
+    """Re-emit inline fragments the model cannot represent.
+
+    Only fragments the parser judged safe to carry reach here: anything holding
+    a relationship id was refused at capture, because a renumbered id would
+    point at the wrong part or none at all.
+    """
+    for token in preserved:
+        try:
+            node.append(etree.fromstring(token["value"]))
+        except (etree.XMLSyntaxError, KeyError, TypeError):
+            # A fragment that will not re-parse is dropped rather than allowed
+            # to corrupt the package; G10 reports the resulting loss.
+            continue
 
 
 _FIELD_CHAR_TYPES = {"field_begin": "begin", "field_separate": "separate", "field_end": "end"}

@@ -194,6 +194,54 @@ def _compact(values: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in values.items() if value is not None}
 
 
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_UNREPRESENTABLE_INLINE = {"AlternateContent", "pict", "object"}
+
+
+def _is_unrepresentable_inline(child, local: str) -> bool:
+    """Inline content with no representation in the document model.
+
+    A ``w:drawing`` holding a picture is modelled as a DrawingRef, so it is
+    excluded here -- preserving it raw as well would emit it twice. A drawing
+    with no picture in it (a group shape, a text box, a diagram) is not modelled
+    at all, and nor is VML or an embedded object.
+    """
+    if local in _UNREPRESENTABLE_INLINE:
+        return True
+    if local != "drawing":
+        return False
+    return not child.xpath(".//*[local-name()='blip']")
+
+
+def _capture_inline(child) -> dict[str, str]:
+    """Serialize an inline fragment, or record why it cannot be carried.
+
+    Relationship ids are renumbered freely by any writer, so a fragment that
+    references one cannot be re-emitted verbatim: the id would point somewhere
+    else, or nowhere, and Word repairs such a document on open. Refusing is the
+    safer failure -- a missing shape is visible, a corrupted package is not.
+
+    Measured on the corpus before relying on it: every mc:AlternateContent block
+    sampled carried no relationship reference at all.
+    """
+    from lxml import etree
+
+    for element in child.iter():
+        if not isinstance(element.tag, str):
+            continue
+        if any(name.startswith(f"{{{_R_NS}}}") for name in element.attrib):
+            return {
+                "kind": "unsupported_inline",
+                "reason": "fragment carries a relationship reference and cannot be re-emitted safely",
+                "tag": local_name(child),
+            }
+    return {
+        "kind": "preserved_xml",
+        "value": etree.tostring(child, encoding="unicode"),
+        "tag": local_name(child),
+    }
+
+
 def parse_run(node, ids: ElementIdFactory, path: str) -> Run:
     r_pr = node.find("w:rPr", namespaces=NS)
     r_fonts = r_pr.find("w:rFonts", namespaces=NS) if r_pr is not None else None
@@ -265,6 +313,8 @@ def parse_run(node, ids: ElementIdFactory, path: str) -> Run:
                 content_tokens.append({"kind": f"field_{field_type}"})
         elif local == "instrText":
             content_tokens.append({"kind": "field_instruction", "value": child.text or ""})
+        elif _is_unrepresentable_inline(child, local):
+            content_tokens.append(_capture_inline(child))
     if break_types:
         properties["break_types"] = break_types
     if content_tokens:
