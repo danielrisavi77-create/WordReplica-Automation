@@ -313,3 +313,72 @@ def test_the_projection_records_what_it_compared(tmp_path, source):
     # opaque parts are compared by content hash, never by name
     digests = [d for group in projection["opaque_parts"].values() for d in group]
     assert sha256(b"\xd0\xcf\x11\xe0 ole payload").hexdigest() in digests
+
+
+# --- WordReplica's own provenance marking ------------------------------------
+
+_CUSTOM_PROPS_CT = (
+    '<Override PartName="/docProps/custom.xml" ContentType="application/vnd.openxmlformats-'
+    'officedocument.custom-properties+xml"/>'
+)
+
+
+def _with_custom_properties(parts: dict[str, bytes], *names: str) -> dict[str, bytes]:
+    body = "".join(
+        '<property fmtid="{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}" pid="{pid}" name="{name}">'
+        "<vt:lpwstr>value</vt:lpwstr></property>".format(pid=index + 2, name=name)
+        for index, name in enumerate(names)
+    )
+    parts = dict(parts)
+    parts["docProps/custom.xml"] = (
+        '<?xml version="1.0"?><Properties '
+        'xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" '
+        'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+        f"{body}</Properties>"
+    ).encode("utf-8")
+    parts["[Content_Types].xml"] = parts["[Content_Types].xml"].replace(
+        b"</Types>", _CUSTOM_PROPS_CT.encode("utf-8") + b"</Types>"
+    )
+    return parts
+
+
+def test_word_replica_provenance_properties_do_not_fail_the_gate(tmp_path, source):
+    # Every reconstruction stamps WordReplicaProjectId / Reconstructed /
+    # ActualSaveCount. That is designed behaviour, and a gate that failed on it
+    # would fail on 100% of documents and be switched off within a week.
+    output = _write(
+        tmp_path / "output.docx",
+        _with_custom_properties(
+            _package(),
+            "WordReplicaProjectId",
+            "WordReplicaReconstructed",
+            "WordReplicaActualSaveCount",
+        ),
+    )
+
+    assert build_preservation_gate(source, output).passed is True
+
+
+def test_a_user_custom_property_that_disappeared_still_fails_the_gate(tmp_path):
+    # The provenance carve-out is by property name, so it cannot mask a real
+    # custom-property loss.
+    src = _write(tmp_path / "source.docx", _with_custom_properties(_package(), "ContractNumber"))
+    output = _write(tmp_path / "output.docx", _package())
+
+    assert build_preservation_gate(src, output).passed is False
+
+
+def test_a_user_custom_property_the_output_invented_fails_the_gate(tmp_path, source):
+    output = _write(tmp_path / "output.docx", _with_custom_properties(_package(), "InventedByUs"))
+
+    assert build_preservation_gate(source, output).passed is False
+
+
+def test_provenance_alongside_a_real_property_is_still_compared(tmp_path):
+    src = _write(tmp_path / "source.docx", _with_custom_properties(_package(), "ContractNumber"))
+    output = _write(
+        tmp_path / "output.docx",
+        _with_custom_properties(_package(), "ContractNumber", "WordReplicaReconstructed"),
+    )
+
+    assert build_preservation_gate(src, output).passed is True

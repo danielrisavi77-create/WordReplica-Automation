@@ -158,7 +158,11 @@ def _markup_compatibility(roots: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _relationship_graph(parts: dict[str, bytes], roots: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+def _relationship_graph(
+    parts: dict[str, bytes],
+    roots: dict[str, Any],
+    ignored: frozenset[str] = frozenset(),
+) -> tuple[dict[str, Any], list[str]]:
     graph: dict[str, dict[str, int]] = {}
     dangling: list[str] = []
     for name, root in roots.items():
@@ -172,11 +176,15 @@ def _relationship_graph(parts: dict[str, bytes], roots: dict[str, Any]) -> tuple
                 entry["external"] += 1
                 continue
             resolved = resolve_relationship_target(name, node.get("Target") or "")
+            if resolved in ignored:
+                entry["count"] -= 1
+                continue
             if resolved and resolved not in parts:
                 # Recorded by type and owner, never by rId: relationship ids are
                 # renumbered freely by any writer and are not a fidelity signal.
                 dangling.append(f"{name}->{rel_type}")
-    return graph, sorted(dangling)
+    # A type whose only relationships were to ignored parts is not present.
+    return {name: entry for name, entry in graph.items() if entry["count"] > 0}, sorted(dangling)
 
 
 def _settings(roots: dict[str, Any]) -> dict[str, Any]:
@@ -202,6 +210,34 @@ def _settings(roots: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_PROVENANCE_PROPERTY_PREFIX = "WordReplica"
+_CUSTOM_PROPS_PART = "docProps/custom.xml"
+_CUSTOM_PROPS_NS = "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"
+
+
+def _is_provenance_only(root: Any) -> bool:
+    """True when docProps/custom.xml holds nothing but our own marking.
+
+    Every reconstruction stamps WordReplicaProjectId, WordReplicaReconstructed
+    and WordReplicaActualSaveCount. That is designed, documented behaviour, and
+    a gate that failed on it would fail on 100 % of documents -- which is how a
+    gate gets switched off and the blind spot it covers reopens.
+
+    The carve-out is by property *name*, so a real custom property that the
+    reconstruction dropped or invented is still compared. A custom.xml holding
+    even one non-provenance property is kept whole.
+    """
+    properties = [
+        node for node in root.iter(f"{{{_CUSTOM_PROPS_NS}}}property")
+    ]
+    if not properties:
+        return True
+    return all(
+        (node.get("name") or "").startswith(_PROVENANCE_PROPERTY_PREFIX)
+        for node in properties
+    )
+
+
 def g10_projection(path: Path, *, limits: PackageLimits = DEFAULT_LIMITS) -> dict[str, Any]:
     """Everything about a package that survives normalization. Never raises."""
     scan = read_package(Path(path), limits=limits)
@@ -210,9 +246,16 @@ def g10_projection(path: Path, *, limits: PackageLimits = DEFAULT_LIMITS) -> dic
 
     content_types = _content_type_map(scan.parts, scan.roots)
 
+    ignored: set[str] = set()
+    custom_props = scan.roots.get(_CUSTOM_PROPS_PART)
+    if custom_props is not None and _is_provenance_only(custom_props):
+        ignored.add(_CUSTOM_PROPS_PART)
+    parts = {name: data for name, data in scan.parts.items() if name not in ignored}
+    roots = {name: root for name, root in scan.roots.items() if name not in ignored}
+
     part_kinds: dict[str, int] = {}
     opaque: dict[str, list[str]] = {}
-    for name, data in scan.parts.items():
+    for name, data in parts.items():
         if name.endswith("/"):
             continue
         content_type = content_types.get(name, "")
@@ -224,17 +267,16 @@ def g10_projection(path: Path, *, limits: PackageLimits = DEFAULT_LIMITS) -> dic
         if _is_opaque(name, content_type):
             opaque.setdefault(key, []).append(sha256(data).hexdigest())
 
-    graph, dangling = _relationship_graph(scan.parts, scan.roots)
+    graph, dangling = _relationship_graph(parts, roots, frozenset(ignored))
 
     return {
-        "namespaces": _namespaces(scan.roots),
-        "unknown_namespaces": list(scan.unknown_namespaces),
-        "markup_compatibility": _markup_compatibility(scan.roots),
+        "namespaces": _namespaces(roots),
+        "markup_compatibility": _markup_compatibility(roots),
         "part_kinds": dict(sorted(part_kinds.items())),
         "opaque_parts": {key: sorted(values) for key, values in sorted(opaque.items())},
         "relationship_graph": dict(sorted(graph.items())),
         "dangling_relationships": dangling,
-        "settings": _settings(scan.roots),
+        "settings": _settings(roots),
         "malformed_parts": sorted(scan.malformed),
         "entity_parts": sorted(scan.entity_parts),
     }
