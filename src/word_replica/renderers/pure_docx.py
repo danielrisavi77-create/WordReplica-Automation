@@ -514,11 +514,21 @@ class MutableDocxPackage:
         self._write_xml("word/document.xml", root)
 
     def set_styles(self, raw: bytes | None) -> None:
-        if raw is not None:
-            self.parts["word/styles.xml"] = raw
+        if raw is None:
+            # The source has no styles part. Returning early here left the
+            # shell template's in place, so the rebuild silently acquired
+            # styles the source never defined.
+            self.drop_part("word/styles.xml")
+            return
+        self.parts["word/styles.xml"] = raw
 
     def set_numbering(self, raw: bytes | None) -> None:
         if raw is None:
+            # Measured on the corpus: documents with no numbering.xml were
+            # handed the template's, complete with its own mc:Ignorable
+            # declaration -- which is how a "markup compatibility" divergence
+            # showed up on documents that use no numbering at all.
+            self.drop_part("word/numbering.xml")
             return
         self.parts["word/numbering.xml"] = raw
         self._ensure_override(
@@ -533,6 +543,7 @@ class MutableDocxPackage:
 
     def set_settings(self, raw: bytes | None, tracked_changes_enabled: bool) -> None:
         if raw is None:
+            self.drop_part("word/settings.xml")
             return
         root = etree.fromstring(raw)
         if not tracked_changes_enabled:

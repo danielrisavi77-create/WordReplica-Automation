@@ -136,3 +136,50 @@ def test_a_source_that_has_these_parts_keeps_them(tmp_path, corpus_dir):
     assert "customXml/itemProps1.xml" in names
     assert "docProps/thumbnail.jpeg" in names
     assert "word/stylesWithEffects.xml" in names
+
+
+# --- optional parts the source simply does not have ---------------------------
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        "word/numbering.xml",
+        "word/styles.xml",
+        "word/settings.xml",
+    ],
+)
+def test_an_optional_part_the_source_lacks_is_not_taken_from_the_template(
+    tmp_path, bare_source, part
+):
+    # set_numbering/set_styles/set_settings return early when the model has
+    # nothing to write, which left the shell template's copy in place. For
+    # numbering that was measurable on the corpus: documents with no
+    # numbering.xml were handed the template's, complete with its own
+    # mc:Ignorable declaration.
+    names = _rebuild(tmp_path, bare_source, suffix=part.replace("/", "_"))
+
+    assert part not in names
+
+
+def test_dropping_an_optional_part_also_drops_what_referenced_it(tmp_path, bare_source):
+    from word_replica.qa.preservation import g10_projection
+
+    result = RebuildService(app_root=tmp_path / "app-optional").rebuild(
+        bare_source,
+        RebuildOptions(
+            renderer=RendererChoice.DOCX,
+            fidelity=FidelityMode.FULL,
+            metadata=MetadataMode.PRESERVE,
+            reconstruction_mode=ReconstructionMode.INSTANT,
+        ),
+    )
+    projection = g10_projection(result.output_path)
+
+    assert projection["dangling_relationships"] == []
+    assert "numbering" not in projection["relationship_graph"]
+
+
+def test_a_source_that_has_numbering_keeps_it(tmp_path, corpus_dir):
+    names = _rebuild(tmp_path, corpus_dir / "03_lists.docx", suffix="-lists")
+
+    assert "word/numbering.xml" in names
