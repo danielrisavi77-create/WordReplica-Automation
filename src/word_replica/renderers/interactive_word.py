@@ -1614,6 +1614,10 @@ class InteractiveWordController:
             with suppress(Exception):
                 _retry_rejected_com_call(lambda: self.document.Close(False))
             self.document = None
+            # Only reachable once Word has actually released its lock on the
+            # saved file (see restore_pending_bookmark_names / save()).
+            with suppress(Exception):
+                self.restore_pending_bookmark_names()
         application_quit = self.application is None
         if self.application is not None:
             try:
