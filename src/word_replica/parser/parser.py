@@ -2,6 +2,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from word_replica.parser.nodes import local_name
 from word_replica.domain.errors import PackageReadError
 from word_replica.domain.model import (
     Bookmark,
@@ -232,7 +233,7 @@ def parse_run(node, ids: ElementIdFactory, path: str) -> Run:
     break_types: list[str] = []
     content_tokens: list[dict[str, str]] = []
     for child in node:
-        local = child.tag.rsplit("}", 1)[-1]
+        local = local_name(child)
         if local in {"t", "delText"}:
             content_tokens.append({"kind": "text", "value": child.text or ""})
         elif local == "tab":
@@ -294,7 +295,7 @@ def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage
     borders = {}
     if borders_node is not None:
         for border in borders_node:
-            local = border.tag.rsplit("}", 1)[-1]
+            local = local_name(border)
             borders[local] = _compact({"val": _attr(border, "val"), "sz": _attr(border, "sz"), "space": _attr(border, "space"), "color": _attr(border, "color")})
     shading = p_pr.find("w:shd", namespaces=NS) if p_pr is not None else None
     properties = _compact(
@@ -323,7 +324,7 @@ def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage
     inline_markers: list[dict[str, Any]] = []
     r_index = 0
     for child_index, child in enumerate(node):
-        local = child.tag.rsplit("}", 1)[-1]
+        local = local_name(child)
         if local == "bookmarkStart":
             name = _attr(child, "name")
             if name and name != "_GoBack":
@@ -396,7 +397,7 @@ def parse_section(node, ids: ElementIdFactory, path: str) -> Section:
 def parse_blocks(parent, ids: ElementIdFactory, source_path: str, package: DocxPackage) -> list[object]:
     blocks: list[object] = []
     for index, child in enumerate(parent):
-        local = child.tag.rsplit("}", 1)[-1]
+        local = local_name(child)
         path = f"{source_path}/{index}"
         if local == "p":
             blocks.append(parse_paragraph(child, ids, path, package))
@@ -596,7 +597,7 @@ class DocxParser:
                 "moveTo": "move_to",
             }
             for node in root.xpath("//w:ins | //w:del | //w:moveFrom | //w:moveTo", namespaces=NS):
-                local = node.tag.rsplit("}", 1)[-1]
+                local = local_name(node)
                 pieces = node.xpath(".//w:t/text() | .//w:delText/text()", namespaces=NS)
                 path_text = tree.getpath(node)
                 model.revisions.append(
@@ -663,7 +664,7 @@ class DocxParser:
             section_index = 0
             block_index = 0
             for child_index, child in enumerate(body):
-                local = child.tag.rsplit("}", 1)[-1]
+                local = local_name(child)
                 sect_pr = None
                 current_block_index: int | None = None
                 if local in {"p", "tbl"}:

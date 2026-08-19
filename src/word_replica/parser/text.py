@@ -1,3 +1,5 @@
+from word_replica.parser.nodes import local_name
+
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 NS = {"w": W_NS}
 
@@ -5,7 +7,7 @@ NS = {"w": W_NS}
 def run_text(run_node) -> str:
     pieces: list[str] = []
     for child in run_node:
-        local = child.tag.rsplit("}", 1)[-1]
+        local = local_name(child)
         if local in {"t", "delText"}:
             pieces.append(child.text or "")
         elif local == "tab":
