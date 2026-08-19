@@ -108,6 +108,14 @@ def _package(
             'xmlns:ds="http://schemas.openxmlformats.org/officeDocument/2006/customXml" '
             'ds:itemID="{AAAA0000-0000-0000-0000-000000000001}"/>'
         )
+        # A customXml item reaches its properties part through its own .rels.
+        # Without this the props part is an orphan in the fixture itself.
+        parts["customXml/_rels/item1.xml.rels"] = (
+            REL_HEAD
+            + '<Relationship Id="rId1" Target="itemProps1.xml" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+            '/customXmlProps"/></Relationships>'
+        )
         rels += (
             '<Relationship Id="rId20" Target="../customXml/item1.xml" '
             'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml"/>'
@@ -136,7 +144,13 @@ def _package(
 
     package: dict[str, str | bytes] = {
         "[Content_Types].xml": content_types,
-        "_rels/.rels": REL_HEAD + REL_DOC + "</Relationships>",
+        "_rels/.rels": (
+            REL_HEAD
+            + REL_DOC
+            + '<Relationship Id="rId2" Target="docProps/core.xml" '
+            'Type="http://schemas.openxmlformats.org/package/2006/relationships'
+            '/metadata/core-properties"/></Relationships>'
+        ),
         "word/_rels/document.xml.rels": rels,
         "word/document.xml": _document(rsid=rsid),
         "docProps/core.xml": CORE_XML.format(revision=revision, created=created),
@@ -409,3 +423,52 @@ def test_declaring_the_policy_does_not_excuse_other_losses(tmp_path):
     output = _write(tmp_path / "output.docx", _package(comments_ex=False))
 
     assert build_preservation_gate(src, output, custom_properties_dropped_by_policy=True).passed is False
+
+
+# --- parts nothing points at ---------------------------------------------------
+
+def test_a_part_no_relationship_reaches_is_reported(tmp_path):
+    # The mirror of a dangling relationship. Found by the pure-docx renderer
+    # keeping an image's bytes while never emitting the w:drawing that referred
+    # to it: the media part survived as litter and the picture was gone from
+    # the document, and the relationship graph alone could not see it.
+    parts = _package()
+    parts["word/media/image1.png"] = b"\x89PNG\r\n\x1a\n orphan"
+    parts["[Content_Types].xml"] = parts["[Content_Types].xml"].replace(
+        b"</Types>", b'<Default Extension="png" ContentType="image/png"/></Types>'
+    )
+    path = _write(tmp_path / "orphan.docx", parts)
+
+    assert g10_projection(path)["orphan_parts"] == ["image/png"]
+
+
+def test_an_ordinary_package_has_no_orphans(tmp_path, source):
+    assert g10_projection(source)["orphan_parts"] == []
+
+
+def test_an_output_that_orphans_a_part_fails_the_gate(tmp_path, source):
+    parts = _package()
+    parts["word/media/image1.png"] = b"\x89PNG\r\n\x1a\n orphan"
+    parts["[Content_Types].xml"] = parts["[Content_Types].xml"].replace(
+        b"</Types>", b'<Default Extension="png" ContentType="image/png"/></Types>'
+    )
+    output = _write(tmp_path / "output.docx", parts)
+
+    assert build_preservation_gate(source, output).passed is False
+
+
+def test_orphan_parts_are_reported_by_kind_not_by_name(tmp_path):
+    # Same normalization as everywhere else: image1.png standing in for
+    # image3.png is not a defect.
+    def _with_orphan(name):
+        parts = _package()
+        parts[f"word/media/{name}"] = b"\x89PNG\r\n\x1a\n orphan"
+        parts["[Content_Types].xml"] = parts["[Content_Types].xml"].replace(
+            b"</Types>", b'<Default Extension="png" ContentType="image/png"/></Types>'
+        )
+        return parts
+
+    first = g10_projection(_write(tmp_path / "a.docx", _with_orphan("image1.png")))
+    second = g10_projection(_write(tmp_path / "b.docx", _with_orphan("image7.png")))
+
+    assert first["orphan_parts"] == second["orphan_parts"] == ["image/png"]

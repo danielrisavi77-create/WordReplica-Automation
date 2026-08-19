@@ -85,6 +85,11 @@ _OPAQUE_CONTENT_TYPE_MARKERS = (
 )
 
 
+# Reached by the package's own conventions rather than by a relationship the
+# projection can follow.
+_ALWAYS_REACHABLE = frozenset({"word/document.xml"})
+
+
 def _content_type_map(parts: dict[str, bytes], roots: dict[str, Any]) -> dict[str, str]:
     """Part name -> declared content type, resolved through Default and Override."""
     root = roots.get("[Content_Types].xml")
@@ -162,9 +167,10 @@ def _relationship_graph(
     parts: dict[str, bytes],
     roots: dict[str, Any],
     ignored: frozenset[str] = frozenset(),
-) -> tuple[dict[str, Any], list[str]]:
+) -> tuple[dict[str, Any], list[str], set[str]]:
     graph: dict[str, dict[str, int]] = {}
     dangling: list[str] = []
+    reached: set[str] = set()
     for name, root in roots.items():
         if not name.endswith(".rels"):
             continue
@@ -179,12 +185,17 @@ def _relationship_graph(
             if resolved in ignored:
                 entry["count"] -= 1
                 continue
+            reached.add(resolved)
             if resolved and resolved not in parts:
                 # Recorded by type and owner, never by rId: relationship ids are
                 # renumbered freely by any writer and are not a fidelity signal.
                 dangling.append(f"{name}->{rel_type}")
     # A type whose only relationships were to ignored parts is not present.
-    return {name: entry for name, entry in graph.items() if entry["count"] > 0}, sorted(dangling)
+    return (
+        {name: entry for name, entry in graph.items() if entry["count"] > 0},
+        sorted(dangling),
+        reached,
+    )
 
 
 def _settings(roots: dict[str, Any]) -> dict[str, Any]:
@@ -279,7 +290,22 @@ def g10_projection(
         if _is_opaque(name, content_type):
             opaque.setdefault(key, []).append(sha256(data).hexdigest())
 
-    graph, dangling = _relationship_graph(parts, roots, frozenset(ignored))
+    graph, dangling, reached = _relationship_graph(parts, roots, frozenset(ignored))
+
+    # The mirror of a dangling relationship: a part nothing points at. Found by
+    # the pure-docx renderer keeping an image's bytes while never emitting the
+    # w:drawing that referred to it -- the media part survived as litter while
+    # the picture was gone from the document, and the relationship graph alone
+    # could not see it. Reported by content type, like everything else here, so
+    # image1.png standing in for image3.png is not a defect.
+    orphans = sorted({
+        content_types.get(name) or f"(undeclared:{name.rsplit('.', 1)[-1].lower()})"
+        for name in parts
+        if name not in reached
+        and not name.endswith((".rels", "/"))
+        and name != "[Content_Types].xml"
+        and name not in _ALWAYS_REACHABLE
+    })
 
     return {
         "namespaces": _namespaces(roots),
@@ -288,6 +314,7 @@ def g10_projection(
         "opaque_parts": {key: sorted(values) for key, values in sorted(opaque.items())},
         "relationship_graph": dict(sorted(graph.items())),
         "dangling_relationships": dangling,
+        "orphan_parts": orphans,
         "settings": _settings(roots),
         "malformed_parts": sorted(scan.malformed),
         "entity_parts": sorted(scan.entity_parts),
