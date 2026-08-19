@@ -2,7 +2,7 @@ def test_scripts_codex_automation_audit_reexports_the_same_objects():
     from scripts.codex_automation import audit as legacy
     from word_replica.qa import golden_audit as packaged
 
-    for name in ("GateResult", "build_golden_report", "build_model_gates", "build_visual_gate", "audit_docx_pair", "compare_page_text_partitions"):
+    for name in ("DEFAULT_GATE_NAMES", "GateResult", "build_golden_report", "build_model_gates", "build_visual_gate", "audit_docx_pair", "compare_page_text_partitions"):
         assert getattr(legacy, name) is getattr(packaged, name), name
 
 

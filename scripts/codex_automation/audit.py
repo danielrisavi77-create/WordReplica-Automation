@@ -5,6 +5,7 @@ codex_automation harness (e.g. by the Lekta repair-package service).
 from __future__ import annotations
 
 from word_replica.qa.golden_audit import (
+    DEFAULT_GATE_NAMES,
     GateResult,
     audit_docx_pair,
     build_golden_report,
@@ -14,6 +15,7 @@ from word_replica.qa.golden_audit import (
 )
 
 __all__ = [
+    "DEFAULT_GATE_NAMES",
     "GateResult",
     "build_golden_report",
     "build_model_gates",

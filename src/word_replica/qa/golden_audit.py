@@ -5,10 +5,14 @@ now re-exports these five public names for backward compatibility.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+DEFAULT_GATE_NAMES: tuple[str, ...] = tuple(f"G{i}" for i in range(10))
+
 __all__ = [
+    "DEFAULT_GATE_NAMES",
     "GateResult",
     "build_golden_report",
     "build_model_gates",
@@ -52,20 +56,33 @@ def compare_page_text_partitions(source_pages: list[str], output_pages: list[str
 
 def build_golden_report(*, run_id: str, source_sha256: str, commit_sha: str, reconstruction_status: str,
                         gates: dict[str, GateResult], source_page_count: int | None = None,
-                        output_page_count: int | None = None, **extra: Any) -> dict[str, Any]:
-    ordered = [f"G{i}" for i in range(10)]
-    first_name = next((name for name in ordered if name in gates and not gates[name].passed), None)
+                        output_page_count: int | None = None,
+                        gate_names: Sequence[str] = DEFAULT_GATE_NAMES, **extra: Any) -> dict[str, Any]:
+    """Build the report contract. `gate_names` declares which gates a FULL PASS
+    requires; it is echoed as `required_gates` so no consumer has to hardcode the
+    count. The default is Golden's original G0-G9, so existing callers are
+    unaffected; the fidelity lab opts in to G0-G10 by passing its own names.
+
+    A declared gate with no result is treated as the first divergence rather
+    than skipped -- a gate that never ran is not a gate that passed.
+    """
+    ordered = list(gate_names)
+    first_name = next(
+        (name for name in ordered if name not in gates or not gates[name].passed),
+        None,
+    )
     report = {
         "schema_version": 1,
         "run_id": run_id,
         "source_sha256": source_sha256,
         "commit_sha": commit_sha,
         "reconstruction_status": reconstruction_status,
+        "required_gates": ordered,
         "gates": {name: gates[name].passed for name in ordered if name in gates},
         "gate_details": {name: asdict(gates[name]) for name in ordered if name in gates},
-        "full_pass": bool(gates) and all(gates.get(name) is not None and gates[name].passed for name in ordered),
+        "full_pass": bool(gates) and all(name in gates and gates[name].passed for name in ordered),
         "first_divergent_gate": first_name,
-        "first_divergence": gates[first_name].first_divergence if first_name else None,
+        "first_divergence": gates[first_name].first_divergence if first_name in gates else None,
         "source_page_count": source_page_count,
         "output_page_count": output_page_count,
     }

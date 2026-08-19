@@ -9,7 +9,7 @@ import subprocess
 import sys
 from typing import Callable
 
-from scripts.codex_automation.audit import GateResult, build_golden_report
+from scripts.codex_automation.audit import DEFAULT_GATE_NAMES, GateResult, build_golden_report
 from scripts.codex_automation.config import CodexAutomationConfig
 from scripts.codex_automation.process import ChildResult, run_owned_child
 from scripts.codex_automation.retention import prune_diagnostics
@@ -82,7 +82,7 @@ def _failure_report(run_id: str, source_hash: str, commit_sha: str, reconstructi
             summary=f"not evaluable: {reason}",
             first_divergence={"error": reason} if i == 0 else None,
         )
-        for i in range(10)
+        for i in range(len(DEFAULT_GATE_NAMES))
     }
     return build_golden_report(
         run_id=run_id,

@@ -5,6 +5,9 @@ import json
 from pathlib import Path
 
 
+DEFAULT_REQUIRED_GATES = tuple(f"G{i}" for i in range(10))
+
+
 @dataclass(slots=True)
 class AutomationState:
     last_gate_status: dict[str, bool] = field(default_factory=dict)
@@ -29,7 +32,16 @@ def evaluate_run(state: AutomationState, report: dict) -> AutomationDecision:
     score = sum(1 for value in current.values() if value)
     commit_sha = str(report.get("commit_sha") or "")
     word_build = ((report.get("environment") or {}).get("word") or {}).get("build")
-    full_pass = bool(report.get("full_pass")) and len(current) == 10 and all(current.values())
+    # Which gates a FULL PASS requires is declared by the report itself, so a
+    # pipeline that runs extra gates (the fidelity lab adds G10) cannot silently
+    # change what gates promotion to main. Reports without the key are Golden's
+    # original ten-gate shape and must keep behaving exactly as they always did.
+    required = [str(name) for name in (report.get("required_gates") or DEFAULT_REQUIRED_GATES)]
+    full_pass = (
+        bool(report.get("full_pass"))
+        and len(current) == len(required)
+        and all(current.get(name, False) for name in required)
+    )
 
     if full_pass:
         # Two consecutive FULL PASS results must land on the same commit AND the

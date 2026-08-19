@@ -156,3 +156,54 @@ def test_visual_gate_uses_blurred_mae_to_separate_word_antialiasing_from_layout_
         "blurred_antialiasing": 1,
         "failed": 1,
     }
+
+
+def _passing(name):
+    return GateResult(name=name, passed=True, summary="ok")
+
+
+def _report(gates, **kwargs):
+    return build_golden_report(
+        run_id="r", source_sha256="s", commit_sha="c",
+        reconstruction_status="PASS", gates=gates, **kwargs,
+    )
+
+
+def test_default_report_declares_the_original_ten_gates():
+    # Golden #1's contract: ten gates, and a report that does not opt in to a
+    # different gate set must keep declaring exactly those ten.
+    gates = {f"G{i}": _passing(f"G{i}") for i in range(10)}
+    report = _report(gates)
+
+    assert report["required_gates"] == [f"G{i}" for i in range(10)]
+    assert report["full_pass"] is True
+    assert list(report["gates"]) == [f"G{i}" for i in range(10)]
+
+
+def test_extra_gate_is_ignored_unless_it_is_declared():
+    # G10 present in the gates dict but not declared must not appear in the
+    # report, so wiring the lab's gate in cannot leak into a Golden run.
+    gates = {f"G{i}": _passing(f"G{i}") for i in range(11)}
+    report = _report(gates)
+
+    assert "G10" not in report["gates"]
+    assert report["required_gates"] == [f"G{i}" for i in range(10)]
+
+
+def test_declared_gate_names_drive_reporting_and_full_pass():
+    names = [f"G{i}" for i in range(11)]
+    gates = {name: _passing(name) for name in names}
+    report = _report(gates, gate_names=names)
+
+    assert report["required_gates"] == names
+    assert report["gates"]["G10"] is True
+    assert report["full_pass"] is True
+
+
+def test_declared_gate_missing_from_results_is_not_a_full_pass():
+    names = [f"G{i}" for i in range(11)]
+    gates = {name: _passing(name) for name in names[:-1]}
+    report = _report(gates, gate_names=names)
+
+    assert report["full_pass"] is False
+    assert report["first_divergent_gate"] == "G10"
