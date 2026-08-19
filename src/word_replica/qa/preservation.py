@@ -282,17 +282,69 @@ def g10_projection(path: Path, *, limits: PackageLimits = DEFAULT_LIMITS) -> dic
     }
 
 
+_CUSTOM_PROPS_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument.custom-properties+xml"
+)
+
+
+def _without_custom_properties(expected: dict[str, Any], actual: dict[str, Any]) -> dict[str, Any]:
+    """Remove the source's custom-properties part from what the output is held to.
+
+    Only when the output does not have one: a policy that drops properties
+    cannot explain an output that has some.
+    """
+    if _CUSTOM_PROPS_CONTENT_TYPE in actual.get("part_kinds", {}):
+        return expected
+    trimmed = dict(expected)
+    trimmed["part_kinds"] = {
+        name: count
+        for name, count in expected.get("part_kinds", {}).items()
+        if name != _CUSTOM_PROPS_CONTENT_TYPE
+    }
+    trimmed["relationship_graph"] = {
+        name: entry
+        for name, entry in expected.get("relationship_graph", {}).items()
+        if name != "custom-properties"
+    }
+    # The two namespaces only ever appear in that part, so dropping the part
+    # means dropping its namespaces too.
+    trimmed["namespaces"] = [
+        uri for uri in expected.get("namespaces", []) if uri not in _CUSTOM_PROPS_NAMESPACES
+    ]
+    return trimmed
+
+
+_CUSTOM_PROPS_NAMESPACES = frozenset({
+    "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties",
+    "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes",
+})
+
+
 def build_preservation_gate(
     source: Path,
     output: Path,
     *,
     limits: PackageLimits = DEFAULT_LIMITS,
+    custom_properties_dropped_by_policy: bool = False,
 ) -> GateResult:
-    """Compare two packages at the level the document model cannot see."""
+    """Compare two packages at the level the document model cannot see.
+
+    ``custom_properties_dropped_by_policy`` lets a caller declare a difference
+    the product makes on purpose. WordReplica drops a source's custom document
+    properties unless they are explicitly allow-listed (README: "custom
+    properties require an explicit allowlist"), so under the default policy
+    their absence from the output is intended rather than a defect.
+
+    The carve-out is one-directional and narrow: it explains a *lost* custom
+    properties part and nothing else. An output that invented custom properties,
+    or lost anything else, still fails.
+    """
     from word_replica.qa.policy import compare_projection
 
     expected = g10_projection(source, limits=limits)
     actual = g10_projection(output, limits=limits)
+    if custom_properties_dropped_by_policy:
+        expected = _without_custom_properties(expected, actual)
     findings = compare_projection("G10", expected, actual)
 
     if not findings:

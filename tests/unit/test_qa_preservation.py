@@ -382,3 +382,30 @@ def test_provenance_alongside_a_real_property_is_still_compared(tmp_path):
     )
 
     assert build_preservation_gate(src, output).passed is True
+
+
+# --- differences the metadata policy deliberately makes ----------------------
+
+def test_a_deliberately_dropped_custom_properties_part_can_be_declared(tmp_path):
+    # README: "custom properties require an explicit allowlist". Under the
+    # default policy a source's custom properties are dropped on purpose, so a
+    # caller that used that policy can say so and G10 will not call it a defect.
+    src = _write(tmp_path / "source.docx", _with_custom_properties(_package(), "ContractNumber"))
+    output = _write(tmp_path / "output.docx", _package())
+
+    assert build_preservation_gate(src, output).passed is False
+    assert build_preservation_gate(src, output, custom_properties_dropped_by_policy=True).passed is True
+
+
+def test_declaring_the_policy_does_not_excuse_inventing_properties(tmp_path, source):
+    # The carve-out is one-directional: policy explains a loss, never a gain.
+    output = _write(tmp_path / "output.docx", _with_custom_properties(_package(), "InventedByUs"))
+
+    assert build_preservation_gate(source, output, custom_properties_dropped_by_policy=True).passed is False
+
+
+def test_declaring_the_policy_does_not_excuse_other_losses(tmp_path):
+    src = _write(tmp_path / "source.docx", _with_custom_properties(_package(), "ContractNumber"))
+    output = _write(tmp_path / "output.docx", _package(comments_ex=False))
+
+    assert build_preservation_gate(src, output, custom_properties_dropped_by_policy=True).passed is False
