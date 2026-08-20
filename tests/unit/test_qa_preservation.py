@@ -472,3 +472,37 @@ def test_orphan_parts_are_reported_by_kind_not_by_name(tmp_path):
     second = g10_projection(_write(tmp_path / "b.docx", _with_orphan("image7.png")))
 
     assert first["orphan_parts"] == second["orphan_parts"] == ["image/png"]
+
+
+# --- relationship parts are bookkeeping, not content --------------------------
+
+def test_relationship_parts_are_not_counted_as_part_kinds(source):
+    # relationship_graph already compares what is inside every .rels file, by
+    # type. Counting the files themselves as well double-counts: a rebuild that
+    # legitimately needs a new .rels part -- a picture in a header gets a header
+    # relationship -- showed up as a part_kinds divergence on top of the graph
+    # comparison that already covered it.
+    projection = g10_projection(source)
+
+    assert not [kind for kind in projection["part_kinds"] if "relationships" in kind], (
+        projection["part_kinds"]
+    )
+
+
+def test_a_relationship_that_actually_disappeared_is_still_reported(tmp_path, source):
+    # Excluding the .rels part must not hide the relationships it carried.
+    parts = _package()
+    parts["word/_rels/document.xml.rels"] = (REL_HEAD + "</Relationships>").encode("utf-8")
+    output = _write(tmp_path / "output.docx", parts)
+
+    assert build_preservation_gate(source, output).passed is False
+
+
+def test_an_added_relationship_part_alone_does_not_fail_the_gate(tmp_path, source):
+    # The case that prompted this: the output needs a .rels file the source did
+    # not have, but every relationship it declares also exists in the source.
+    parts = _package()
+    parts["word/_rels/header1.xml.rels"] = (REL_HEAD + "</Relationships>").encode("utf-8")
+    output = _write(tmp_path / "output.docx", parts)
+
+    assert build_preservation_gate(source, output).passed is True

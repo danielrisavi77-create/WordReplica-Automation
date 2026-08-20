@@ -279,7 +279,12 @@ def g10_projection(
     part_kinds: dict[str, int] = {}
     opaque: dict[str, list[str]] = {}
     for name, data in parts.items():
-        if name.endswith("/"):
+        # .rels files are bookkeeping, and relationship_graph already compares
+        # what is inside every one of them by type. Counting the files as well
+        # double-counts, so a rebuild that legitimately needs a new .rels part
+        # -- a picture in a header gets a header relationship -- would diverge
+        # here on top of the graph comparison that already covers it.
+        if name.endswith("/") or name.endswith(".rels"):
             continue
         content_type = content_types.get(name, "")
         # Part names are deliberately dropped here: only the kind and how many
