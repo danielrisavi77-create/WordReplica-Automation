@@ -183,3 +183,42 @@ def test_a_source_that_has_numbering_keeps_it(tmp_path, corpus_dir):
     names = _rebuild(tmp_path, corpus_dir / "03_lists.docx", suffix="-lists")
 
     assert "word/numbering.xml" in names
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        "word/theme/theme1.xml",
+        "word/webSettings.xml",
+        "word/fontTable.xml",
+    ],
+)
+def test_a_template_owned_part_the_source_lacks_is_not_added(tmp_path, bare_source, part):
+    # The renderer never writes these, so whatever the shell template brought
+    # stayed. Documents with no theme of their own were handed the template's,
+    # and its mc:Ignorable declaration with it.
+    names = _rebuild(tmp_path, bare_source, suffix=part.replace("/", "_"))
+
+    assert part not in names
+
+
+def test_a_source_that_has_a_theme_keeps_its_own(tmp_path, corpus_dir):
+    # The mirror half: these are dropped from the template so the source's can
+    # be restored in their place, never so the document ends up without one.
+    from zipfile import ZipFile
+
+    source = corpus_dir / "01_plain_text.docx"
+    with ZipFile(source) as archive:
+        expected = archive.read("word/theme/theme1.xml")
+
+    result = RebuildService(app_root=tmp_path / "app-theme").rebuild(
+        source,
+        RebuildOptions(
+            renderer=RendererChoice.DOCX,
+            fidelity=FidelityMode.FULL,
+            metadata=MetadataMode.PRESERVE,
+            reconstruction_mode=ReconstructionMode.INSTANT,
+        ),
+    )
+    with ZipFile(result.output_path) as archive:
+        assert archive.read("word/theme/theme1.xml") == expected

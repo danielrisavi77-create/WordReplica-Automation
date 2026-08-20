@@ -487,11 +487,18 @@ class MutableDocxPackage:
     # place they end up in documents that never had them -- a foreign customXml
     # store is real content, not decoration, and no gate that compares parsed
     # models can see it because the parser does not model custom XML at all.
+    # Parts the shell template brings and the renderer never writes. Dropped
+    # here so the source's own can be restored in their place; a source that
+    # has none ends up with none, rather than inheriting the template's --
+    # which also brought the template's mc:Ignorable declaration with it.
     _TEMPLATE_DEBRIS = (
         "customXml/item1.xml",
         "customXml/itemProps1.xml",
         "docProps/thumbnail.jpeg",
         "word/stylesWithEffects.xml",
+        "word/theme/theme1.xml",
+        "word/webSettings.xml",
+        "word/fontTable.xml",
     )
 
     def drop_template_debris(self) -> list[str]:
@@ -537,7 +544,14 @@ class MutableDocxPackage:
                 self._write_xml(rels_name, rels_root)
         return True
 
-    def _ensure_relationship(self, rels_part: str, rel_type: str, target: str) -> str:
+    def _ensure_relationship(
+        self, rels_part: str, rel_type: str, target: str, *, external: bool = False
+    ) -> str:
+        if rels_part not in self.parts:
+            self.parts[rels_part] = (
+                b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>'
+            )
         root = self._xml(rels_part)
         for node in root:
             if node.get("Type") == rel_type and node.get("Target") == target:
@@ -551,6 +565,8 @@ class MutableDocxPackage:
         node.set("Id", rel_id)
         node.set("Type", rel_type)
         node.set("Target", target)
+        if external:
+            node.set("TargetMode", "External")
         self._write_xml(rels_part, root)
         return rel_id
 
@@ -670,6 +686,17 @@ class MutableDocxPackage:
                     continue
                 reached.add(_resolve_rel_target(rels_name, node.get("Target") or ""))
         return sorted(name for name in self.parts if name.startswith(prefix) and name not in reached)
+
+    def set_settings_relationships(self, relationships) -> None:
+        """Restore the settings part's external relationships.
+
+        Only external ones reach here, so there is no part to install and
+        nothing that can end up pointing at a part that is not present.
+        """
+        for rel_type, target in relationships or ():
+            self._ensure_relationship(
+                "word/_rels/settings.xml.rels", rel_type, target, external=True
+            )
 
     def install_attachment(
         self,
@@ -857,10 +884,7 @@ class PureDocxRenderer:
             ("numbering", lambda: self._package.set_numbering(model.numbering_xml)),
             (
                 "settings",
-                lambda: self._package.set_settings(
-                    model.settings_xml,
-                    bool(model.extras.get("tracked_changes_enabled", False)),
-                ),
+                lambda: self._set_settings_and_relationships(model),
             ),
             ("assets", lambda: self._install_assets(model)),
             ("notes_headers", lambda: self._install_notes_headers(model)),
@@ -888,6 +912,17 @@ class PureDocxRenderer:
             )
         finally:
             shell.unlink(missing_ok=True)
+
+    def _set_settings_and_relationships(self, model: DocumentModel) -> None:
+        assert self._package is not None
+        self._package.set_settings(
+            model.settings_xml,
+            bool(model.extras.get("tracked_changes_enabled", False)),
+        )
+        if model.settings_xml is not None:
+            self._package.set_settings_relationships(
+                model.extras.get("settings_relationships")
+            )
 
     def _install_assets(self, model: DocumentModel) -> None:
         assert self._package is not None

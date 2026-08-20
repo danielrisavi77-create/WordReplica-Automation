@@ -836,6 +836,20 @@ class DocxParser:
             model.extras["fields"] = model.fields
             model.extras["preserved_parts"] = model.preserved_parts
             model.extras["tracked_changes_enabled"] = tracked_changes
+            # word/_rels/settings.xml.rels carries the attached template the
+            # document was authored from -- usually the author's Normal.dotm.
+            # The renderer writes settings.xml but never its .rels, so that
+            # relationship was simply disappearing.
+            #
+            # Only external relationships are carried: an external target needs
+            # no part in the package, so restoring it cannot leave anything
+            # dangling, while an internal one would need its part to travel too.
+            settings_relationships = []
+            if "word/_rels/settings.xml.rels" in package.parts:
+                for rel in package.relationships("word/settings.xml").values():
+                    if rel.target_mode == "External":
+                        settings_relationships.append((rel.rel_type, rel.target))
+            model.extras["settings_relationships"] = sorted(settings_relationships)
             # mc:Ignorable on the document root declares which namespace
             # prefixes a reader may skip. The pure-docx shell template carries
             # its own, so without recording the source's, every rebuild
