@@ -225,15 +225,38 @@ def test_a_picture_inside_a_comment_is_not_orphaned(tmp_path, corpus_dir):
     assert projection["dangling_relationships"] == []
 
 
-def test_an_ambiguous_relationship_id_is_refused(tmp_path):
-    # The same id can address different parts in different .rels files.
-    # Resolving it across all of them is only safe when they agree; where they
-    # disagree the fragment must be refused rather than guessed at.
-    from word_replica.parser.parser import _resolve_reference_target
+def test_the_same_relationship_id_resolves_per_part(tmp_path):
+    """A relationship id is only meaningful relative to the part that declares it.
 
-    agreeing = {"rId5": {"word/media/image1.png"}}
-    conflicting = {"rId5": {"word/media/image1.png", "word/media/image9.png"}}
+    Measured on a real corpus document before this was built: rId1 addressed
+    word/styles.xml from word/document.xml.rels and word/media/image1.png from
+    word/_rels/comments.xml.rels. Resolving without knowing whose id it is can
+    only guess, and a guess rewrites a reference to the wrong part.
+    """
+    from zipfile import ZIP_DEFLATED
+    from word_replica.opc.package_reader import DocxPackage
+    from word_replica.parser.parser import _reference_targets
 
-    assert _resolve_reference_target("rId5", agreeing) == "word/media/image1.png"
-    assert _resolve_reference_target("rId5", conflicting) is None
-    assert _resolve_reference_target("rId9", agreeing) is None
+    def _rels(target: str, kind: str) -> bytes:
+        return (
+            '<?xml version="1.0"?><Relationships '
+            'xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'<Relationship Id="rId1" Target="{target}" '
+            f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/{kind}"/>'
+            "</Relationships>"
+        ).encode("utf-8")
+
+    path = tmp_path / "collide.docx"
+    with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", b"<Types/>")
+        archive.writestr("_rels/.rels", b"<Relationships/>")
+        archive.writestr("word/document.xml", b"<document/>")
+        archive.writestr("word/comments.xml", b"<comments/>")
+        archive.writestr("word/styles.xml", b"<styles/>")
+        archive.writestr("word/media/image1.png", b"png")
+        archive.writestr("word/_rels/document.xml.rels", _rels("styles.xml", "styles"))
+        archive.writestr("word/_rels/comments.xml.rels", _rels("media/image1.png", "image"))
+
+    with DocxPackage.open(path) as package:
+        assert _reference_targets(package, "word/document.xml")["rId1"] == "word/styles.xml"
+        assert _reference_targets(package, "word/comments.xml")["rId1"] == "word/media/image1.png"

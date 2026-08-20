@@ -1,3 +1,4 @@
+from contextvars import ContextVar
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -211,28 +212,32 @@ def _is_preservable_inline(child, local: str) -> bool:
     return local in _PRESERVABLE_INLINE
 
 
-def _reference_targets(package: DocxPackage | None) -> dict[str, set[str]]:
-    """Relationship id -> every part it addresses, across the whole package.
+# Which OPC part the blocks currently being parsed came from. A relationship id
+# only means something relative to the part that declares it: in a real corpus
+# document rId1 addressed word/styles.xml from the document and
+# word/media/image1.png from the comments.
+_OWNER_PART: ContextVar[str] = ContextVar("owner_part", default="word/document.xml")
 
-    A picture in a comment or a header has its relationship in that part's own
-    .rels, not the document's. Resolving against document.xml.rels alone meant
-    those fragments could not be resolved and were refused, while their media
-    still travelled -- leaving an image in the package that nothing displayed.
+
+def _reference_targets(package: DocxPackage | None, owner_part: str) -> dict[str, str]:
+    """Relationship id -> part, for one owning part.
+
+    A relationship id is only meaningful relative to the part that declares it.
+    In a real corpus document rId1 addressed word/styles.xml from the document
+    and word/media/image1.png from the comments, so resolving an id without
+    knowing whose it is can only guess.
     """
     if package is None:
         return {}
-    targets: dict[str, set[str]] = {}
-    for rels_part in [name for name in package.parts if name.endswith(".rels")]:
-        owner = rels_part.replace("/_rels/", "/").removesuffix(".rels")
-        try:
-            relationships = package.relationships(owner)
-        except Exception:
-            continue
-        for rel_id, rel in relationships.items():
-            if rel.target_mode == "External":
-                continue
-            targets.setdefault(rel_id, set()).add(_resolve_relative_target(owner, rel.target))
-    return targets
+    try:
+        relationships = package.relationships(owner_part)
+    except Exception:
+        return {}
+    return {
+        rel_id: _resolve_relative_target(owner_part, rel.target)
+        for rel_id, rel in relationships.items()
+        if rel.target_mode != "External"
+    }
 
 
 def _resolve_relative_target(owner_part: str, target: str) -> str:
@@ -252,20 +257,6 @@ def _resolve_relative_target(owner_part: str, target: str) -> str:
     return "/".join(resolved)
 
 
-def _resolve_reference_target(rel_id: str, targets: dict[str, set[str]]) -> str | None:
-    """The part an id addresses, or None when that cannot be settled.
-
-    The same id addresses different parts in different .rels files. Resolving
-    across all of them is only safe where they agree; where they disagree the
-    fragment is refused rather than guessed at, because a reference rewritten
-    to the wrong part is worse than a missing shape.
-    """
-    candidates = targets.get(rel_id)
-    if not candidates or len(candidates) != 1:
-        return None
-    return next(iter(candidates))
-
-
 def _capture_inline(child, package: DocxPackage | None) -> dict:
     """Serialize an inline fragment, resolving the parts its references address.
 
@@ -280,7 +271,7 @@ def _capture_inline(child, package: DocxPackage | None) -> dict:
     """
     from lxml import etree
 
-    known = _reference_targets(package)
+    known = _reference_targets(package, _OWNER_PART.get())
     targets: dict[str, str] = {}
     for element in child.iter():
         if not isinstance(element.tag, str):
@@ -288,7 +279,7 @@ def _capture_inline(child, package: DocxPackage | None) -> dict:
         for name, value in element.attrib.items():
             if not name.startswith(f"{{{_R_NS}}}"):
                 continue
-            resolved = _resolve_reference_target(value, known)
+            resolved = known.get(value)
             if resolved is None:
                 return {
                     "kind": "unsupported_inline",
@@ -588,7 +579,25 @@ def _resolve_document_target(target: str) -> str:
     return "/".join(resolved)
 
 
-def parse_blocks(parent, ids: ElementIdFactory, source_path: str, package: DocxPackage) -> list[object]:
+def parse_blocks(parent, ids: ElementIdFactory, source_path: str, package: DocxPackage,
+                 owner_part: str | None = None) -> list[object]:
+    """Parse a story part's blocks.
+
+    ``owner_part`` names the OPC part these blocks came from. It is ambient
+    rather than threaded through every signature because it applies to a whole
+    subtree -- paragraphs, runs, table cells and their nested blocks alike --
+    and one of those levels lives in another module.
+    """
+    if owner_part is not None:
+        token = _OWNER_PART.set(owner_part)
+        try:
+            return _parse_blocks(parent, ids, source_path, package)
+        finally:
+            _OWNER_PART.reset(token)
+    return _parse_blocks(parent, ids, source_path, package)
+
+
+def _parse_blocks(parent, ids: ElementIdFactory, source_path: str, package: DocxPackage) -> list[object]:
     blocks: list[object] = []
     for index, child in enumerate(parent):
         local = local_name(child)
@@ -742,10 +751,10 @@ class DocxParser:
 
             for part in package.iter_parts("word/header"):
                 if part.endswith(".xml"):
-                    model.headers[part] = parse_blocks(package.read_xml(part), ids, f"header/{part}", package)
+                    model.headers[part] = parse_blocks(package.read_xml(part), ids, f"header/{part}", package, part)
             for part in package.iter_parts("word/footer"):
                 if part.endswith(".xml"):
-                    model.footers[part] = parse_blocks(package.read_xml(part), ids, f"footer/{part}", package)
+                    model.footers[part] = parse_blocks(package.read_xml(part), ids, f"footer/{part}", package, part)
 
             def parse_notes(part_name: str, note_tag: str, prefix: str) -> dict[str, list[object]]:
                 result: dict[str, list[object]] = {}
@@ -755,7 +764,7 @@ class DocxParser:
                 for note in note_root.findall(f"w:{note_tag}", namespaces=NS):
                     note_id = note.get(f"{{{W_NS}}}id")
                     if note_id is not None:
-                        result[note_id] = parse_blocks(note, ids, f"{prefix}/{note_id}", package)
+                        result[note_id] = parse_blocks(note, ids, f"{prefix}/{note_id}", package, part_name)
                 return result
 
             model.footnotes = parse_notes("word/footnotes.xml", "footnote", "footnote")
@@ -828,7 +837,7 @@ class DocxParser:
                         comment_id,
                         comment_node.get(f"{{{W_NS}}}author"),
                         comment_node.get(f"{{{W_NS}}}date"),
-                        parse_blocks(comment_node, ids, f"comment/{comment_id}", package),
+                        parse_blocks(comment_node, ids, f"comment/{comment_id}", package, "word/comments.xml"),
                     )
                     initials = comment_node.get(f"{{{W_NS}}}initials")
                     if initials:
