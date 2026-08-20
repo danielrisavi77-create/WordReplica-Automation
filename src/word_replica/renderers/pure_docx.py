@@ -100,7 +100,8 @@ def _run_element(run: Run):
     # A drawing token carries both: "kind" tells the interactive executor what
     # to do, "value" carries the markup this renderer has to write itself.
     preserved = [token for token in content_tokens if token.get("value") and token.get("kind") in _PRESERVED_KINDS]
-    if not run.text and not has_field_tokens and not preserved:
+    references = [token for token in content_tokens if token.get("kind") in _REFERENCE_TOKENS]
+    if not run.text and not has_field_tokens and not preserved and not references:
         return node
     buffer = ""
 
@@ -129,6 +130,10 @@ def _run_element(run: Run):
     flush()
     if has_field_tokens:
         _append_field_tokens(node, content_tokens)
+    for token in references:
+        tag, key = _REFERENCE_TOKENS[token["kind"]]
+        marker = etree.SubElement(node, f"{W}{tag}")
+        _set_w(marker, "id", str(token.get(key)))
     _append_preserved_inline(node, preserved)
     return node
 
@@ -167,6 +172,10 @@ def _append_preserved_inline(node, preserved) -> None:
 
 _PRESERVED_KINDS = {"preserved_xml", "drawing"}
 
+
+_REFERENCE_TOKENS = {
+    "comment_ref": ("commentReference", "comment_id"),
+}
 
 _FIELD_CHAR_TYPES = {"field_begin": "begin", "field_separate": "separate", "field_end": "end"}
 _FIELD_TOKEN_KINDS = {*_FIELD_CHAR_TYPES, "field_instruction"}
@@ -987,6 +996,28 @@ class PureDocxRenderer:
                 note.append(_block_element(block, []))
         return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
 
+    def _comments_part_xml(self, model: DocumentModel) -> bytes:
+        """Rebuild word/comments.xml from the model.
+
+        Author, date and initials come back because they are how Word
+        attributes a comment; a comment whose author is gone reads as somebody
+        else's remark.
+        """
+        root = _w("comments")
+        initials = model.extras.get("comment_initials") or {}
+        for comment_id, comment in sorted(model.comments.items(), key=lambda item: item[0]):
+            node = etree.SubElement(root, f"{W}comment")
+            _set_w(node, "id", str(comment_id))
+            if comment.author:
+                _set_w(node, "author", comment.author)
+            if initials.get(comment_id):
+                _set_w(node, "initials", initials[comment_id])
+            if comment.date:
+                _set_w(node, "date", comment.date)
+            for block in comment.blocks:
+                node.append(_block_element(block, []))
+        return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
+
     def _install_notes_headers(self, model: DocumentModel) -> None:
         assert self._package is not None
         for kind, collection, content_type, rel_type in (
@@ -1008,6 +1039,15 @@ class PureDocxRenderer:
                         message=f"Multiple {kind} parts were reconstructed, but the pure fallback maps only the first as each section's default {kind}",
                         affects_status=True,
                     ))
+
+        if model.comments:
+            self._package.install_structured_part(
+                "word/comments.xml",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments",
+                "comments.xml",
+                self._comments_part_xml(model),
+            )
 
         for kind, notes, content_type, rel_type in (
             ("footnote", model.footnotes, "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes"),

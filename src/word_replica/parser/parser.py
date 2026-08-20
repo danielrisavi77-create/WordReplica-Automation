@@ -322,6 +322,12 @@ def parse_run(node, ids: ElementIdFactory, path: str, package: DocxPackage | Non
             note_id = _attr(child, "id")
             if note_id is not None:
                 content_tokens.append({"kind": "endnote_ref", "note_id": note_id})
+        elif local == "commentReference":
+            # Without this the comment part can be restored but nothing points
+            # at it, and a comment no reader anchors is invisible in Word.
+            comment_id = _attr(child, "id")
+            if comment_id is not None:
+                content_tokens.append({"kind": "comment_ref", "comment_id": comment_id})
         elif local == "fldChar":
             field_type = _attr(child, "fldCharType")
             if field_type in {"begin", "separate", "end"}:
@@ -763,12 +769,16 @@ class DocxParser:
                     comment_id = comment_node.get(f"{{{W_NS}}}id")
                     if comment_id is None:
                         continue
-                    model.comments[comment_id] = Comment(
+                    comment = Comment(
                         comment_id,
                         comment_node.get(f"{{{W_NS}}}author"),
                         comment_node.get(f"{{{W_NS}}}date"),
                         parse_blocks(comment_node, ids, f"comment/{comment_id}", package),
                     )
+                    initials = comment_node.get(f"{{{W_NS}}}initials")
+                    if initials:
+                        model.extras.setdefault("comment_initials", {})[comment_id] = initials
+                    model.comments[comment_id] = comment
 
             tracked_changes = False
             if "word/settings.xml" in package.parts:
