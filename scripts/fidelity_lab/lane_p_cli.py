@@ -40,6 +40,7 @@ from word_replica.domain.enums import (
     VisibilityMode,
 )
 from word_replica.qa.golden_audit import build_model_gates
+from word_replica.lab.word_probe import RepairOutcome, lock_is_held, probe_repair
 from word_replica.qa.preservation import build_preservation_gate
 
 MODEL_GATES = tuple(f"G{index}" for index in range(8))
@@ -53,6 +54,7 @@ class Outcome:
     g10_pass: bool | None = None
     first_model_failure: str | None = None
     g10_divergence: str | None = None
+    repair: str | None = None
     error: str | None = None
 
     @property
@@ -71,7 +73,7 @@ def _rebuild_options() -> RebuildOptions:
     )
 
 
-def _evaluate(source: Path, service, options) -> Outcome:
+def _evaluate(source: Path, service, options, *, with_word: bool = False) -> Outcome:
     from word_replica.parser.parser import DocxParser
 
     ref = source.name
@@ -111,9 +113,13 @@ def _evaluate(source: Path, service, options) -> Outcome:
     if not g10.passed and g10.first_divergence:
         divergence = str(g10.first_divergence.get("path", ""))[:120]
 
+    # Word is the slow, serial part, so it is opt-in and runs last: a document
+    # that already failed to rebuild has nothing to open.
+    repair = probe_repair(source, output).value if with_word else None
+
     return Outcome(
         ref, ok=True, model_pass=model_pass, g10_pass=g10.passed,
-        first_model_failure=first_failure, g10_divergence=divergence,
+        first_model_failure=first_failure, g10_divergence=divergence, repair=repair,
     )
 
 
@@ -152,9 +158,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source", default=None, help="restrict to one corpus source")
     parser.add_argument("--order", choices=sorted(_ORDERINGS), default="spread")
     parser.add_argument("--json", type=Path, default=None)
+    parser.add_argument("--word", action="store_true",
+                        help="also ask real Word whether it repairs each rebuild (slow, serial)")
     args = parser.parse_args(argv)
 
     from word_replica.services.rebuild import RebuildService
+
+    if args.word and lock_is_held():
+        # AGENTS.md: one active Golden Word run at a time, machine-wide. The lab
+        # always gives way; RUN_GOLDEN_CODEX.ps1 must never wait on it.
+        raise SystemExit("a Golden Word run holds state/golden_run.lock; yielding")
 
     picks = _pick(args.db, args.limit, args.source, args.order)
     if not picks:
@@ -172,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
             outcomes.append(Outcome(source_ref, ok=False, error="document not on disk"))
             continue
         try:
-            outcomes.append(_evaluate(path, service, options))
+            outcomes.append(_evaluate(path, service, options, with_word=args.word))
         except Exception:
             outcomes.append(Outcome(source_ref, ok=False, error=traceback.format_exc(limit=1).strip()))
         if index % 25 == 0:
@@ -206,6 +219,20 @@ def main(argv: list[str] | None = None) -> int:
         for outcome in false_passes[:10]:
             print(f"  {outcome.source_ref:<52} {outcome.g10_divergence}")
 
+    probed = [o for o in evaluated if o.repair]
+    if probed:
+        introduced = [o for o in probed if o.repair == RepairOutcome.REPAIR_INTRODUCED]
+        counts = collections.Counter(o.repair for o in probed)
+        print("\nDOES WORD REPAIR WHAT WE HAND BACK?")
+        for name, count in counts.most_common():
+            marker = "   <-- ours" if name == RepairOutcome.REPAIR_INTRODUCED else ""
+            print(f"  {name:<20} {count:>4}{marker}")
+        if introduced:
+            print("\n  Word repaired these reconstructions although it opened their")
+            print("  sources cleanly, so the damage is ours:")
+            for outcome in introduced[:10]:
+                print(f"    {outcome.source_ref}")
+
     if model_fail:
         print("\nFIRST FAILING MODEL GATE (documents G0-G7 already catches)")
         for gate, count in collections.Counter(o.first_model_failure for o in model_fail).most_common():
@@ -230,6 +257,10 @@ def main(argv: list[str] | None = None) -> int:
                     "both_pass": len(both_pass),
                     "model_fail": len(model_fail),
                     "false_pass": len(false_passes),
+                    "word_probed": len([o for o in evaluated if o.repair]),
+                    "repair_introduced": len(
+                        [o for o in evaluated if o.repair == RepairOutcome.REPAIR_INTRODUCED]
+                    ),
                     "false_pass_examples": [
                         {"document": o.source_ref, "divergence": o.g10_divergence}
                         for o in false_passes[:50]
