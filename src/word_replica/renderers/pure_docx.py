@@ -62,6 +62,41 @@ _RUN_PR_KEYS = (
 )
 
 
+HYPERLINK_REFERENCE_PREFIX = "wr-link:"
+
+
+def _append_runs_grouping_hyperlinks(node, runs) -> None:
+    """Emit runs, wrapping consecutive linked ones back in w:hyperlink.
+
+    The parser flattens w:hyperlink to reach the runs inside, so the grouping
+    has to be rebuilt from what each run remembers. Consecutive runs sharing a
+    group belong to one link; a run with no link ends it.
+
+    An external target cannot become a relationship id yet -- ids are allocated
+    once the whole body exists -- so it goes out as a placeholder and is
+    resolved with the rest.
+    """
+    current = None
+    container = node
+    for run in runs:
+        link = run.properties.get("hyperlink") or None
+        key = link.get("group") if link else None
+        if link is None or key != current:
+            current = key
+            container = node
+            if link is not None:
+                container = etree.SubElement(node, f"{W}hyperlink")
+                if link.get("anchor"):
+                    _set_w(container, "anchor", link["anchor"])
+                if link.get("tooltip"):
+                    _set_w(container, "tooltip", link["tooltip"])
+                if link.get("target"):
+                    container.set(
+                        f"{{{R_NS}}}id", HYPERLINK_REFERENCE_PREFIX + link["target"]
+                    )
+        container.append(_run_element(run))
+
+
 def _run_element(run: Run):
     node = _w("r")
     r_pr = None
@@ -289,8 +324,7 @@ def _paragraph_element(paragraph: Paragraph, sections: list[Section]):
         section_index = props.get("section_index")
         if isinstance(section_index, int) and 0 <= section_index < len(sections):
             p_pr.append(_section_element(sections[section_index]))
-    for run in paragraph.runs:
-        p.append(_run_element(run))
+    _append_runs_grouping_hyperlinks(p, paragraph.runs)
     return p
 
 
@@ -434,6 +468,7 @@ def _relative_to_word(part_name: str) -> str:
 
 
 IMAGE_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+HYPERLINK_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
 
 _STORY_PART_PREFIXES = ("word/document.xml", "word/header", "word/footer",
                         "word/footnotes.xml", "word/endnotes.xml", "word/comments.xml")
@@ -662,7 +697,20 @@ class MutableDocxPackage:
                 if not isinstance(element.tag, str):
                     continue
                 for name, value in list(element.attrib.items()):
-                    if not value.startswith(ASSET_REFERENCE_PREFIX):
+                    if not value.startswith((ASSET_REFERENCE_PREFIX, HYPERLINK_REFERENCE_PREFIX)):
+                        continue
+                    if value.startswith(HYPERLINK_REFERENCE_PREFIX):
+                        # An external link needs no part, only a relationship.
+                        changed = True
+                        element.set(
+                            name,
+                            self._ensure_relationship(
+                                _rels_part_for(part_name),
+                                HYPERLINK_REL_TYPE,
+                                value[len(HYPERLINK_REFERENCE_PREFIX):],
+                                external=True,
+                            ),
+                        )
                         continue
                     rel_type, _, target = value[len(ASSET_REFERENCE_PREFIX):].partition("|")
                     if not target:  # written before the type was recorded

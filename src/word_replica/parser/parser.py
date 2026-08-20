@@ -397,6 +397,30 @@ def parse_run(node, ids: ElementIdFactory, path: str, package: DocxPackage | Non
     )
 
 
+def _hyperlink_properties(node, package: DocxPackage | None) -> dict[str, Any]:
+    """Where a hyperlink points, in whichever of the two ways it can.
+
+    An external link carries an r:id resolved through the owning part's
+    relationships; an internal one carries only a w:anchor naming a bookmark,
+    with no relationship at all.
+    """
+    anchor = node.get(f"{{{W_NS}}}anchor")
+    rel_id = node.get(f"{{{_R_NS}}}id")
+    target = None
+    if rel_id and package is not None:
+        try:
+            relationship = package.relationships(_OWNER_PART.get()).get(rel_id)
+        except Exception:
+            relationship = None
+        if relationship is not None:
+            target = relationship.target
+    return {
+        "target": target,
+        "anchor": anchor,
+        "tooltip": node.get(f"{{{W_NS}}}tooltip"),
+    }
+
+
 def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage | None = None) -> Paragraph:
     p_pr = node.find("w:pPr", namespaces=NS)
     style = p_pr.find("w:pStyle", namespaces=NS) if p_pr is not None else None
@@ -455,15 +479,22 @@ def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage
             runs.append(parse_run(child, ids, f"{path}/run/{r_index}", package))
             r_index += 1
         elif local in {"ins", "moveTo", "fldSimple", "hyperlink"}:
+            # Unwrapping reaches the runs inside, which is what the model
+            # represents -- but a hyperlink is more than the words it wraps.
+            # Without recording it here the link text survives and the link
+            # does not, and G0 sees nothing wrong because the text is exactly
+            # what does survive.
+            link = _hyperlink_properties(child, package) if local == "hyperlink" else None
             for nested_index, nested_run in enumerate(child.findall(".//w:r", namespaces=NS)):
-                runs.append(
-                    parse_run(
-                        nested_run,
-                        ids,
-                        f"{path}/{local}/{child_index}/run/{nested_index}",
-                        package,
-                    )
+                run = parse_run(
+                    nested_run,
+                    ids,
+                    f"{path}/{local}/{child_index}/run/{nested_index}",
+                    package,
                 )
+                if link is not None:
+                    run.properties["hyperlink"] = {**link, "group": child_index}
+                runs.append(run)
                 r_index += 1
         # Deleted/move-from revision text is preserved as evidence but never
         # promoted into visible-final Run.text.
