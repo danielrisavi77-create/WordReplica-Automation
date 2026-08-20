@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from typing import Any
 import os
 import shutil
 import tempfile
@@ -328,33 +329,139 @@ def _paragraph_element(paragraph: Paragraph, sections: list[Section]):
     return p
 
 
+def _edge_element(parent, tag: str, edges: dict, keys: tuple[str, ...]) -> None:
+    """Write a container of per-edge values (borders, cell margins).
+
+    Edges are written in the schema's own order rather than the dictionary's,
+    for the same reason the property sequence is pinned below.
+    """
+    if not isinstance(edges, dict) or not edges:
+        return
+    container = etree.SubElement(parent, f"{W}{tag}")
+    for edge in ("top", "start", "left", "bottom", "end", "right", "insideH", "insideV"):
+        value = edges.get(edge)
+        if not isinstance(value, dict):
+            continue
+        node = etree.SubElement(container, f"{W}{edge}")
+        for key in keys:
+            if value.get(key) is not None:
+                _set_w(node, key, value[key])
+
+
+# w:tblPr has a required child sequence and Word repairs a document whose
+# properties arrive out of order, so the order is pinned here rather than
+# following whatever order the model happens to hold them in.
+_TABLE_PROPERTY_ORDER = ("tblStyle", "tblW", "jc", "tblBorders", "shd", "tblLayout", "tblCellMar")
+_BORDER_KEYS = ("val", "sz", "space", "color")
+_MARGIN_KEYS = ("w", "type")
+
+
+def _table_properties_element(properties: dict):
+    written: dict[str, Any] = {}
+    holder = _w("tblPr")
+
+    if properties.get("style_id") is not None:
+        node = etree.Element(f"{W}tblStyle")
+        _set_w(node, "val", properties["style_id"])
+        written["tblStyle"] = node
+    if properties.get("width") is not None:
+        node = etree.Element(f"{W}tblW")
+        _set_w(node, "w", properties.get("width"))
+        _set_w(node, "type", properties.get("width_type") or "dxa")
+        written["tblW"] = node
+    if properties.get("alignment") is not None:
+        node = etree.Element(f"{W}jc")
+        _set_w(node, "val", properties["alignment"])
+        written["jc"] = node
+    if properties.get("borders"):
+        _edge_element(holder, "tblBorders", properties["borders"], _BORDER_KEYS)
+        written["tblBorders"] = holder.find(f"{W}tblBorders")
+    if properties.get("shading_fill") is not None:
+        node = etree.Element(f"{W}shd")
+        _set_w(node, "fill", properties["shading_fill"])
+        written["shd"] = node
+    if properties.get("layout") is not None:
+        node = etree.Element(f"{W}tblLayout")
+        _set_w(node, "type", properties["layout"])
+        written["tblLayout"] = node
+    if properties.get("cell_margins"):
+        _edge_element(holder, "tblCellMar", properties["cell_margins"], _MARGIN_KEYS)
+        written["tblCellMar"] = holder.find(f"{W}tblCellMar")
+
+    tbl_pr = _w("tblPr")
+    for name in _TABLE_PROPERTY_ORDER:
+        node = written.get(name)
+        if node is not None:
+            tbl_pr.append(node)
+    return tbl_pr
+
+
+# w:tcPr has its own required sequence.
+_CELL_PROPERTY_ORDER = ("tcW", "gridSpan", "vMerge", "tcBorders", "shd", "tcMar", "vAlign")
+
+
+def _cell_properties_element(properties: dict):
+    written: dict[str, Any] = {}
+    holder = _w("tcPr")
+
+    if properties.get("width") is not None:
+        node = etree.Element(f"{W}tcW")
+        _set_w(node, "w", properties.get("width"))
+        _set_w(node, "type", properties.get("width_type") or "dxa")
+        written["tcW"] = node
+    span = properties.get("grid_span", 1)
+    if span and int(span) > 1:
+        node = etree.Element(f"{W}gridSpan")
+        _set_w(node, "val", span)
+        written["gridSpan"] = node
+    if properties.get("v_merge") is not None:
+        node = etree.Element(f"{W}vMerge")
+        if properties.get("v_merge") != "continue":
+            _set_w(node, "val", properties.get("v_merge"))
+        written["vMerge"] = node
+    if properties.get("borders"):
+        _edge_element(holder, "tcBorders", properties["borders"], _BORDER_KEYS)
+        written["tcBorders"] = holder.find(f"{W}tcBorders")
+    if properties.get("shading_fill") is not None:
+        node = etree.Element(f"{W}shd")
+        _set_w(node, "fill", properties["shading_fill"])
+        written["shd"] = node
+    if properties.get("margins"):
+        _edge_element(holder, "tcMar", properties["margins"], _MARGIN_KEYS)
+        written["tcMar"] = holder.find(f"{W}tcMar")
+    if properties.get("v_align") is not None:
+        node = etree.Element(f"{W}vAlign")
+        _set_w(node, "val", properties["v_align"])
+        written["vAlign"] = node
+
+    tc_pr = _w("tcPr")
+    for name in _CELL_PROPERTY_ORDER:
+        node = written.get(name)
+        if node is not None:
+            tc_pr.append(node)
+    return tc_pr
+
+
 def _table_element(table: Table, sections: list[Section]):
     tbl = _w("tbl")
-    if table.properties:
-        tbl_pr = etree.SubElement(tbl, f"{W}tblPr")
-        if table.properties.get("width") is not None:
-            tbl_w = etree.SubElement(tbl_pr, f"{W}tblW")
-            _set_w(tbl_w, "w", table.properties.get("width"))
-            _set_w(tbl_w, "type", table.properties.get("width_type") or "dxa")
-        if table.properties.get("layout") is not None:
-            layout = etree.SubElement(tbl_pr, f"{W}tblLayout")
-            _set_w(layout, "type", table.properties.get("layout"))
-        if table.properties.get("shading_fill") is not None:
-            shd = etree.SubElement(tbl_pr, f"{W}shd")
-            _set_w(shd, "fill", table.properties.get("shading_fill"))
+    tbl_pr = _table_properties_element(table.properties or {})
+    if len(tbl_pr):
+        tbl.append(tbl_pr)
+
+    # Without w:tblGrid Word has no column widths to lay the table out from and
+    # falls back to its own guess, so a table authored with a narrow label
+    # column and a wide value column comes back evenly split.
+    widths = (table.properties or {}).get("grid_column_widths") or []
+    if widths:
+        grid = etree.SubElement(tbl, f"{W}tblGrid")
+        for width in widths:
+            _set_w(etree.SubElement(grid, f"{W}gridCol"), "w", width)
+
     for row in table.rows:
         tr = etree.SubElement(tbl, f"{W}tr")
         for cell in row.cells:
             tc = etree.SubElement(tr, f"{W}tc")
-            tc_pr = etree.SubElement(tc, f"{W}tcPr")
-            span = cell.properties.get("grid_span", 1)
-            if span and int(span) > 1:
-                grid_span = etree.SubElement(tc_pr, f"{W}gridSpan")
-                _set_w(grid_span, "val", span)
-            if cell.properties.get("v_merge") is not None:
-                v_merge = etree.SubElement(tc_pr, f"{W}vMerge")
-                if cell.properties.get("v_merge") != "continue":
-                    _set_w(v_merge, "val", cell.properties.get("v_merge"))
+            tc.append(_cell_properties_element(cell.properties or {}))
             for block in cell.blocks:
                 tc.append(_block_element(block, sections))
             if not cell.blocks:
