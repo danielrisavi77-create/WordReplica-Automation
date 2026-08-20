@@ -98,7 +98,12 @@ def _evaluate(source: Path, service, options) -> Outcome:
         # source's custom document properties unless they are allow-listed.
         # That is intended behaviour, so it is declared rather than counted as
         # a silent loss.
-        g10 = build_preservation_gate(source, output, custom_properties_dropped_by_policy=True)
+        g10 = build_preservation_gate(
+            source,
+            output,
+            custom_properties_dropped_by_policy=True,
+            application_properties_rewritten_by_policy=True,
+        )
     except Exception as exc:
         return Outcome(ref, ok=False, model_pass=model_pass, error=f"G10 raised {type(exc).__name__}: {exc}")
 

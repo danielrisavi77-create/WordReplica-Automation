@@ -506,3 +506,66 @@ def test_an_added_relationship_part_alone_does_not_fail_the_gate(tmp_path, sourc
     output = _write(tmp_path / "output.docx", parts)
 
     assert build_preservation_gate(source, output).passed is True
+
+
+# --- application properties describe the new document, not the old ------------
+
+_APP_CT = (
+    '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-'
+    'officedocument.extended-properties+xml"/>'
+)
+
+
+def _with_app_properties(parts: dict[str, bytes], *, company: str = "Acme", pages: str = "3") -> dict[str, bytes]:
+    parts = dict(parts)
+    parts["docProps/app.xml"] = (
+        '<?xml version="1.0"?><Properties '
+        'xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
+        'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+        f"<Company>{company}</Company><Pages>{pages}</Pages>"
+        '<TitlesOfParts><vt:vector size="1" baseType="lpstr"><vt:lpstr>doc</vt:lpstr></vt:vector></TitlesOfParts>'
+        "</Properties>"
+    ).encode("utf-8")
+    parts["[Content_Types].xml"] = parts["[Content_Types].xml"].replace(
+        b"</Types>", _APP_CT.encode("utf-8") + b"</Types>"
+    )
+    return parts
+
+
+def test_rewritten_application_properties_can_be_declared(tmp_path):
+    # docProps/app.xml holds statistics about the document that now exists --
+    # page and word counts, editing time, the writing application and its
+    # version. Those cannot match the source by construction, and MetadataMode
+    # governs what is carried across, so a caller can declare it.
+    src = _write(tmp_path / "source.docx", _with_app_properties(_package(), pages="3"))
+    output = _write(tmp_path / "output.docx", _with_app_properties(_package(), pages="97"))
+
+    assert build_preservation_gate(src, output, application_properties_rewritten_by_policy=True).passed is True
+
+
+def test_an_output_that_gained_application_properties_can_be_declared(tmp_path, source):
+    output = _write(tmp_path / "output.docx", _with_app_properties(_package()))
+
+    assert build_preservation_gate(source, output).passed is False
+    assert build_preservation_gate(
+        source, output, application_properties_rewritten_by_policy=True
+    ).passed is True
+
+
+def test_declaring_application_properties_does_not_excuse_other_losses(tmp_path):
+    src = _write(tmp_path / "source.docx", _with_app_properties(_package()))
+    output = _write(tmp_path / "output.docx", _with_app_properties(_package(comments_ex=False)))
+
+    assert build_preservation_gate(
+        src, output, application_properties_rewritten_by_policy=True
+    ).passed is False
+
+
+def test_the_two_policy_declarations_are_independent(tmp_path):
+    # Declaring one must not quietly enable the other.
+    src = _write(tmp_path / "source.docx", _with_custom_properties(_package(), "ContractNumber"))
+    output = _write(tmp_path / "output.docx", _package())
+
+    assert build_preservation_gate(
+        src, output, application_properties_rewritten_by_policy=True
+    ).passed is False

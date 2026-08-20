@@ -326,6 +326,9 @@ def g10_projection(
     }
 
 
+_APP_PROPS_PART = "docProps/app.xml"
+
+
 _CUSTOM_PROPS_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument.custom-properties+xml"
 )
@@ -337,6 +340,7 @@ def build_preservation_gate(
     *,
     limits: PackageLimits = DEFAULT_LIMITS,
     custom_properties_dropped_by_policy: bool = False,
+    application_properties_rewritten_by_policy: bool = False,
 ) -> GateResult:
     """Compare two packages at the level the document model cannot see.
 
@@ -349,16 +353,31 @@ def build_preservation_gate(
     The carve-out is one-directional and narrow: it explains a *lost* custom
     properties part and nothing else. An output that invented custom properties,
     or lost anything else, still fails.
+
+    ``application_properties_rewritten_by_policy`` covers ``docProps/app.xml``,
+    which holds statistics about the document that now exists -- page and word
+    counts, total editing time, the writing application and its version. Those
+    cannot match the source by construction, and MetadataMode already governs
+    what descriptive metadata is carried across. Unlike the custom-properties
+    rule this applies in both directions, because the renderer writes its own
+    app.xml whether or not the source had one.
+
+    The two declarations are independent; neither enables the other.
     """
     from word_replica.qa.policy import compare_projection
 
     actual = g10_projection(output, limits=limits)
-    ignore: frozenset[str] = frozenset()
+    ignore: set[str] = set()
+    if application_properties_rewritten_by_policy:
+        ignore.add(_APP_PROPS_PART)
     if custom_properties_dropped_by_policy and _CUSTOM_PROPS_CONTENT_TYPE not in actual.get("part_kinds", {}):
-        # Project the source as if it had never had the part, so the comparison
-        # is exact rather than a subtraction from a finished projection.
-        ignore = frozenset({_CUSTOM_PROPS_PART})
-    expected = g10_projection(source, limits=limits, ignore_parts=ignore)
+        ignore.add(_CUSTOM_PROPS_PART)
+    if ignore:
+        # Project both sides as if the declared parts had never been there, so
+        # the comparison stays exact rather than becoming a subtraction from a
+        # finished projection.
+        actual = g10_projection(output, limits=limits, ignore_parts=frozenset(ignore))
+    expected = g10_projection(source, limits=limits, ignore_parts=frozenset(ignore))
     findings = compare_projection("G10", expected, actual)
 
     if not findings:
