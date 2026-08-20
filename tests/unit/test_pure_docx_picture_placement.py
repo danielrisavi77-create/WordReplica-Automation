@@ -164,3 +164,76 @@ def test_a_document_with_no_pictures_gains_none(tmp_path, corpus_dir):
 
     assert not _document(output).findall(f".//{{{W}}}drawing")
     assert not _media(output)
+
+
+# --- pictures that live outside the main document part ------------------------
+
+def test_a_picture_inside_a_comment_is_not_orphaned(tmp_path, corpus_dir):
+    """A relationship id means different things in different parts.
+
+    The capture resolved every r: reference against word/document.xml.rels, so
+    a picture inside a comment or a header -- whose id lives in that part's own
+    .rels -- could not be resolved and the fragment was refused. The media part
+    still travelled, leaving an image in the package that nothing displayed.
+    """
+    from zipfile import ZIP_DEFLATED
+    from word_replica.qa.preservation import g10_projection
+
+    base = corpus_dir / "10_comments_tracked_changes.docx"
+    with ZipFile(base) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+
+    comments = members["word/comments.xml"].decode("utf-8")
+    drawing = (
+        '<w:r><w:drawing>'
+        '<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">'
+        '<wp:extent cx="914400" cy="914400"/>'
+        '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        '<pic:blipFill><a:blip '
+        'r:embed="rIdPic1" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>'
+        "</pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"
+    )
+    assert "</w:p></w:comment>" in comments, comments[:200]
+    members["word/comments.xml"] = comments.replace(
+        "</w:p></w:comment>", f"{drawing}</w:p></w:comment>", 1
+    ).encode("utf-8")
+
+    members["word/media/commentimage.png"] = b"\x89PNG\r\n\x1a\n" + b"c" * 40
+    members["word/_rels/comments.xml.rels"] = (
+        b'<?xml version="1.0"?><Relationships '
+        b'xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rIdPic1" Target="media/commentimage.png" '
+        b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"/>'
+        b"</Relationships>"
+    )
+    members["[Content_Types].xml"] = members["[Content_Types].xml"].replace(
+        b"</Types>", b'<Default Extension="png" ContentType="image/png"/></Types>'
+    )
+    enriched = tmp_path / "commentpic.docx"
+    with ZipFile(enriched, "w", ZIP_DEFLATED) as out:
+        for name, data in members.items():
+            out.writestr(name, data)
+
+    assert g10_projection(enriched)["orphan_parts"] == [], "the fixture itself must be sound"
+
+    projection = g10_projection(_rebuild(tmp_path, enriched, "-commentpic"))
+
+    assert "image/png" not in projection["orphan_parts"]
+    assert projection["dangling_relationships"] == []
+
+
+def test_an_ambiguous_relationship_id_is_refused(tmp_path):
+    # The same id can address different parts in different .rels files.
+    # Resolving it across all of them is only safe when they agree; where they
+    # disagree the fragment must be refused rather than guessed at.
+    from word_replica.parser.parser import _resolve_reference_target
+
+    agreeing = {"rId5": {"word/media/image1.png"}}
+    conflicting = {"rId5": {"word/media/image1.png", "word/media/image9.png"}}
+
+    assert _resolve_reference_target("rId5", agreeing) == "word/media/image1.png"
+    assert _resolve_reference_target("rId5", conflicting) is None
+    assert _resolve_reference_target("rId9", agreeing) is None

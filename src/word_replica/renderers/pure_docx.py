@@ -897,6 +897,7 @@ class PureDocxRenderer:
             ),
             ("assets", lambda: self._install_assets(model)),
             ("notes_headers", lambda: self._install_notes_headers(model)),
+            ("references", lambda: self._resolve_references(model)),
             ("metadata", lambda: self._package.set_metadata(model.extras.get("metadata_policy", {}))),
         ]
         try:
@@ -937,23 +938,7 @@ class PureDocxRenderer:
         assert self._package is not None
         for asset in model.assets.values():
             self._package.install_asset(asset.part_name, asset.bytes_data, asset.content_type)
-        # The body was written before the media existed, so its references are
-        # still placeholders naming the part they addressed.
-        for missing in self._package.resolve_asset_references():
-            self._package.warnings.append(WarningItem(
-                code="PURE_DOCX_ASSET_REFERENCE_UNRESOLVED",
-                message=f"A picture referenced {missing}, which is not in the rebuilt package",
-                affects_status=True,
-            ))
-        # The mirror case: media that arrived with the model but that nothing in
-        # the rebuilt body points at. Reported rather than shipped silently --
-        # the bytes would travel with the document while the picture is gone.
-        for orphan in self._package.unreferenced_parts("word/media/"):
-            self._package.warnings.append(WarningItem(
-                code="PURE_DOCX_ASSET_UNREFERENCED",
-                message=f"Media part {orphan} was retained but nothing in the document refers to it",
-                affects_status=True,
-            ))
+
         for part in model.preserved_parts.values():
             if part.relationship_type:
                 # A document-level attachment: part plus one relationship is the
@@ -1017,6 +1002,32 @@ class PureDocxRenderer:
             for block in comment.blocks:
                 node.append(_block_element(block, []))
         return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
+
+    def _resolve_references(self, model: DocumentModel) -> None:
+        """Turn placeholder asset references into relationship ids.
+
+        Runs after every story part exists, not just the body. Comments,
+        headers and notes are written in a later stage than the media is
+        installed, so resolving inside the asset stage left their placeholders
+        untouched and their pictures orphaned -- which is exactly what the
+        orphan check then reported.
+        """
+        assert self._package is not None
+        for missing in self._package.resolve_asset_references():
+            self._package.warnings.append(WarningItem(
+                code="PURE_DOCX_ASSET_REFERENCE_UNRESOLVED",
+                message=f"A picture referenced {missing}, which is not in the rebuilt package",
+                affects_status=True,
+            ))
+        # The mirror case: media that arrived with the model but that nothing in
+        # the rebuilt document points at. Reported rather than shipped silently
+        # -- the bytes would travel while the picture itself is gone.
+        for orphan in self._package.unreferenced_parts("word/media/"):
+            self._package.warnings.append(WarningItem(
+                code="PURE_DOCX_ASSET_UNREFERENCED",
+                message=f"Media part {orphan} was retained but nothing in the document refers to it",
+                affects_status=True,
+            ))
 
     def _install_notes_headers(self, model: DocumentModel) -> None:
         assert self._package is not None

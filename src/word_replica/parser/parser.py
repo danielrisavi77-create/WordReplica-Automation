@@ -211,6 +211,61 @@ def _is_preservable_inline(child, local: str) -> bool:
     return local in _PRESERVABLE_INLINE
 
 
+def _reference_targets(package: DocxPackage | None) -> dict[str, set[str]]:
+    """Relationship id -> every part it addresses, across the whole package.
+
+    A picture in a comment or a header has its relationship in that part's own
+    .rels, not the document's. Resolving against document.xml.rels alone meant
+    those fragments could not be resolved and were refused, while their media
+    still travelled -- leaving an image in the package that nothing displayed.
+    """
+    if package is None:
+        return {}
+    targets: dict[str, set[str]] = {}
+    for rels_part in [name for name in package.parts if name.endswith(".rels")]:
+        owner = rels_part.replace("/_rels/", "/").removesuffix(".rels")
+        try:
+            relationships = package.relationships(owner)
+        except Exception:
+            continue
+        for rel_id, rel in relationships.items():
+            if rel.target_mode == "External":
+                continue
+            targets.setdefault(rel_id, set()).add(_resolve_relative_target(owner, rel.target))
+    return targets
+
+
+def _resolve_relative_target(owner_part: str, target: str) -> str:
+    from pathlib import PurePosixPath
+
+    if target.startswith("/"):
+        candidate = target.lstrip("/")
+    else:
+        candidate = str(PurePosixPath(owner_part).parent / target)
+    resolved: list[str] = []
+    for piece in PurePosixPath(candidate).parts:
+        if piece == "..":
+            if resolved:
+                resolved.pop()
+        elif piece not in (".", ""):
+            resolved.append(piece)
+    return "/".join(resolved)
+
+
+def _resolve_reference_target(rel_id: str, targets: dict[str, set[str]]) -> str | None:
+    """The part an id addresses, or None when that cannot be settled.
+
+    The same id addresses different parts in different .rels files. Resolving
+    across all of them is only safe where they agree; where they disagree the
+    fragment is refused rather than guessed at, because a reference rewritten
+    to the wrong part is worse than a missing shape.
+    """
+    candidates = targets.get(rel_id)
+    if not candidates or len(candidates) != 1:
+        return None
+    return next(iter(candidates))
+
+
 def _capture_inline(child, package: DocxPackage | None) -> dict:
     """Serialize an inline fragment, resolving the parts its references address.
 
@@ -225,7 +280,7 @@ def _capture_inline(child, package: DocxPackage | None) -> dict:
     """
     from lxml import etree
 
-    relationships = package.relationships("word/document.xml") if package is not None else {}
+    known = _reference_targets(package)
     targets: dict[str, str] = {}
     for element in child.iter():
         if not isinstance(element.tag, str):
@@ -233,14 +288,14 @@ def _capture_inline(child, package: DocxPackage | None) -> dict:
         for name, value in element.attrib.items():
             if not name.startswith(f"{{{_R_NS}}}"):
                 continue
-            relationship = relationships.get(value)
-            if relationship is None or relationship.target_mode == "External":
+            resolved = _resolve_reference_target(value, known)
+            if resolved is None:
                 return {
                     "kind": "unsupported_inline",
                     "reason": "fragment carries a relationship reference that cannot be resolved",
                     "tag": local_name(child),
                 }
-            targets[value] = _resolve_document_target(relationship.target)
+            targets[value] = resolved
     return {
         "kind": "preserved_xml",
         "value": etree.tostring(child, encoding="unicode"),
