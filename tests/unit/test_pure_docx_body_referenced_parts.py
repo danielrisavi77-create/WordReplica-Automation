@@ -156,3 +156,89 @@ def test_a_document_without_one_gains_nothing(tmp_path):
 
     with ZipFile(_rebuild(tmp_path, path, "-plain")) as archive:
         assert not [n for n in archive.namelist() if n.startswith("word/embeddings/")]
+
+
+# --- a restored part can have dependents of its own ---------------------------
+
+CHART_REL = f"{REL}/chart"
+
+
+@pytest.fixture
+def chart_source(tmp_path):
+    """A chart, its style sidecars and the workbook it was built from.
+
+    A chart part is not self-contained: word/charts/_rels/chart1.xml.rels
+    points at chartstyle, chartcolorstyle and the embedded spreadsheet, and
+    those in turn are how Word renders it.
+    """
+    path = tmp_path / "chart.docx"
+    content_types = (
+        '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Default Extension="xlsx" ContentType="application/vnd.openxmlformats-officedocument'
+        '.spreadsheetml.sheet"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument'
+        '.wordprocessingml.document.main+xml"/>'
+        '<Override PartName="/word/charts/style1.xml" ContentType="application/vnd.ms-office.chartstyle+xml"/>'
+        "</Types>"
+    ).encode("utf-8")
+    document = (
+        '<?xml version="1.0"?><w:document '
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" '
+        f'xmlns:r="{REL}">'
+        "<w:body><w:p><w:r><w:drawing>"
+        '<c:chart r:id="rId4"/>'
+        "</w:drawing></w:r></w:p><w:sectPr/></w:body></w:document>"
+    ).encode("utf-8")
+    doc_rels = (
+        '<?xml version="1.0"?><Relationships '
+        'xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId4" Target="charts/chart1.xml" Type="{CHART_REL}"/>'
+        "</Relationships>"
+    ).encode("utf-8")
+    chart_rels = (
+        '<?xml version="1.0"?><Relationships '
+        'xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Target="style1.xml" Type="{REL}/chartStyle"/>'
+        f'<Relationship Id="rId2" Target="../embeddings/data1.xlsx" Type="{REL}/package"/>'
+        "</Relationships>"
+    ).encode("utf-8")
+    with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", ROOT_RELS)
+        archive.writestr("word/_rels/document.xml.rels", doc_rels)
+        archive.writestr("word/document.xml", document)
+        archive.writestr("word/charts/chart1.xml", b"<chart/>")
+        archive.writestr("word/charts/_rels/chart1.xml.rels", chart_rels)
+        archive.writestr("word/charts/style1.xml", b"<style/>")
+        archive.writestr("word/embeddings/data1.xlsx", b"PK workbook")
+    return path
+
+
+def test_the_chart_itself_comes_back(tmp_path, chart_source):
+    with ZipFile(_rebuild(tmp_path, chart_source, "-chart")) as archive:
+        assert archive.read("word/charts/chart1.xml") == b"<chart/>"
+
+
+def test_the_parts_the_chart_depends_on_come_with_it(tmp_path, chart_source):
+    # A chart without its style and its workbook is not the chart that was
+    # authored -- Word renders it from those.
+    with ZipFile(_rebuild(tmp_path, chart_source, "-deps")) as archive:
+        names = set(archive.namelist())
+
+    assert "word/charts/style1.xml" in names
+    assert "word/embeddings/data1.xlsx" in names
+
+
+def test_the_charts_own_relationships_travel_too(tmp_path, chart_source):
+    with ZipFile(_rebuild(tmp_path, chart_source, "-rels")) as archive:
+        assert "word/charts/_rels/chart1.xml.rels" in archive.namelist()
+
+
+def test_nothing_in_the_chart_chain_is_orphaned(tmp_path, chart_source):
+    projection = g10_projection(_rebuild(tmp_path, chart_source, "-orphan"))
+
+    assert projection["orphan_parts"] == []
+    assert projection["dangling_relationships"] == []

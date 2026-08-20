@@ -906,11 +906,15 @@ class DocxParser:
                 )
 
             for part in sorted(package.parts):
-                # Body-referenced parts are reached from inside document.xml, so
-                # a renderer that rebuilds the body cannot restore them without
-                # the reference. Captured anyway, so the loss can be reported.
-                if part.startswith(_BODY_REFERENCED_PREFIXES) and not part.endswith(".rels"):
-                    _preserve(part, None)
+                if not part.startswith(_BODY_REFERENCED_PREFIXES) or part.endswith(".rels"):
+                    continue
+                # A chart or diagram is not self-contained: its own .rels points
+                # at the style, colour-style and embedded workbook Word renders
+                # it from. Restoring the part without them leaves those in the
+                # package with nothing pointing at them.
+                _preserve(part, None)
+                for _target, sidecar_rels in _sidecars(package, part):
+                    _preserve(sidecar_rels, None, sidecar=True)
 
             for rel in package.relationships("word/document.xml").values():
                 if rel.target_mode == "External":
