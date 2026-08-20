@@ -195,54 +195,61 @@ def _compact(values: dict[str, Any]) -> dict[str, Any]:
 
 
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-_UNREPRESENTABLE_INLINE = {"AlternateContent", "pict", "object"}
+_PRESERVABLE_INLINE = {"AlternateContent", "pict", "object"}
+_IMAGE_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
 
 
-def _is_unrepresentable_inline(child, local: str) -> bool:
-    """Inline content with no representation in the document model.
+def _is_preservable_inline(child, local: str) -> bool:
+    """Inline content that must be carried verbatim rather than rebuilt.
 
-    A ``w:drawing`` holding a picture is modelled as a DrawingRef, so it is
-    excluded here -- preserving it raw as well would emit it twice. A drawing
-    with no picture in it (a group shape, a text box, a diagram) is not modelled
-    at all, and nor is VML or an embedded object.
+    A picture is modelled as a DrawingRef, but only its *bytes* and a few
+    measurements; the authored anchor geometry, wrapping, crop and effects live
+    only in the original XML. Rebuilding that by hand would keep whatever the
+    model happens to represent and drop the rest, so the fragment is preserved
+    and re-emitted. Shapes, VML and embedded objects are not modelled at all.
     """
-    if local in _UNREPRESENTABLE_INLINE:
-        return True
-    if local != "drawing":
-        return False
-    return not child.xpath(".//*[local-name()='blip']")
+    return local in _PRESERVABLE_INLINE
 
 
-def _capture_inline(child) -> dict[str, str]:
-    """Serialize an inline fragment, or record why it cannot be carried.
+def _capture_inline(child, package: DocxPackage | None) -> dict:
+    """Serialize an inline fragment, resolving the parts its references address.
 
-    Relationship ids are renumbered freely by any writer, so a fragment that
-    references one cannot be re-emitted verbatim: the id would point somewhere
-    else, or nowhere, and Word repairs such a document on open. Refusing is the
-    safer failure -- a missing shape is visible, a corrupted package is not.
+    A fragment carrying an ``r:`` attribute cannot simply be re-emitted:
+    relationship ids are renumbered by any writer, so a stale one points at the
+    wrong part or none at all, and Word repairs such a document on open.
 
-    Measured on the corpus before relying on it: every mc:AlternateContent block
-    sampled carried no relationship reference at all.
+    Where the id *can* be resolved -- the parser knows which part it addressed,
+    and the renderer owns the new package -- the target is recorded so the id
+    can be rewritten on the way out. Where it cannot, the fragment is refused;
+    a missing shape is a visible loss, a corrupted package is not.
     """
     from lxml import etree
 
+    relationships = package.relationships("word/document.xml") if package is not None else {}
+    targets: dict[str, str] = {}
     for element in child.iter():
         if not isinstance(element.tag, str):
             continue
-        if any(name.startswith(f"{{{_R_NS}}}") for name in element.attrib):
-            return {
-                "kind": "unsupported_inline",
-                "reason": "fragment carries a relationship reference and cannot be re-emitted safely",
-                "tag": local_name(child),
-            }
+        for name, value in element.attrib.items():
+            if not name.startswith(f"{{{_R_NS}}}"):
+                continue
+            relationship = relationships.get(value)
+            if relationship is None or relationship.target_mode == "External":
+                return {
+                    "kind": "unsupported_inline",
+                    "reason": "fragment carries a relationship reference that cannot be resolved",
+                    "tag": local_name(child),
+                }
+            targets[value] = _resolve_document_target(relationship.target)
     return {
         "kind": "preserved_xml",
         "value": etree.tostring(child, encoding="unicode"),
         "tag": local_name(child),
+        "rel_targets": targets,
     }
 
 
-def parse_run(node, ids: ElementIdFactory, path: str) -> Run:
+def parse_run(node, ids: ElementIdFactory, path: str, package: DocxPackage | None = None) -> Run:
     r_pr = node.find("w:rPr", namespaces=NS)
     r_fonts = r_pr.find("w:rFonts", namespaces=NS) if r_pr is not None else None
     size = r_pr.find("w:sz", namespaces=NS) if r_pr is not None else None
@@ -294,11 +301,19 @@ def parse_run(node, ids: ElementIdFactory, path: str) -> Run:
             break_types.append("line")
             content_tokens.append({"kind": "line_break"})
         elif local == "drawing":
+            # The kind stays "drawing" because the interactive executor
+            # dispatches on it and inserts the picture through Word's own
+            # object model. The verbatim fragment is added alongside, for the
+            # pure-docx renderer, which has to write the markup itself.
+            token = _capture_inline(child, package)
             blips = child.xpath(".//*[local-name()='blip']")
-            if blips:
-                relationship_id = blips[0].get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
-                if relationship_id:
-                    content_tokens.append({"kind": "drawing", "relationship_id": relationship_id})
+            relationship_id = (
+                blips[0].get(f"{{{_R_NS}}}embed") if blips else None
+            )
+            if relationship_id:
+                content_tokens.append({**token, "kind": "drawing", "relationship_id": relationship_id})
+            elif token["kind"] == "preserved_xml":
+                content_tokens.append(token)
         elif local == "footnoteReference":
             note_id = _attr(child, "id")
             if note_id is not None:
@@ -313,8 +328,8 @@ def parse_run(node, ids: ElementIdFactory, path: str) -> Run:
                 content_tokens.append({"kind": f"field_{field_type}"})
         elif local == "instrText":
             content_tokens.append({"kind": "field_instruction", "value": child.text or ""})
-        elif _is_unrepresentable_inline(child, local):
-            content_tokens.append(_capture_inline(child))
+        elif _is_preservable_inline(child, local):
+            content_tokens.append(_capture_inline(child, package))
     if break_types:
         properties["break_types"] = break_types
     if content_tokens:
@@ -382,7 +397,7 @@ def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage
         elif local == "bookmarkEnd":
             inline_markers.append({"kind": "bookmark_end", "run_index": r_index, "bookmark_id": _attr(child, "id")})
         elif local == "r":
-            runs.append(parse_run(child, ids, f"{path}/run/{r_index}"))
+            runs.append(parse_run(child, ids, f"{path}/run/{r_index}", package))
             r_index += 1
         elif local in {"ins", "moveTo", "fldSimple", "hyperlink"}:
             for nested_index, nested_run in enumerate(child.findall(".//w:r", namespaces=NS)):
@@ -391,6 +406,7 @@ def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage
                         nested_run,
                         ids,
                         f"{path}/{local}/{child_index}/run/{nested_index}",
+                        package,
                     )
                 )
                 r_index += 1

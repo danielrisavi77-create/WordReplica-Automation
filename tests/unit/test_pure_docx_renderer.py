@@ -111,7 +111,15 @@ def test_fresh_shell_uses_current_reconstruction_timestamp(tmp_path):
     assert props.total_editing_time == '0'
 
 
-def test_renderer_warns_when_image_bytes_exist_without_reconstructed_position(tmp_path):
+def test_renderer_warns_when_image_bytes_have_nothing_referring_to_them(tmp_path):
+    """Successor to the position-unavailable warning.
+
+    Picture positions are now reconstructed, so the old blanket warning no
+    longer describes reality. What still deserves reporting is the case this
+    test actually builds: media that arrived with the model while nothing in
+    the body refers to it. Those bytes would travel with the document as litter
+    while the picture itself is gone.
+    """
     from word_replica.domain.model import BinaryAsset
     model = DocumentModel(source_sha256='abc')
     model.assets['image-sha'] = BinaryAsset(
@@ -123,8 +131,8 @@ def test_renderer_warns_when_image_bytes_exist_without_reconstructed_position(tm
     )
     result = PureDocxRenderer().render(model, tmp_path / 'with-image.docx', context=None)
     codes = [warning.code for warning in result.warnings]
-    assert 'PURE_DOCX_ASSET_POSITION_UNAVAILABLE' in codes
-    assert any(w.affects_status for w in result.warnings if w.code == 'PURE_DOCX_ASSET_POSITION_UNAVAILABLE')
+    assert 'PURE_DOCX_ASSET_UNREFERENCED' in codes
+    assert any(w.affects_status for w in result.warnings if w.code == 'PURE_DOCX_ASSET_UNREFERENCED')
 
 
 def test_atomic_writer_closes_mkstemp_descriptor_before_unlink(monkeypatch, tmp_path):

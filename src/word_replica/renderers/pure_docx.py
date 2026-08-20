@@ -97,7 +97,9 @@ def _run_element(run: Run):
             _set_w(lang, "bidi", props.get("language_bidi"))
     content_tokens = props.get("content_tokens") or ()
     has_field_tokens = any(token.get("kind") in _FIELD_TOKEN_KINDS for token in content_tokens)
-    preserved = [token for token in content_tokens if token.get("kind") == "preserved_xml"]
+    # A drawing token carries both: "kind" tells the interactive executor what
+    # to do, "value" carries the markup this renderer has to write itself.
+    preserved = [token for token in content_tokens if token.get("value") and token.get("kind") in _PRESERVED_KINDS]
     if not run.text and not has_field_tokens and not preserved:
         return node
     buffer = ""
@@ -131,20 +133,39 @@ def _run_element(run: Run):
     return node
 
 
-def _append_preserved_inline(node, preserved) -> None:
-    """Re-emit inline fragments the model cannot represent.
+ASSET_REFERENCE_PREFIX = "wr-asset:"
 
-    Only fragments the parser judged safe to carry reach here: anything holding
-    a relationship id was refused at capture, because a renumbered id would
-    point at the wrong part or none at all.
+
+def _append_preserved_inline(node, preserved) -> None:
+    """Re-emit inline fragments the model cannot rebuild.
+
+    Relationship ids cannot be written yet: the media parts are installed in a
+    later stage, so no id exists here to point at. Each reference is therefore
+    replaced with the part name it addressed, marked by ASSET_REFERENCE_PREFIX,
+    and resolved to a real id once the assets are in the package.
+
+    A fragment whose reference the parser could not resolve never reaches here;
+    it was refused at capture.
     """
     for token in preserved:
         try:
-            node.append(etree.fromstring(token["value"]))
+            fragment = etree.fromstring(token["value"])
         except (etree.XMLSyntaxError, KeyError, TypeError):
             # A fragment that will not re-parse is dropped rather than allowed
             # to corrupt the package; G10 reports the resulting loss.
             continue
+        targets = token.get("rel_targets") or {}
+        if targets:
+            for element in fragment.iter():
+                if not isinstance(element.tag, str):
+                    continue
+                for name, value in list(element.attrib.items()):
+                    if name.startswith(f"{{{R_NS}}}") and value in targets:
+                        element.set(name, ASSET_REFERENCE_PREFIX + targets[value])
+        node.append(fragment)
+
+
+_PRESERVED_KINDS = {"preserved_xml", "drawing"}
 
 
 _FIELD_CHAR_TYPES = {"field_begin": "begin", "field_separate": "separate", "field_end": "end"}
@@ -400,6 +421,27 @@ def _relative_to_word(part_name: str) -> str:
     return "../" + part_name
 
 
+IMAGE_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+
+_STORY_PART_PREFIXES = ("word/document.xml", "word/header", "word/footer",
+                        "word/footnotes.xml", "word/endnotes.xml", "word/comments.xml")
+
+
+def _is_story_part(name: str) -> bool:
+    return name.endswith(".xml") and name.startswith(_STORY_PART_PREFIXES)
+
+
+def _relative_to(part_name: str, owner_dir: str) -> str:
+    """Express a part name as a relationship target relative to owner_dir."""
+    owner = PurePosixPath(owner_dir)
+    target = PurePosixPath(part_name)
+    try:
+        return str(target.relative_to(owner))
+    except ValueError:
+        up = "../" * len(owner.parts)
+        return up + str(target)
+
+
 class MutableDocxPackage:
     def __init__(self, parts: dict[str, bytes]) -> None:
         self.parts = parts
@@ -568,6 +610,66 @@ class MutableDocxPackage:
             for node in root.findall(f"{W}trackRevisions"):
                 root.remove(node)
         self._write_xml("word/settings.xml", root)
+
+    def resolve_asset_references(self) -> list[str]:
+        """Turn placeholder asset references into real relationship ids.
+
+        Runs after the media parts are installed. Each story part is resolved
+        against its own .rels, so a picture in a header gets a header
+        relationship rather than a document one.
+
+        A reference whose part never made it into the package is stripped
+        rather than left pointing at nothing: Word repairs a package with a
+        broken reference, and a repaired document is a worse outcome than a
+        missing picture.
+        """
+        unresolved: list[str] = []
+        for part_name in [name for name in self.parts if _is_story_part(name)]:
+            try:
+                root = self._xml(part_name)
+            except etree.XMLSyntaxError:
+                continue
+            changed = False
+            for element in root.iter():
+                if not isinstance(element.tag, str):
+                    continue
+                for name, value in list(element.attrib.items()):
+                    if not value.startswith(ASSET_REFERENCE_PREFIX):
+                        continue
+                    target = value[len(ASSET_REFERENCE_PREFIX):]
+                    changed = True
+                    if target not in self.parts:
+                        unresolved.append(target)
+                        del element.attrib[name]
+                        continue
+                    rels_part = _rels_part_for(part_name)
+                    owner = PurePosixPath(part_name).parent
+                    relative = _relative_to(target, str(owner))
+                    element.set(
+                        name,
+                        self._ensure_relationship(rels_part, IMAGE_REL_TYPE, relative),
+                    )
+            if changed:
+                self._write_xml(part_name, root)
+        return unresolved
+
+    def unreferenced_parts(self, prefix: str) -> list[str]:
+        """Parts under ``prefix`` that no relationship reaches.
+
+        An OPC part nothing points at is litter, not content: the bytes ship
+        with the document while whatever displayed them is gone.
+        """
+        reached: set[str] = set()
+        for rels_name in [name for name in self.parts if name.endswith(".rels")]:
+            try:
+                root = self._xml(rels_name)
+            except etree.XMLSyntaxError:
+                continue
+            for node in root:
+                if node.get("TargetMode") == "External":
+                    continue
+                reached.add(_resolve_rel_target(rels_name, node.get("Target") or ""))
+        return sorted(name for name in self.parts if name.startswith(prefix) and name not in reached)
 
     def install_attachment(
         self,
@@ -791,10 +893,21 @@ class PureDocxRenderer:
         assert self._package is not None
         for asset in model.assets.values():
             self._package.install_asset(asset.part_name, asset.bytes_data, asset.content_type)
-        if model.assets:
+        # The body was written before the media existed, so its references are
+        # still placeholders naming the part they addressed.
+        for missing in self._package.resolve_asset_references():
             self._package.warnings.append(WarningItem(
-                code="PURE_DOCX_ASSET_POSITION_UNAVAILABLE",
-                message="Media bytes were retained, but exact inline/anchor positions are not yet represented in the canonical model",
+                code="PURE_DOCX_ASSET_REFERENCE_UNRESOLVED",
+                message=f"A picture referenced {missing}, which is not in the rebuilt package",
+                affects_status=True,
+            ))
+        # The mirror case: media that arrived with the model but that nothing in
+        # the rebuilt body points at. Reported rather than shipped silently --
+        # the bytes would travel with the document while the picture is gone.
+        for orphan in self._package.unreferenced_parts("word/media/"):
+            self._package.warnings.append(WarningItem(
+                code="PURE_DOCX_ASSET_UNREFERENCED",
+                message=f"Media part {orphan} was retained but nothing in the document refers to it",
                 affects_status=True,
             ))
         for part in model.preserved_parts.values():
