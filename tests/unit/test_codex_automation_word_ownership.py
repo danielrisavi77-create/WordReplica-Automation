@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts.codex_automation.word_process import OwnedWordProcess, read_owned_word_process, may_terminate_owned_word
 
 
@@ -65,3 +67,52 @@ def test_terminator_refuses_reused_pid_even_if_image_and_owner_match():
     )
     assert result == []
     assert killed == []
+
+
+# --- enumerating Word processes has to survive a busy machine -----------------
+
+def test_process_enumeration_retries_a_timeout_before_giving_up(monkeypatch):
+    """Regression: the full suite failed while the fidelity lab was driving Word.
+
+    word_process_pids shells out to tasklist with a 15 second budget, and the
+    controller calls it on every Word acquisition. Under load -- a lab run
+    opening documents while the suite runs -- that budget is not always enough,
+    and the timeout surfaced as an unrelated-looking test failure.
+    """
+    import subprocess
+    from word_replica.renderers import word_ownership
+
+    calls = []
+
+    def _flaky(cmd, **kwargs):
+        calls.append(kwargs.get("timeout"))
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        return subprocess.CompletedProcess(cmd, 0, stdout='"WINWORD.EXE","4242","Console"\n', stderr="")
+
+    monkeypatch.setattr(word_ownership.subprocess, "run", _flaky)
+    monkeypatch.setattr(word_ownership.os, "name", "nt")
+
+    assert word_ownership.word_process_pids() == {4242}
+    assert len(calls) == 2
+    assert calls[1] > calls[0], "the retry should get a longer budget than the attempt that timed out"
+
+
+def test_process_enumeration_raises_rather_than_reporting_no_word(monkeypatch):
+    """An empty set is a dangerous wrong answer.
+
+    Callers read it as "no Word is running", which is exactly the condition
+    under which ownership logic decides a process is safe to act on. If the
+    enumeration cannot answer it must say so, not answer "none".
+    """
+    import subprocess
+    from word_replica.renderers import word_ownership
+
+    def _always_timeout(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(word_ownership.subprocess, "run", _always_timeout)
+    monkeypatch.setattr(word_ownership.os, "name", "nt")
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        word_ownership.word_process_pids()

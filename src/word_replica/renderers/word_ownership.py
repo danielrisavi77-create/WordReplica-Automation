@@ -59,17 +59,37 @@ def _default_pid_resolver(hwnd: int) -> int:
     return int(pid)
 
 
+_TASKLIST_TIMEOUTS = (15, 45)
+
+
 def word_process_pids() -> set[int]:
-    """Return the currently running WINWORD.EXE process IDs."""
+    """Return the currently running WINWORD.EXE process IDs.
+
+    Retried once with a longer budget, because this is called on every Word
+    acquisition and a busy machine can push tasklist past fifteen seconds --
+    the fidelity lab driving Word alongside the test suite was enough to do it,
+    and the timeout surfaced as an unrelated-looking failure elsewhere.
+
+    A timeout that survives the retry is raised, never reported as an empty
+    set. Callers read an empty result as "no Word is running", which is exactly
+    the condition under which ownership logic decides a process is safe to act
+    on; answering "none" when the truth is "unknown" is the dangerous direction.
+    """
     if os.name != "nt":
         raise RuntimeError("Windows Word process discovery is unavailable")
-    result = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq WINWORD.EXE", "/FO", "CSV", "/NH"],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
+    for attempt, budget in enumerate(_TASKLIST_TIMEOUTS):
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq WINWORD.EXE", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=budget,
+                check=False,
+            )
+            break
+        except subprocess.TimeoutExpired:
+            if attempt + 1 == len(_TASKLIST_TIMEOUTS):
+                raise
     pids: set[int] = set()
     for row in csv.reader(io.StringIO(result.stdout)):
         if len(row) >= 2 and row[0].upper() == "WINWORD.EXE":
