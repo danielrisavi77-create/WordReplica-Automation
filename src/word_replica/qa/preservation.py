@@ -326,7 +326,11 @@ def g10_projection(
     }
 
 
-_APP_PROPS_PART = "docProps/app.xml"
+# Document properties the renderer authors rather than copies. app.xml holds
+# statistics about the document that now exists; core.xml carries the
+# "truthful lifecycle" stamp -- created, modified, revision -- that the product
+# documents and other tests assert. Neither can match a source by construction.
+_AUTHORED_PROPERTY_PARTS = ("docProps/app.xml", "docProps/core.xml")
 
 
 _CUSTOM_PROPS_CONTENT_TYPE = (
@@ -354,13 +358,16 @@ def build_preservation_gate(
     properties part and nothing else. An output that invented custom properties,
     or lost anything else, still fails.
 
-    ``application_properties_rewritten_by_policy`` covers ``docProps/app.xml``,
+    ``application_properties_rewritten_by_policy`` covers the document
+    properties the renderer authors rather than copies: ``docProps/app.xml``,
     which holds statistics about the document that now exists -- page and word
-    counts, total editing time, the writing application and its version. Those
-    cannot match the source by construction, and MetadataMode already governs
-    what descriptive metadata is carried across. Unlike the custom-properties
-    rule this applies in both directions, because the renderer writes its own
-    app.xml whether or not the source had one.
+    counts, total editing time, the writing application and its version -- and
+    ``docProps/core.xml``, which carries the truthful-lifecycle stamp of
+    created, modified and revision. Neither can match the source by
+    construction, and MetadataMode already governs what descriptive metadata is
+    carried across. Unlike the custom-properties rule this applies in both
+    directions, because the renderer writes both parts whether or not the
+    source had them.
 
     The two declarations are independent; neither enables the other.
     """
@@ -369,7 +376,7 @@ def build_preservation_gate(
     actual = g10_projection(output, limits=limits)
     ignore: set[str] = set()
     if application_properties_rewritten_by_policy:
-        ignore.add(_APP_PROPS_PART)
+        ignore.update(_AUTHORED_PROPERTY_PARTS)
     if custom_properties_dropped_by_policy and _CUSTOM_PROPS_CONTENT_TYPE not in actual.get("part_kinds", {}):
         ignore.add(_CUSTOM_PROPS_PART)
     if ignore:

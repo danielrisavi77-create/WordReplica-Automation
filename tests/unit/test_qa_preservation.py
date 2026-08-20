@@ -569,3 +569,26 @@ def test_the_two_policy_declarations_are_independent(tmp_path):
     assert build_preservation_gate(
         src, output, application_properties_rewritten_by_policy=True
     ).passed is False
+
+
+def test_core_properties_the_renderer_authors_are_covered_by_the_same_declaration(tmp_path, source):
+    # Every rebuild stamps created/modified/revision into docProps/core.xml --
+    # the "truthful lifecycle" the product documents and other tests assert. A
+    # source that had no core.xml therefore gains one, by design.
+    parts = _package()
+    del parts["docProps/core.xml"]
+    parts["_rels/.rels"] = (REL_HEAD + REL_DOC + "</Relationships>").encode("utf-8")
+    bare = _write(tmp_path / "bare.docx", parts)
+
+    assert build_preservation_gate(bare, source).passed is False
+    assert build_preservation_gate(
+        bare, source, application_properties_rewritten_by_policy=True
+    ).passed is True
+
+
+def test_the_declaration_still_does_not_excuse_a_lost_content_part(tmp_path, source):
+    output = _write(tmp_path / "output.docx", _package(custom_xml=False))
+
+    assert build_preservation_gate(
+        source, output, application_properties_rewritten_by_policy=True
+    ).passed is False
