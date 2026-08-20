@@ -271,80 +271,77 @@ corrected rather than the check loosened.
 
 | | at G10 landing | now |
 |---|---|---|
-| G0–G7 pass **and** G10 pass | 1 | **40** |
+| G0–G7 pass **and** G10 pass | 1 | **43** |
 | G0–G7 fail (already visible) | 41 | **14** |
-| G0–G7 pass but G10 fails | 18 | **6** |
+| G0–G7 pass but G10 fails | 18 | **3** |
 
-And the property no gate had ever asserted: across synthetic fixtures and real
-LibreOffice documents carrying shapes, VML and group shapes, **Word introduced
-zero repairs**. `scripts/fidelity_lab/lane_p_cli.py --word` now checks that on
-every run.
+And the property no gate had asserted before: across synthetic fixtures and real
+LibreOffice documents carrying shapes, VML and group shapes, **Word introduces
+no repairs**. `lane_p_cli --word` checks it on demand.
 
-### What the last rounds fixed
+### What was fixed, in the order the lab surfaced it
 
-**Template-owned parts.** The renderer never writes `theme1.xml`,
-`webSettings.xml` or `fontTable.xml`, so whatever the shell template brought
-stayed — and its `mc:Ignorable` declaration came with it, which is why a
+**Template debris.** The renderer starts from python-docx's default template, so
+every output carried its `customXml` store, thumbnail, `stylesWithEffects`,
+theme, `webSettings` and font table. Dropped at shell setup so the source's own
+can be restored in their place.
+
+**Attachments were never carried.** The parser captured three prefixes and the
+renderer installed none of them, so every rebuild shipped the *template's* theme
+and font table rather than the source's and lost the source's custom XML.
+
+**Optional parts.** `set_numbering`/`set_styles`/`set_settings` returned early
+with nothing to write, leaving the template's copy — which is how a
 markup-compatibility difference appeared on documents that declare none.
 
-**The attached template.** `word/_rels/settings.xml.rels` holds the template a
-document was authored from, usually the author's Normal.dotm. The renderer
-wrote `settings.xml` but never its `.rels`. Only *external* relationships are
-carried: an external target needs no part, so restoring it cannot leave
-anything dangling.
+**The attached template.** `word/_rels/settings.xml.rels` was never written.
+Only external relationships are carried; an external target needs no part, so
+restoring it cannot dangle.
+
+**Shapes and pictures.** Non-picture drawings had no model representation, and
+pictures were never emitted into the body at all — the bytes shipped while the
+`w:drawing` did not. Both are now preserved verbatim with relationship ids
+remapped, which keeps authored anchor geometry, wrapping, crop and rotation
+exactly where hand-built markup would keep only what the model represents.
 
 **Comments.** `word/comments.xml` was read into the model since v1 and never
-written back — the only mention of it in `pure_docx.py` was in an unrelated
-list. Every comment in every document went through the pure-docx path and came
-out gone, invisible to every gate: G0 compares body text, which a comment is
-not part of. Author, date and initials come back too, because they are how Word
-attributes a comment. Comment *ranges* are still not restored, so a comment
-anchors to a point rather than spanning its text.
+written back. Every comment in every document was lost, invisible to every gate.
 
-**Pictures outside the main part.** A relationship id means different things in
-different parts. Resolving every reference against `word/document.xml.rels`
-meant a picture inside a comment or a header could not be resolved and its
-fragment was refused, while the media still travelled — an image in the package
-that nothing displayed. Ids are now resolved across every `.rels`, and **only
-where they agree**; where two parts give the same id different targets the
-fragment is refused rather than guessed at.
+**Relationship ids are per-part.** Resolving every reference against
+`word/document.xml.rels` meant a picture inside a comment could not be resolved.
+Measured on a real document: `rId1` addressed `styles.xml` from the document and
+`media/image1.png` from the comments.
 
-That exposed a second bug behind it: placeholder references were resolved in
-the asset stage, but comments, headers and notes are written later, so their
-placeholders were never turned into ids. Resolution is now its own stage, after
-every story part exists.
+**Charts, diagrams and embedded objects.** Refused for a reason that had quietly
+stopped being true: verbatim fragments now carry the reference, so the part they
+point at can be installed. Their own `.rels` travels too, or the style and
+workbook Word renders a chart from ship unreferenced.
 
-### The orphan check earned its keep
+### The orphan check paid for itself twice
 
-Two documents came out with an image in the package that nothing displayed.
-Nothing else could see it — the relationship graph is intact in that state,
-there is no broken reference, just a part no reference reaches. The check added
-speculatively one round earlier is what found it.
+Added speculatively, it found the picture-in-a-comment case and then the
+chart-dependency case. Neither is visible any other way: the relationship graph
+is intact in both, there is no broken reference — just a part no reference
+reaches.
 
-### What remains, and why
+### What remains
 
-Six of sixty, and three of them are one deliberate decision:
+Three of sixty, each its own oddity rather than a class:
 
-| Document | Lost | |
-|---|---|---|
-| `fdo78284` | SmartArt diagram | body-referenced, refused by design |
-| `tdf75659` | charts, chartStyle | body-referenced, refused by design |
-| `mathtype` | OLE object | body-referenced, refused by design |
-| `testComment` | a picture | not yet diagnosed |
-| `tdf118699` | core properties | package carries two core-properties parts |
-| `tdf138465min` | — | differs outside the namespace set |
-
-A chart, diagram or embedded object is reached from inside the document body.
-Writing the part without the reference the rebuilt body no longer carries would
-produce an orphan, and G10 would then match on a document that is actually
-broken. A false signal is worse than a reported loss, so these stay reported.
+| Document | |
+|---|---|
+| `fdo78284` | one SmartArt sub-part still unreferenced; the diagram chain is deeper than the one level now followed |
+| `tdf118699` | the package carries two core-properties parts, and only the standard path is treated as authored metadata |
+| `testComment` | passes the projection directly; its Lane P entry predates the last fix |
 
 ## What is still not done
 
 No visual lane (G8/G9 pagination and pixel comparison over the corpus), no
-minimizer, no generators, no tier scheduler, and no docx-corpus ingest. Three
-occurrences of the non-element-node crash remain in `parser/tables.py`,
-deferred while that file carried uncommitted work from the autonomous harness.
+minimizer, no generators, no tier scheduler, and no docx-corpus ingest. Comment
+ranges are not restored, so a comment anchors to a point rather than spanning
+its text. Three occurrences of the non-element-node crash remain in
+`parser/tables.py`, deferred while that file carried uncommitted work from the
+autonomous harness.
 
 Golden #1 remains on ten gates. `G10_GATE_NAMES` exists for callers that opt in
 to eleven via `build_golden_report(gate_names=...)`.
