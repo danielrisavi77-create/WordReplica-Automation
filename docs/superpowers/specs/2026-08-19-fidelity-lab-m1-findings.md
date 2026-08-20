@@ -178,22 +178,19 @@ and are not.
 
 ## Acting on what G10 found
 
-Four rounds of fix-and-measure over the same 60-document sample. Every number
+Seven rounds of fix-and-measure over the same 60-document sample. Every number
 below comes from `scripts/fidelity_lab/lane_p_cli.py`.
 
 | | at G10 landing | now |
 |---|---|---|
-| G0–G7 pass **and** G10 pass | 1 | **7** |
-| G0–G7 fail (already visible) | 41 | **18** |
-| G0–G7 pass but G10 fails | 18 | 35 |
+| G0–G7 pass **and** G10 pass | 1 | **29** |
+| G0–G7 fail (already visible) | 41 | **14** |
+| G0–G7 pass but G10 fails | 18 | 17 |
 
-The middle row is the real result. Restoring the source's own theme, font
-table and styles-with-effects fixed typography that G2 had been reporting for
-years' worth of documents — model-gate failures more than halved. The bottom
-row rose because those documents did not become correct, they became
-*differently* incorrect: G10 now holds them at the package level instead of
-letting them pass once the visible defect was gone. That is the gate doing its
-job — preventing fixed-but-not-fixed from turning into a silent pass.
+Model-gate failures fell by two thirds and clean round-trips went from one
+document to twenty-nine. The middle row moved because several fixes were not
+package-level at all: restoring the source's own theme and font table fixed
+typography that G2 had been reporting.
 
 ### What was fixed
 
@@ -202,34 +199,51 @@ template, so every output carried its `customXml` store, thumbnail and
 `stylesWithEffects` part. `MutableDocxPackage.drop_part` removes a part with
 its content-type override and every relationship resolving to it.
 
-**Attachments were never carried.** Two gaps compounded: the parser captured
-only `word/charts/`, `word/embeddings/` and `word/diagrams/`, and the renderer
-never installed preserved parts at all — it warned `UNSUPPORTED_TRANSFER_PART`
-and dropped them. So every rebuild shipped the *template's* theme and font
-table rather than the source's, and lost the source's custom XML outright.
-`PreservedPart` now records how a part is reached, because that decides what
-can be done with it: a document-level attachment is restored exactly, a sidecar
-(a customXml item's properties part) comes back with its `.rels`, and a
-body-referenced part still warns — writing chart bytes without the reference
-the rebuilt body no longer carries would only orphan them, and G10 would then
-match on a document that is actually broken.
+**Attachments were never carried.** The parser captured only `word/charts/`,
+`word/embeddings/` and `word/diagrams/`, and the renderer never installed
+preserved parts at all — it warned and dropped them. So every rebuild shipped
+the *template's* theme and font table rather than the source's, and lost the
+source's custom XML outright. `PreservedPart` now records how a part is
+reached, because that decides what can be done with it.
 
 **Optional parts the source lacks.** `set_numbering`/`set_styles`/`set_settings`
 returned early when there was nothing to write, leaving the template's copy.
-Documents using no numbering at all were handed the template's `numbering.xml`,
-complete with its `mc:Ignorable="w14 wp14"` — which is why a markup-compatibility
-divergence appeared on documents with no markup-compatibility content.
 
-**A difference the product makes on purpose.** Five documents' only loss was
-`docProps/custom.xml`. That is documented behaviour: "custom properties require
-an explicit allowlist". G10 was right to report it and wrong to call it a
-defect. It is now a declared parameter rather than a hidden rule, narrow and
-one-directional — it explains a lost custom-properties part and nothing else.
+**Shapes had no representation.** `parse_drawings` only produces a `DrawingRef`
+when there is a `blip` — a picture. A group shape, text box, diagram or VML has
+none, so it was not modelled and the rebuilt body emitted nothing where it was.
+Such fragments are now preserved verbatim and re-emitted.
 
-### Three self-inflicted bugs, all caught by measuring
+**Pictures were not in the document at all.** Verified directly: rebuilding a
+fixture with an image produced a package still holding `word/media/image1.png`
+and a `word/document.xml` with no `w:drawing`. Every rebuilt document lost every
+picture from its visible content while the bytes sat in the package as litter.
+The `w:drawing` is now preserved verbatim with its relationship ids remapped —
+which keeps the authored anchor geometry, wrapping, crop and rotation exactly,
+where hand-built DrawingML would have kept only what `DrawingRef` models.
 
-Worth recording, because each was caught by running against real documents
-rather than by reading the code:
+**Two differences the product makes on purpose.** Custom document properties
+are dropped unless allow-listed (README: "custom properties require an explicit
+allowlist"), and `docProps/app.xml` holds statistics about the document that now
+exists — page counts, editing time, application and version — which cannot match
+the source by construction. Both are declared parameters rather than hidden
+rules, so the gate reports them only when the caller has not said it did them
+deliberately.
+
+### The measurement that made shape preservation safe
+
+Re-emitting a fragment verbatim is only safe if it carries no relationship id:
+ids are renumbered by any writer, so a stale one points at the wrong part or
+none at all, and Word repairs such a document on open. **Every
+`mc:AlternateContent` block sampled from the corpus carried none**, which is
+why verbatim re-emission was viable. Where an id *is* present and can be
+resolved — the parser knows which part it addressed and the renderer owns the
+new package — it is rewritten. Where it cannot be resolved, the fragment is
+refused: a missing shape is a visible loss, a corrupted package is not.
+
+### Five self-inflicted bugs, all caught by measuring
+
+Worth recording, because none was caught by reading the code:
 
 1. The first attachment rule was "anything with a document-level relationship",
    which also matched `styles.xml`, `settings.xml` and `numbering.xml` — parts
@@ -239,37 +253,40 @@ rather than by reading the code:
    proceeded — Golden #1's included. The full suite caught it as 8 failures.
 3. Trimming the finished projection for the metadata carve-out stripped
    `docPropsVTypes`, which `docProps/app.xml` also uses. Lane P caught it: clean
-   documents fell from 6 to 0. Fixed by re-projecting the source with the part
-   ignored rather than subtracting from the result.
+   documents fell from 6 to 0. Fixed by re-projecting with the part ignored
+   rather than subtracting from the result.
+4. A new inline-capture branch was unreachable, because `w:drawing` already had
+   its own branch emitting the token the interactive executor dispatches on.
+   The token was extended instead of replaced.
+5. `word/stylesWithEffects.xml` was put on the template-debris list, but real
+   documents legitimately have one — dropping it unconditionally was the same
+   defect mirrored.
 
-### What remains, and it is one root cause
+Three times the fixture, not the code, turned out to be what was wrong: an
+over-minimal package with relationships pointing nowhere, missing `_rels` for a
+customXml item, and no package relationship to `docProps/core.xml`. Each was
+corrected rather than the check loosened.
 
-Every outstanding divergence is drawing content that is not a picture:
+### What remains
 
-| Lost namespace | Documents |
+Seventeen of sixty, each on something specific rather than one systemic cause:
+
+| First divergence | Documents |
 |---|---|
-| `wordprocessingDrawing` | 13 |
-| VML (`urn:schemas-microsoft-com:vml`) | 12 |
-| `wordprocessingShape` | 8 |
-| legacy `office:word` | 6 |
-| `chart` | 3 |
-| `wordprocessingGroup`, `diagram` | 2 each |
+| namespaces | 5 |
+| `attachedTemplate` relationship | 2 |
+| theme part | 2 |
+| `webSettings` part | 2 |
+| `mc:Ignorable` | 2 |
+| comments part | 1 |
+| OLE object bytes | 1 |
+| core-properties part | 1 |
 
-plus 7 documents whose `mc:AlternateContent` blocks disappear — the same thing
-seen from the markup-compatibility side, since that is how Word wraps a modern
-shape with its VML fallback.
-
-The parser finds `//w:drawing` anywhere, including inside `mc:AlternateContent`,
-but only extracts a `DrawingRef` when there is a `blip` — a picture. A group
-shape, a text box or a diagram has no picture, so it has no model
-representation, and the rebuilt body emits nothing for it.
-
-One measurement matters for whatever comes next: **every `mc:AlternateContent`
-block sampled carried no `r:` relationship reference at all.** Verbatim
-re-emission of those fragments is therefore safe, because there is no
-relationship id to go stale. Fragments that *do* carry one must be refused —
-re-emitting a stale rId would produce a broken document, which is worse than a
-missing shape.
+Charts, diagrams and embedded objects are still refused rather than restored:
+they are reached from inside the document body, so writing the part without the
+reference the rebuilt body no longer carries would produce an orphan, and G10
+would then match on a document that is actually broken. A false signal is worse
+than a reported loss.
 
 ## What is still not done
 
@@ -279,6 +296,4 @@ crash remain in `parser/tables.py`, deferred while that file carried
 uncommitted work from the autonomous harness.
 
 Golden #1 remains on ten gates. `G10_GATE_NAMES` exists for callers that opt in
-to eleven via `build_golden_report(gate_names=...)`; turning it on for the
-Golden pipeline should wait until shape content is represented, or the gate will
-report a red the pipeline cannot yet act on.
+to eleven via `build_golden_report(gate_names=...)`.
