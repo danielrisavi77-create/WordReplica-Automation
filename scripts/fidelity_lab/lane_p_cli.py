@@ -40,6 +40,7 @@ from word_replica.domain.enums import (
     VisibilityMode,
 )
 from word_replica.qa.golden_audit import build_model_gates
+from word_replica.lab.visual import VisualOutcome, compare_visually
 from word_replica.lab.word_probe import RepairOutcome, lock_is_held, probe_repair
 from word_replica.qa.preservation import build_preservation_gate
 
@@ -55,6 +56,8 @@ class Outcome:
     first_model_failure: str | None = None
     g10_divergence: str | None = None
     repair: str | None = None
+    visual: str | None = None
+    visual_detail: str | None = None
     error: str | None = None
 
     @property
@@ -73,7 +76,8 @@ def _rebuild_options() -> RebuildOptions:
     )
 
 
-def _evaluate(source: Path, service, options, *, with_word: bool = False) -> Outcome:
+def _evaluate(source: Path, service, options, *, with_word: bool = False,
+              with_visual: bool = False, qa_root: Path | None = None) -> Outcome:
     from word_replica.parser.parser import DocxParser
 
     ref = source.name
@@ -117,9 +121,15 @@ def _evaluate(source: Path, service, options, *, with_word: bool = False) -> Out
     # that already failed to rebuild has nothing to open.
     repair = probe_repair(source, output).value if with_word else None
 
+    visual = visual_detail = None
+    if with_visual:
+        verdict = compare_visually(source, output, (qa_root or output.parent) / f"visual-{ref}")
+        visual, visual_detail = verdict.outcome.value, verdict.detail
+
     return Outcome(
         ref, ok=True, model_pass=model_pass, g10_pass=g10.passed,
         first_model_failure=first_failure, g10_divergence=divergence, repair=repair,
+        visual=visual, visual_detail=visual_detail,
     )
 
 
@@ -160,11 +170,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", type=Path, default=None)
     parser.add_argument("--word", action="store_true",
                         help="also ask real Word whether it repairs each rebuild (slow, serial)")
+    parser.add_argument("--visual", action="store_true",
+                        help="also render both documents with Word and compare pages and pixels")
     args = parser.parse_args(argv)
 
     from word_replica.services.rebuild import RebuildService
 
-    if args.word and lock_is_held():
+    if (args.word or args.visual) and lock_is_held():
         # AGENTS.md: one active Golden Word run at a time, machine-wide. The lab
         # always gives way; RUN_GOLDEN_CODEX.ps1 must never wait on it.
         raise SystemExit("a Golden Word run holds state/golden_run.lock; yielding")
@@ -185,7 +197,10 @@ def main(argv: list[str] | None = None) -> int:
             outcomes.append(Outcome(source_ref, ok=False, error="document not on disk"))
             continue
         try:
-            outcomes.append(_evaluate(path, service, options, with_word=args.word))
+            outcomes.append(_evaluate(
+                path, service, options,
+                with_word=args.word, with_visual=args.visual, qa_root=workspace,
+            ))
         except Exception:
             outcomes.append(Outcome(source_ref, ok=False, error=traceback.format_exc(limit=1).strip()))
         if index % 25 == 0:
@@ -233,6 +248,19 @@ def main(argv: list[str] | None = None) -> int:
             for outcome in introduced[:10]:
                 print(f"    {outcome.source_ref}")
 
+    rendered = [o for o in evaluated if o.visual]
+    if rendered:
+        counts = collections.Counter(o.visual for o in rendered)
+        print("\nWHAT THE READER WOULD SEE")
+        for name, count in counts.most_common():
+            print(f"  {name:<22} {count:>4}")
+        for kind in (VisualOutcome.PAGINATION_DIFFERS, VisualOutcome.PIXELS_DIFFER):
+            examples = [o for o in rendered if o.visual == kind]
+            if examples:
+                print(f"\n  {kind}:")
+                for outcome in examples[:8]:
+                    print(f"    {outcome.source_ref:<44} {outcome.visual_detail}")
+
     if model_fail:
         print("\nFIRST FAILING MODEL GATE (documents G0-G7 already catches)")
         for gate, count in collections.Counter(o.first_model_failure for o in model_fail).most_common():
@@ -257,6 +285,13 @@ def main(argv: list[str] | None = None) -> int:
                     "both_pass": len(both_pass),
                     "model_fail": len(model_fail),
                     "false_pass": len(false_passes),
+                    "visual_rendered": len([o for o in evaluated if o.visual]),
+                    "visual_match": len(
+                        [o for o in evaluated if o.visual == VisualOutcome.MATCH]
+                    ),
+                    "pagination_differs": len(
+                        [o for o in evaluated if o.visual == VisualOutcome.PAGINATION_DIFFERS]
+                    ),
                     "word_probed": len([o for o in evaluated if o.repair]),
                     "repair_introduced": len(
                         [o for o in evaluated if o.repair == RepairOutcome.REPAIR_INTRODUCED]
