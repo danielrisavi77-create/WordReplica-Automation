@@ -166,7 +166,10 @@ def _append_preserved_inline(node, preserved) -> None:
                     continue
                 for name, value in list(element.attrib.items()):
                     if name.startswith(f"{{{R_NS}}}") and value in targets:
-                        element.set(name, ASSET_REFERENCE_PREFIX + targets[value])
+                        part_name, rel_type = targets[value]
+                        element.set(
+                            name, f"{ASSET_REFERENCE_PREFIX}{rel_type}|{part_name}"
+                        )
         node.append(fragment)
 
 
@@ -661,7 +664,9 @@ class MutableDocxPackage:
                 for name, value in list(element.attrib.items()):
                     if not value.startswith(ASSET_REFERENCE_PREFIX):
                         continue
-                    target = value[len(ASSET_REFERENCE_PREFIX):]
+                    rel_type, _, target = value[len(ASSET_REFERENCE_PREFIX):].partition("|")
+                    if not target:  # written before the type was recorded
+                        rel_type, target = IMAGE_REL_TYPE, rel_type
                     changed = True
                     if target not in self.parts:
                         unresolved.append(target)
@@ -672,13 +677,13 @@ class MutableDocxPackage:
                     relative = _relative_to(target, str(owner))
                     element.set(
                         name,
-                        self._ensure_relationship(rels_part, IMAGE_REL_TYPE, relative),
+                        self._ensure_relationship(rels_part, rel_type, relative),
                     )
             if changed:
                 self._write_xml(part_name, root)
         return unresolved
 
-    def unreferenced_parts(self, prefix: str) -> list[str]:
+    def unreferenced_parts(self, prefix: str | tuple[str, ...]) -> list[str]:
         """Parts under ``prefix`` that no relationship reaches.
 
         An OPC part nothing points at is litter, not content: the bytes ship
@@ -956,15 +961,15 @@ class PureDocxRenderer:
                 # restored here, so no new relationship is needed.
                 self._package.install_asset(part.part_name, part.data, part.content_type)
                 continue
-            # Body-referenced. Writing the bytes without the reference the
-            # rebuilt body no longer carries would only produce an orphan, so
-            # report the loss instead of pretending to have transferred it.
-            self._package.warnings.append(
-                WarningItem(
-                    code="UNSUPPORTED_TRANSFER_PART",
-                    message=f"Could not transfer {part.part_name}",
-                )
-            )
+            # Body-referenced: a chart, diagram or embedded object. These used
+            # to be dropped, because a rebuilt body could not carry the
+            # reference and the part alone would have been an orphan. Verbatim
+            # fragment preservation removed that constraint -- the reference
+            # survives with its id remapped -- so the part is installed and the
+            # two ends meet. If the fragment was refused after all, the
+            # unreferenced-media check reports the part rather than shipping it
+            # silently.
+            self._package.install_asset(part.part_name, part.data, part.content_type)
 
     def _blocks_part_xml(self, root_tag: str, blocks: list[object]) -> bytes:
         root = _w(root_tag)
@@ -1022,7 +1027,8 @@ class PureDocxRenderer:
         # The mirror case: media that arrived with the model but that nothing in
         # the rebuilt document points at. Reported rather than shipped silently
         # -- the bytes would travel while the picture itself is gone.
-        for orphan in self._package.unreferenced_parts("word/media/"):
+        for orphan in self._package.unreferenced_parts(("word/media/", "word/embeddings/",
+                                                       "word/charts/", "word/diagrams/")):
             self._package.warnings.append(WarningItem(
                 code="PURE_DOCX_ASSET_UNREFERENCED",
                 message=f"Media part {orphan} was retained but nothing in the document refers to it",

@@ -258,5 +258,12 @@ def test_the_same_relationship_id_resolves_per_part(tmp_path):
         archive.writestr("word/_rels/comments.xml.rels", _rels("media/image1.png", "image"))
 
     with DocxPackage.open(path) as package:
-        assert _reference_targets(package, "word/document.xml")["rId1"] == "word/styles.xml"
-        assert _reference_targets(package, "word/comments.xml")["rId1"] == "word/media/image1.png"
+        from_document = _reference_targets(package, "word/document.xml")["rId1"]
+        from_comments = _reference_targets(package, "word/comments.xml")["rId1"]
+
+    # (part, relationship type) -- the type travels because an OLE object
+    # reached through an image relationship is not the same document.
+    assert from_document[0] == "word/styles.xml"
+    assert from_document[1].endswith("/styles")
+    assert from_comments[0] == "word/media/image1.png"
+    assert from_comments[1].endswith("/image")

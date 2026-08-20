@@ -240,10 +240,18 @@ def test_a_document_without_attachments_does_not_gain_any(tmp_path):
         assert "word/bibliography.xml" not in archive.namelist()
 
 
-def test_body_referenced_parts_are_still_reported_rather_than_silently_restored(tmp_path):
-    # A chart is reached from inside the document body. Restoring the part
-    # without the body reference would orphan it, so that case still warns
-    # instead of pretending to have transferred it.
+def test_a_body_referenced_part_nothing_refers_to_is_reported(tmp_path):
+    """Successor to the transfer-refused warning.
+
+    Charts, diagrams and embedded objects used to be dropped, because a rebuilt
+    body could not carry the reference and the part alone would be an orphan.
+    Verbatim fragment preservation removed that constraint, so they are now
+    restored and the surviving reference points at them.
+
+    What still deserves reporting is the case this test builds: a part with no
+    fragment referring to it anywhere. Its bytes would travel with the document
+    while nothing displayed them.
+    """
     from word_replica.domain.model import PreservedPart
     from word_replica.renderers.pure_docx import PureDocxRenderer
 
@@ -255,4 +263,4 @@ def test_body_referenced_parts_are_still_reported_rather_than_silently_restored(
     renderer.render(model, tmp_path / "out.docx", None)
 
     codes = {warning.code for warning in renderer._package.warnings}
-    assert "UNSUPPORTED_TRANSFER_PART" in codes
+    assert "PURE_DOCX_ASSET_UNREFERENCED" in codes

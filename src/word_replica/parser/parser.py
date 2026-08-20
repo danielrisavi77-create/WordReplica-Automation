@@ -219,7 +219,7 @@ def _is_preservable_inline(child, local: str) -> bool:
 _OWNER_PART: ContextVar[str] = ContextVar("owner_part", default="word/document.xml")
 
 
-def _reference_targets(package: DocxPackage | None, owner_part: str) -> dict[str, str]:
+def _reference_targets(package: DocxPackage | None, owner_part: str) -> dict[str, tuple[str, str]]:
     """Relationship id -> part, for one owning part.
 
     A relationship id is only meaningful relative to the part that declares it.
@@ -233,8 +233,11 @@ def _reference_targets(package: DocxPackage | None, owner_part: str) -> dict[str
         relationships = package.relationships(owner_part)
     except Exception:
         return {}
+    # The relationship *type* travels with the target. An OLE object reached
+    # through an image relationship is not the same document: Word uses the
+    # type to decide what a reference is for.
     return {
-        rel_id: _resolve_relative_target(owner_part, rel.target)
+        rel_id: (_resolve_relative_target(owner_part, rel.target), rel.rel_type)
         for rel_id, rel in relationships.items()
         if rel.target_mode != "External"
     }
@@ -775,8 +778,41 @@ class DocxParser:
             model.extras["endnotes"] = model.endnotes
 
             tree = root.getroottree()
+
+            def _paragraph_relative_path(node) -> str:
+                # tree.getpath() positions a node among its parent's direct
+                # children - which shifts every element after a <w:sdt> content
+                # control (e.g. a TOC) whenever the control's contents get
+                # flattened to plain paragraphs (as this renderer does), even
+                # though nothing about the document's actual content changed.
+                # Anchor the path to the enclosing paragraph's position among
+                # ALL <w:p> elements in the document instead, which is stable
+                # across that flattening (confirmed: identical total <w:p>
+                # count between a source with an sdt-wrapped TOC and the
+                # rendered output without one).
+                full_path = tree.getpath(node)
+                ancestor = node
+                while ancestor is not None and local_name(ancestor) != "p":
+                    ancestor = ancestor.getparent()
+                if ancestor is None:
+                    return full_path
+                ancestor_path = tree.getpath(ancestor)
+                if not full_path.startswith(ancestor_path):
+                    return full_path
+                paragraph_index = all_paragraph_positions.get(ancestor_path)
+                if paragraph_index is None:
+                    return full_path
+                return f"//w:p[{paragraph_index}]" + full_path[len(ancestor_path):]
+
+            # lxml Element identity (id()) is not reliable for matching a node
+            # reached via getparent() back to one reached via a fresh xpath()
+            # call - key on the (stable, string) xpath instead.
+            all_paragraph_positions = {
+                tree.getpath(p): position
+                for position, p in enumerate(root.xpath("//w:p", namespaces=NS), start=1)
+            }
             end_paths = {
-                node.get(f"{{{W_NS}}}id"): tree.getpath(node)
+                node.get(f"{{{W_NS}}}id"): _paragraph_relative_path(node)
                 for node in root.xpath("//w:bookmarkEnd", namespaces=NS)
                 if node.get(f"{{{W_NS}}}id") is not None
             }
@@ -788,7 +824,7 @@ class DocxParser:
                         Bookmark(
                             bookmark_id,
                             name,
-                            tree.getpath(node),
+                            _paragraph_relative_path(node),
                             end_paths.get(bookmark_id),
                         )
                     )

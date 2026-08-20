@@ -64,14 +64,21 @@ def test_renderer_prefers_theme_font_over_literal_name_when_both_present(tmp_pat
     assert 'w:asciiTheme="majorHAnsi"' in xml
 
 
-def test_renderer_warns_when_preserved_part_cannot_be_safely_related(tmp_path):
+def test_renderer_warns_when_a_preserved_part_ends_up_unreferenced(tmp_path):
+    """Successor to the transfer-refused warning.
+
+    A body-referenced part is now restored rather than dropped, because the
+    fragment that refers to it survives verbatim. This model has the part and
+    no fragment, so nothing points at it -- which is the case still worth
+    reporting: the bytes ship while nothing displays them.
+    """
     model = DocumentModel(source_sha256="abc")
     model.preserved_parts["word/embeddings/object.bin"] = PreservedPart(
         "word/embeddings/object.bin", "application/octet-stream", None, "deadbeef", b"x"
     )
     output = tmp_path / "out.docx"
     result = PureDocxRenderer().render(model, output, context=None)
-    assert [warning.code for warning in result.warnings] == ["UNSUPPORTED_TRANSFER_PART"]
+    assert [warning.code for warning in result.warnings] == ["PURE_DOCX_ASSET_UNREFERENCED"]
 
 
 def test_renderer_roundtrips_headers_footers_and_notes(tmp_path):
