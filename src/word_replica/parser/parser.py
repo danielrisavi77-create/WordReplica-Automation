@@ -905,28 +905,58 @@ class DocxParser:
                 if node.get(f"{{{W_NS}}}name") not in (None, "_GoBack")
             }
 
-            def _indexed_among_modelled(node, tag: str) -> str:
-                path = _paragraph_relative_path(node)
-                parent = node.getparent()
-                if parent is None:
-                    return path
-                siblings = [
-                    child
-                    for child in parent
-                    if local_name(child) == tag
-                    and child.get(f"{{{W_NS}}}id") in modelled_ids
-                ]
+            # A bookmark need not be inside a paragraph: both marks are allowed
+            # wherever block-level content is, as direct children of w:body or
+            # inside a w:sdtContent. Those had no enclosing paragraph to anchor
+            # to, so they fell back to a raw lxml path carrying no position the
+            # renderer could use, and every one was dumped into the first
+            # paragraph.
+            #
+            # The anchor is the nearest paragraph, and the side matters: a start
+            # standing before paragraph N opens the bookmark there, an end
+            # standing after paragraph N closes it there. Either way it covers
+            # the text it covered before, which is all a cross-reference sees.
+            #
+            # One walk in document order does both jobs -- it finds each mark's
+            # paragraph and fixes the order marks share one.
+            paragraph_total = len(all_paragraph_positions)
+            anchors: dict[object, int] = {}
+            grouped: dict[tuple[int, str], list[object]] = {}
+            seen_paragraphs = 0
+            for node in root.iter():
+                if not isinstance(node.tag, str):
+                    continue
+                tag = local_name(node)
+                if tag == "p":
+                    seen_paragraphs += 1
+                    continue
+                if tag not in ("bookmarkStart", "bookmarkEnd"):
+                    continue
+                if node.get(f"{{{W_NS}}}id") not in modelled_ids:
+                    continue
+                enclosing = node.getparent()
+                while enclosing is not None and local_name(enclosing) != "p":
+                    enclosing = enclosing.getparent()
+                if enclosing is not None or tag == "bookmarkEnd":
+                    target = seen_paragraphs
+                else:
+                    target = seen_paragraphs + 1
+                target = min(max(target, 1), paragraph_total) if paragraph_total else 0
+                anchors[node] = target
+                grouped.setdefault((target, tag), []).append(node)
+
+            def _anchored_path(node, tag: str) -> str:
+                target = anchors.get(node)
+                if not target:
+                    return _paragraph_relative_path(node)
+                siblings = grouped.get((target, tag), [])
                 if len(siblings) < 2:
-                    # lxml omits the index for an only child; match that, and
-                    # strip only the trailing index -- the paragraph's own index
-                    # earlier in the path has to survive.
-                    return path[: path.rindex("[")] if path.endswith("]") else path
-                position = siblings.index(node) + 1
-                base = path[: path.rindex("/")] if "/" in path else path
-                return f"{base}/w:{tag}[{position}]"
+                    # lxml omits the index for an only child; match that.
+                    return f"//w:p[{target}]/w:{tag}"
+                return f"//w:p[{target}]/w:{tag}[{siblings.index(node) + 1}]"
 
             end_paths = {
-                node.get(f"{{{W_NS}}}id"): _indexed_among_modelled(node, "bookmarkEnd")
+                node.get(f"{{{W_NS}}}id"): _anchored_path(node, "bookmarkEnd")
                 for node in root.xpath("//w:bookmarkEnd", namespaces=NS)
                 if node.get(f"{{{W_NS}}}id") in modelled_ids
             }
@@ -938,7 +968,7 @@ class DocxParser:
                         Bookmark(
                             bookmark_id,
                             name,
-                            _indexed_among_modelled(node, "bookmarkStart"),
+                            _anchored_path(node, "bookmarkStart"),
                             end_paths.get(bookmark_id),
                         )
                     )
