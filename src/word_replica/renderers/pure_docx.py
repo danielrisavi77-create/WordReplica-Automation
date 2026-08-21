@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 import os
+import re
 import shutil
 import tempfile
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
@@ -530,23 +531,84 @@ def _block_element(block, sections: list[Section]):
     return p
 
 
+_PARAGRAPH_INDEX = re.compile(r"^//w:p\[(\d+)\]")
+_SIBLING_INDEX = re.compile(r"\[(\d+)\]$")
+
+
+def _sibling_index(path: str | None) -> int:
+    """Which of its like-named siblings a path points at; 1 when unindexed.
+
+    lxml writes no index when an element is the only one of its name in the
+    parent, so a bare path means "the first".
+    """
+    if not path:
+        return 1
+    match = _SIBLING_INDEX.search(path)
+    return int(match.group(1)) if match else 1
+
+
+def _paragraph_at(paragraphs: list, path: str | None):
+    """The paragraph a Bookmark path names, or None if it names nothing here.
+
+    Paths look like ``//w:p[N]/...`` where N counts every w:p in the document,
+    table cells included -- so the list handed in has to be built the same way.
+    """
+    if not path:
+        return None
+    match = _PARAGRAPH_INDEX.match(path)
+    if match is None:
+        return None
+    index = int(match.group(1))
+    return paragraphs[index - 1] if 1 <= index <= len(paragraphs) else None
+
+
 def _inject_bookmarks_and_fields(body, model: DocumentModel) -> None:
     paragraphs = body.findall(f"{W}p")
     if not paragraphs:
         return
 
+    # Every w:p in document order, matching how the parser numbered them. Using
+    # only the body's direct children would count a bookmark in a table cell as
+    # though the whole table were one paragraph.
+    all_paragraphs = list(body.iter(f"{W}p"))
+
     first = paragraphs[0]
-    insert_at = 1 if len(first) and first[0].tag == f"{W}pPr" else 0
+    insert_positions: dict[object, int] = {}
+    # Ends are appended after every bookmark is placed, in the order the source
+    # had them rather than the order the bookmarks were declared. Nested
+    # bookmarks close inside-out -- start A, start B, end B, end A -- so
+    # following declaration order puts A's end first and moves both.
+    pending_ends: list[tuple[object, int, int, object]] = []
     for index, bookmark in enumerate(model.bookmarks, start=1):
         bookmark_id = str(bookmark.bookmark_id or index)
+        # Bookmarks used to go into the first paragraph regardless of where they
+        # were authored, so a cross-reference resolved to the wrong text. The
+        # position was in the model the whole time; it just was not read.
+        # "or" would be wrong here: an lxml element with no children is falsy,
+        # so a bookmark in an empty paragraph would silently fall back.
+        start_host = _paragraph_at(all_paragraphs, bookmark.start_path)
+        if start_host is None:
+            start_host = first
+        end_host = _paragraph_at(all_paragraphs, bookmark.end_path)
+        if end_host is None:
+            end_host = start_host
+
         start = etree.Element(f"{W}bookmarkStart")
         _set_w(start, "id", bookmark_id)
         _set_w(start, "name", bookmark.name)
-        first.insert(insert_at, start)
-        insert_at += 1
+        if start_host not in insert_positions:
+            insert_positions[start_host] = (
+                1 if len(start_host) and start_host[0].tag == f"{W}pPr" else 0
+            )
+        start_host.insert(insert_positions[start_host], start)
+        insert_positions[start_host] += 1
+
         end = etree.Element(f"{W}bookmarkEnd")
         _set_w(end, "id", bookmark_id)
-        first.append(end)
+        pending_ends.append((end_host, _sibling_index(bookmark.end_path), index, end))
+
+    for host, _position, _declared, end in sorted(pending_ends, key=lambda item: item[1:3]):
+        host.append(end)
 
     if model.fields and not body.findall(f".//{W}fldChar"):
         # Real parsed documents already got their fields rendered in place by

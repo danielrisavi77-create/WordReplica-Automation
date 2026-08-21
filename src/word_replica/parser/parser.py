@@ -860,10 +860,43 @@ class DocxParser:
                 tree.getpath(p): position
                 for position, p in enumerate(root.xpath("//w:p", namespaces=NS), start=1)
             }
+            # _GoBack is Word's volatile "last edit position" mark and is not
+            # modelled, but it is still a sibling in the source. A path indexed
+            # among *all* siblings therefore says [2] for a bookmark whose
+            # rebuild can only ever write [1], and the gate reports a
+            # divergence about a bookmark the model never carried. Index among
+            # the bookmarks that are kept instead, so both sides count the same
+            # things.
+            modelled_ids = {
+                node.get(f"{{{W_NS}}}id")
+                for node in root.xpath("//w:bookmarkStart", namespaces=NS)
+                if node.get(f"{{{W_NS}}}name") not in (None, "_GoBack")
+            }
+
+            def _indexed_among_modelled(node, tag: str) -> str:
+                path = _paragraph_relative_path(node)
+                parent = node.getparent()
+                if parent is None:
+                    return path
+                siblings = [
+                    child
+                    for child in parent
+                    if local_name(child) == tag
+                    and child.get(f"{{{W_NS}}}id") in modelled_ids
+                ]
+                if len(siblings) < 2:
+                    # lxml omits the index for an only child; match that, and
+                    # strip only the trailing index -- the paragraph's own index
+                    # earlier in the path has to survive.
+                    return path[: path.rindex("[")] if path.endswith("]") else path
+                position = siblings.index(node) + 1
+                base = path[: path.rindex("/")] if "/" in path else path
+                return f"{base}/w:{tag}[{position}]"
+
             end_paths = {
-                node.get(f"{{{W_NS}}}id"): _paragraph_relative_path(node)
+                node.get(f"{{{W_NS}}}id"): _indexed_among_modelled(node, "bookmarkEnd")
                 for node in root.xpath("//w:bookmarkEnd", namespaces=NS)
-                if node.get(f"{{{W_NS}}}id") is not None
+                if node.get(f"{{{W_NS}}}id") in modelled_ids
             }
             for node in root.xpath("//w:bookmarkStart", namespaces=NS):
                 bookmark_id = node.get(f"{{{W_NS}}}id")
@@ -873,7 +906,7 @@ class DocxParser:
                         Bookmark(
                             bookmark_id,
                             name,
-                            _paragraph_relative_path(node),
+                            _indexed_among_modelled(node, "bookmarkStart"),
                             end_paths.get(bookmark_id),
                         )
                     )
