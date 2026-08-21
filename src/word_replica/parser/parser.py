@@ -799,7 +799,31 @@ class DocxParser:
             model.extras["theme_font_scheme"] = _parse_theme_font_scheme(model.theme_parts)
             model.body = parse_blocks(body, ids, "body", package)
 
-            for part in package.iter_parts("word/media/"):
+            # Sweeping word/media/ finds what nearly every document does, and
+            # media nothing points at as well. But the folder is a convention,
+            # not a rule: a part is wherever its relationship targets, and a
+            # picture kept at media/ in the package root never became an asset,
+            # so the drawing had nothing to resolve to and the picture was gone.
+            media_parts = list(package.iter_parts("word/media/"))
+            seen_media = set(media_parts)
+            for rels_part in sorted(package.parts):
+                if not rels_part.endswith(".rels"):
+                    continue
+                try:
+                    relationships = package.relationships(_rels_owner(rels_part))
+                except Exception:
+                    continue
+                for rel in relationships.values():
+                    if rel.target_mode == "External":
+                        continue
+                    if rel.rel_type.rsplit("/", 1)[-1] != "image":
+                        continue
+                    target = resolve_relationship_target(_rels_owner(rels_part) or "x", rel.target)
+                    if target in package.parts and target not in seen_media:
+                        seen_media.add(target)
+                        media_parts.append(target)
+
+            for part in media_parts:
                 asset = extract_asset(package, part)
                 # The id is the content hash, so two parts holding the same
                 # bytes claim the same one and setdefault kept only the first --
