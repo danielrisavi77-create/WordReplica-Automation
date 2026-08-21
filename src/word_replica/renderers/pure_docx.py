@@ -397,7 +397,9 @@ def _table_properties_element(properties: dict):
 
 
 # w:tcPr has its own required sequence.
-_CELL_PROPERTY_ORDER = ("tcW", "gridSpan", "vMerge", "tcBorders", "shd", "tcMar", "vAlign")
+_CELL_PROPERTY_ORDER = (
+    "tcW", "gridSpan", "vMerge", "tcBorders", "shd", "tcMar", "textDirection", "vAlign",
+)
 
 
 def _cell_properties_element(properties: dict):
@@ -426,12 +428,19 @@ def _cell_properties_element(properties: dict):
         node = etree.Element(f"{W}shd")
         _set_w(node, "fill", properties["shading_fill"])
         written["shd"] = node
-    if properties.get("margins"):
-        _edge_element(holder, "tcMar", properties["margins"], _MARGIN_KEYS)
+    # These two keys are "cell_margins" and "vertical_alignment" in the model.
+    # Asking for "margins"/"v_align" returned None every time and the properties
+    # vanished without any error to notice.
+    if properties.get("cell_margins"):
+        _edge_element(holder, "tcMar", properties["cell_margins"], _MARGIN_KEYS)
         written["tcMar"] = holder.find(f"{W}tcMar")
-    if properties.get("v_align") is not None:
+    if properties.get("text_direction") is not None:
+        node = etree.Element(f"{W}textDirection")
+        _set_w(node, "val", properties["text_direction"])
+        written["textDirection"] = node
+    if properties.get("vertical_alignment") is not None:
         node = etree.Element(f"{W}vAlign")
-        _set_w(node, "val", properties["v_align"])
+        _set_w(node, "val", properties["vertical_alignment"])
         written["vAlign"] = node
 
     tc_pr = _w("tcPr")
@@ -440,6 +449,37 @@ def _cell_properties_element(properties: dict):
         if node is not None:
             tc_pr.append(node)
     return tc_pr
+
+
+# w:trPr is a sequence too.
+_ROW_PROPERTY_ORDER = ("cantSplit", "trHeight", "tblHeader")
+
+
+def _row_properties_element(properties: dict):
+    """Rebuild w:trPr, emitting it even when it ends up empty.
+
+    cant_split and repeat_header are False rather than absent whenever the
+    source row carried a w:trPr at all, so an empty one still says something:
+    dropping it turns False into missing and the row stops round-tripping.
+    """
+    written: dict[str, Any] = {}
+
+    if properties.get("cant_split"):
+        written["cantSplit"] = etree.Element(f"{W}cantSplit")
+    if properties.get("height") is not None or properties.get("height_rule") is not None:
+        node = etree.Element(f"{W}trHeight")
+        _set_w(node, "val", properties.get("height"))
+        _set_w(node, "hRule", properties.get("height_rule"))
+        written["trHeight"] = node
+    if properties.get("repeat_header"):
+        written["tblHeader"] = etree.Element(f"{W}tblHeader")
+
+    tr_pr = _w("trPr")
+    for name in _ROW_PROPERTY_ORDER:
+        node = written.get(name)
+        if node is not None:
+            tr_pr.append(node)
+    return tr_pr
 
 
 def _table_element(table: Table, sections: list[Section]):
@@ -459,6 +499,10 @@ def _table_element(table: Table, sections: list[Section]):
 
     for row in table.rows:
         tr = etree.SubElement(tbl, f"{W}tr")
+        # An empty dict means the source row had no w:trPr; a dict holding only
+        # False means it had an empty one, which still has to come back.
+        if row.properties:
+            tr.append(_row_properties_element(row.properties))
         for cell in row.cells:
             tc = etree.SubElement(tr, f"{W}tc")
             tc.append(_cell_properties_element(cell.properties or {}))
