@@ -29,6 +29,16 @@ def sha256_file_bytes(data: bytes) -> str:
     return sha256(data).hexdigest()
 
 
+def _rels_owner(rels_part: str) -> str:
+    """The part a .rels file belongs to; "" for the package root."""
+    import posixpath
+
+    directory, _, name = rels_part.rpartition("/")
+    owner_name = name[: -len(".rels")]
+    parent = posixpath.dirname(directory)  # strip the trailing "_rels"
+    return posixpath.join(parent, owner_name) if parent else owner_name
+
+
 def _parse_theme_font_scheme(theme_parts: dict[str, bytes]) -> dict[str, str]:
     if not theme_parts:
         return {}
@@ -997,6 +1007,33 @@ class DocxParser:
                 _preserve(part, None)
                 for _target, sidecar_rels in _sidecars(package, part):
                     _preserve(sidecar_rels, None, sidecar=True)
+
+            # Which relationship reached each part in the source. A package
+            # routinely relates a part that no element points at -- an image
+            # left behind by editing, or a SmartArt drawing, reached from
+            # document.xml.rels while dgm:relIds names only the data, layout,
+            # colours and quick-style parts. The rebuild kept such a part and
+            # dropped its relationship, turning it into an orphan; with this the
+            # renderer can put the relationship back and leave the package as it
+            # found it.
+            part_relationships: dict[str, tuple[str, str]] = {}
+            for rels_part in sorted(package.parts):
+                if not rels_part.endswith(".rels"):
+                    continue
+                owner = _rels_owner(rels_part)
+                try:
+                    relationships = package.relationships(owner)
+                except Exception:
+                    continue
+                for rel in relationships.values():
+                    if rel.target_mode == "External":
+                        continue
+                    # Relative to the owning part's directory, not the _rels
+                    # directory the file happens to live in.
+                    target = resolve_relationship_target(owner or "x", rel.target)
+                    if target and target not in part_relationships:
+                        part_relationships[target] = (rels_part, rel.rel_type)
+            model.extras["source_part_relationships"] = part_relationships
 
             for rel in package.relationships("word/document.xml").values():
                 if rel.target_mode == "External":

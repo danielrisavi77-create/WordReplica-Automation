@@ -663,6 +663,14 @@ def _rels_part_for(part_name: str) -> str:
     return f"{parent}/_rels/{name}.rels" if parent else f"_rels/{name}.rels"
 
 
+def _rels_owner(rels_part: str) -> str:
+    """The part a .rels file belongs to; "" for the package root."""
+    directory, _, name = rels_part.rpartition("/")
+    owner_name = name[: -len(".rels")]
+    parent = str(PurePosixPath(directory).parent) if directory else ""
+    return f"{parent}/{owner_name}" if parent not in ("", ".") else owner_name
+
+
 def _resolve_rel_target(rels_part: str, target: str) -> str:
     owner = PurePosixPath(rels_part).parent
     if owner.name == "_rels":
@@ -835,6 +843,25 @@ class MutableDocxPackage:
         self._write_xml(rels_part, root)
         return rel_id
 
+
+    def restore_part_relationship(self, part_name: str, rels_part: str, rel_type: str) -> bool:
+        """Re-create the relationship the source used to reach ``part_name``.
+
+        For a part nothing points at, which the source also related and never
+        referenced. A fresh id is safe precisely because nothing refers to one.
+
+        Refused when the part is absent, or when the .rels would belong to a
+        part that is not in the package: writing it then would leave a
+        relationship file for something that does not exist.
+        """
+        owner = _rels_owner(rels_part)
+        if part_name not in self.parts:
+            return False
+        if owner and owner not in self.parts:
+            return False
+        relative = _relative_to(part_name, str(PurePosixPath(owner).parent) if owner else "")
+        self._ensure_relationship(rels_part, rel_type, relative)
+        return True
 
     def restore_verbatim_relationships(
         self, part_name: str, entries
@@ -1361,8 +1388,16 @@ class PureDocxRenderer:
         # The mirror case: media that arrived with the model but that nothing in
         # the rebuilt document points at. Reported rather than shipped silently
         # -- the bytes would travel while the picture itself is gone.
+        origins = model.extras.get("source_part_relationships") or {}
         for orphan in self._package.unreferenced_parts(("word/media/", "word/embeddings/",
                                                        "word/charts/", "word/diagrams/")):
+            # The source may have related this part and referenced it from
+            # nowhere -- a stray image, a SmartArt drawing. Putting the
+            # relationship back leaves the package as we found it instead of
+            # reporting a difference we introduced.
+            origin = origins.get(orphan)
+            if origin is not None and self._package.restore_part_relationship(orphan, *origin):
+                continue
             self._package.warnings.append(WarningItem(
                 code="PURE_DOCX_ASSET_UNREFERENCED",
                 message=f"Media part {orphan} was retained but nothing in the document refers to it",
