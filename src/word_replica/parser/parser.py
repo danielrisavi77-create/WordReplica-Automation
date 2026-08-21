@@ -620,6 +620,10 @@ _ATTACHMENT_RELATIONSHIP_TYPES = frozenset({
     "webSettings",
     "fontTable",
     "theme",
+    # word/customizations.xml -- the key map and toolbar customisations saved
+    # with the document. A part with a relationship like any other; it was lost
+    # only because this list is a list and the type was not on it.
+    "keyMapCustomizations",
 })
 
 
