@@ -345,6 +345,30 @@ def g10_projection(
 # "truthful lifecycle" stamp -- created, modified, revision -- that the product
 # documents and other tests assert. Neither can match a source by construction.
 _AUTHORED_PROPERTY_PARTS = ("docProps/app.xml", "docProps/core.xml")
+# The same parts, recognised by what they are rather than where they sit.
+# LibreOffice writes a second core-properties part, docProps/core0.xml, hung
+# off _rels/.rels by a relationship whose type URI is misspelled. Its content
+# duplicates core.xml, and the renderer authors these properties rather than
+# copying them, so naming only the two canonical paths left the duplicate being
+# compared -- the largest class of G10 failures in the corpus.
+_AUTHORED_PROPERTY_CONTENT_TYPES = frozenset(
+    {
+        "application/vnd.openxmlformats-package.core-properties+xml",
+        "application/vnd.openxmlformats-officedocument.extended-properties+xml",
+    }
+)
+
+
+def _authored_property_parts(path: Path, limits: PackageLimits) -> set[str]:
+    """Every part in the package that holds properties the renderer authors."""
+    scan = read_package(Path(path), limits=limits)
+    if not scan.ok:
+        return set()
+    return {
+        name
+        for name, content_type in _content_type_map(scan.parts, scan.roots).items()
+        if content_type in _AUTHORED_PROPERTY_CONTENT_TYPES
+    }
 
 
 _CUSTOM_PROPS_CONTENT_TYPE = (
@@ -391,6 +415,10 @@ def build_preservation_gate(
     ignore: set[str] = set()
     if application_properties_rewritten_by_policy:
         ignore.update(_AUTHORED_PROPERTY_PARTS)
+        # Both sides, because ignore_parts is applied to both and a package may
+        # carry a property part the other does not.
+        ignore.update(_authored_property_parts(source, limits))
+        ignore.update(_authored_property_parts(output, limits))
     if custom_properties_dropped_by_policy and _CUSTOM_PROPS_CONTENT_TYPE not in actual.get("part_kinds", {}):
         ignore.add(_CUSTOM_PROPS_PART)
     if ignore:
