@@ -1,4 +1,5 @@
 from contextvars import ContextVar
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -800,7 +801,28 @@ class DocxParser:
 
             for part in package.iter_parts("word/media/"):
                 asset = extract_asset(package, part)
-                model.assets.setdefault(asset.asset_id, asset)
+                # The id is the content hash, so two parts holding the same
+                # bytes claim the same one and setdefault kept only the first --
+                # the second part never reached the model and the rebuild came
+                # out a part short. In OPC a part's identity is its name, and a
+                # document storing one image under two names is not unusual.
+                #
+                # Colliding ids are disambiguated rather than the scheme being
+                # changed: DrawingRef.asset_id, the interactive preflight and
+                # the asset files written to disk all key on them, so every
+                # document without a collision keeps exactly the ids it had.
+                # iter_parts is sorted, so which part takes the bare id is
+                # stable across runs.
+                asset_id = asset.asset_id
+                suffix = 1
+                while asset_id in model.assets:
+                    if model.assets[asset_id].part_name == part:
+                        break
+                    suffix += 1
+                    asset_id = f"{asset.asset_id}_{suffix}"
+                if asset_id != asset.asset_id:
+                    asset = replace(asset, asset_id=asset_id)
+                model.assets.setdefault(asset_id, asset)
 
             _extract_body_drawings(root, package, ids, model)
 
