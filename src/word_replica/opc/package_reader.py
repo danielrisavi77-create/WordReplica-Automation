@@ -49,7 +49,17 @@ class DocxPackage:
             raise PackageReadError(f"Malformed XML part {part_name}: {exc}") from exc
 
     def iter_parts(self, prefix: str) -> list[str]:
-        return sorted(part for part in self.parts if part.startswith(prefix))
+        """Parts under ``prefix``. Directory entries are not parts.
+
+        A zip may carry zero-length entries ending in "/" to record a folder,
+        and many writers emit them. Handing one back as a part means a caller
+        reads a folder as content: the theme scheme gave up on the empty
+        ``word/theme/`` before reaching ``word/theme/theme1.xml`` beside it, and
+        ``word/media/`` would have been extracted as an image.
+        """
+        return sorted(
+            part for part in self.parts if part.startswith(prefix) and not part.endswith("/")
+        )
 
     def relationships(self, source_part: str) -> dict[str, Relationship]:
         source = Path(source_part)

@@ -34,12 +34,21 @@ def _parse_theme_font_scheme(theme_parts: dict[str, bytes]) -> dict[str, str]:
         return {}
     from lxml import etree
 
-    data = next(iter(theme_parts.values()), None)
-    if not data:
-        return {}
-    root = etree.fromstring(data)
+    # The first theme part is not necessarily the one that declares fonts: a
+    # themeOverride sorts ahead of theme1.xml and may carry no fontScheme at
+    # all. Take the first that actually has one.
     a_ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
-    scheme = root.find(".//a:fontScheme", namespaces=a_ns)
+    scheme = None
+    for data in theme_parts.values():
+        if not data:
+            continue
+        try:
+            candidate = etree.fromstring(data).find(".//a:fontScheme", namespaces=a_ns)
+        except etree.XMLSyntaxError:
+            continue
+        if candidate is not None:
+            scheme = candidate
+            break
     if scheme is None:
         return {}
 
