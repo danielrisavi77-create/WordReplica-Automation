@@ -507,14 +507,22 @@ def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage
         elif local == "r":
             runs.append(parse_run(child, ids, f"{path}/run/{r_index}", package))
             r_index += 1
-        elif local in {"ins", "moveTo", "fldSimple", "hyperlink"}:
+        elif local in {"ins", "moveTo", "fldSimple", "hyperlink", "sdt"}:
             # Unwrapping reaches the runs inside, which is what the model
             # represents -- but a hyperlink is more than the words it wraps.
             # Without recording it here the link text survives and the link
             # does not, and G0 sees nothing wrong because the text is exactly
             # what does survive.
             link = _hyperlink_properties(child, package) if local == "hyperlink" else None
-            for nested_index, nested_run in enumerate(child.findall(".//w:r", namespaces=NS)):
+            # An inline content control matched none of these, so the control
+            # and everything in it was dropped without a trace. Unwrapping is
+            # what already happens to a block-level control, whose paragraphs
+            # the renderer flattens.
+            #
+            # Only w:sdtContent is searched: w:sdtPr describes the control
+            # itself, and a placeholder caption in there is not document text.
+            search = "./w:sdtContent//w:r" if local == "sdt" else ".//w:r"
+            for nested_index, nested_run in enumerate(child.findall(search, namespaces=NS)):
                 run = parse_run(
                     nested_run,
                     ids,
