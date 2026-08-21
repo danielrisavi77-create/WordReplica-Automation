@@ -175,6 +175,10 @@ def _run_element(run: Run):
 
 
 ASSET_REFERENCE_PREFIX = "wr-asset:"
+# The same idea for a reference that leaves the package: no part to install,
+# only a relationship to allocate, and the relationship type comes along
+# because a fragment can point outward for more reasons than a hyperlink.
+EXTERNAL_REFERENCE_PREFIX = "wr-extref:"
 
 
 def _append_preserved_inline(node, preserved) -> None:
@@ -202,10 +206,11 @@ def _append_preserved_inline(node, preserved) -> None:
                     continue
                 for name, value in list(element.attrib.items()):
                     if name.startswith(f"{{{R_NS}}}") and value in targets:
-                        part_name, rel_type = targets[value]
-                        element.set(
-                            name, f"{ASSET_REFERENCE_PREFIX}{rel_type}|{part_name}"
+                        target, rel_type, external = targets[value]
+                        prefix = (
+                            EXTERNAL_REFERENCE_PREFIX if external else ASSET_REFERENCE_PREFIX
                         )
+                        element.set(name, f"{prefix}{rel_type}|{target}")
         node.append(fragment)
 
 
@@ -883,7 +888,27 @@ class MutableDocxPackage:
                 if not isinstance(element.tag, str):
                     continue
                 for name, value in list(element.attrib.items()):
-                    if not value.startswith((ASSET_REFERENCE_PREFIX, HYPERLINK_REFERENCE_PREFIX)):
+                    if not value.startswith(
+                        (
+                            ASSET_REFERENCE_PREFIX,
+                            HYPERLINK_REFERENCE_PREFIX,
+                            EXTERNAL_REFERENCE_PREFIX,
+                        )
+                    ):
+                        continue
+                    if value.startswith(EXTERNAL_REFERENCE_PREFIX):
+                        # Points out of the package: allocate the relationship,
+                        # install nothing.
+                        rel_type, _, target = value[
+                            len(EXTERNAL_REFERENCE_PREFIX):
+                        ].partition("|")
+                        changed = True
+                        element.set(
+                            name,
+                            self._ensure_relationship(
+                                _rels_part_for(part_name), rel_type, target, external=True
+                            ),
+                        )
                         continue
                     if value.startswith(HYPERLINK_REFERENCE_PREFIX):
                         # An external link needs no part, only a relationship.

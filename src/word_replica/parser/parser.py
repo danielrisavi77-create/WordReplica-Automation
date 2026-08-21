@@ -219,8 +219,10 @@ def _is_preservable_inline(child, local: str) -> bool:
 _OWNER_PART: ContextVar[str] = ContextVar("owner_part", default="word/document.xml")
 
 
-def _reference_targets(package: DocxPackage | None, owner_part: str) -> dict[str, tuple[str, str]]:
-    """Relationship id -> part, for one owning part.
+def _reference_targets(
+    package: DocxPackage | None, owner_part: str
+) -> dict[str, tuple[str, str, bool]]:
+    """Relationship id -> (target, type, is_external), for one owning part.
 
     A relationship id is only meaningful relative to the part that declares it.
     In a real corpus document rId1 addressed word/styles.xml from the document
@@ -236,11 +238,18 @@ def _reference_targets(package: DocxPackage | None, owner_part: str) -> dict[str
     # The relationship *type* travels with the target. An OLE object reached
     # through an image relationship is not the same document: Word uses the
     # type to decide what a reference is for.
-    return {
-        rel_id: (_resolve_relative_target(owner_part, rel.target), rel.rel_type)
-        for rel_id, rel in relationships.items()
-        if rel.target_mode != "External"
-    }
+    #
+    # External relationships are included. They resolve to a URL rather than a
+    # part, and excluding them meant any fragment containing one -- a shape with
+    # a hyperlink on it -- had an id that resolved to nothing and was refused
+    # whole, taking the shape and its geometry with it. The refusal looked like
+    # the safety rule working.
+    resolved: dict[str, tuple[str, str, bool]] = {}
+    for rel_id, rel in relationships.items():
+        external = rel.target_mode == "External"
+        target = rel.target if external else _resolve_relative_target(owner_part, rel.target)
+        resolved[rel_id] = (target, rel.rel_type, external)
+    return resolved
 
 
 def _resolve_relative_target(owner_part: str, target: str) -> str:
