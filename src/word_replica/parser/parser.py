@@ -1111,6 +1111,25 @@ class DocxParser:
                         part_relationships[target] = (rels_part, rel.rel_type)
             model.extras["source_part_relationships"] = part_relationships
 
+            # The same idea for relationships that leave the package. Editing a
+            # document strips the link text and leaves the relationship behind,
+            # and an external one has no part to travel with it, so nothing
+            # noticed it was gone. settings.xml already had this fix for its own
+            # external relationships; this is the same rule everywhere else.
+            external_relationships: list[tuple[str, str, str]] = []
+            for rels_part in sorted(package.parts):
+                if not rels_part.endswith(".rels"):
+                    continue
+                try:
+                    relationships = package.relationships(_rels_owner(rels_part))
+                except Exception:
+                    continue
+                for rel in relationships.values():
+                    if rel.target_mode != "External":
+                        continue
+                    external_relationships.append((rels_part, rel.rel_type, rel.target))
+            model.extras["source_external_relationships"] = sorted(set(external_relationships))
+
             for rel in package.relationships("word/document.xml").values():
                 if rel.target_mode == "External":
                     continue

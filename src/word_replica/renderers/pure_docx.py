@@ -844,6 +844,19 @@ class MutableDocxPackage:
         return rel_id
 
 
+    def restore_external_relationship(self, rels_part: str, rel_type: str, target: str) -> bool:
+        """Re-create a relationship that points out of the package.
+
+        Keyed by type and target, so one the rebuild already wrote for a
+        reference that survived is not written a second time. Refused when the
+        owning part is absent, which would leave a .rels for nothing.
+        """
+        owner = _rels_owner(rels_part)
+        if owner and owner not in self.parts:
+            return False
+        self._ensure_relationship(rels_part, rel_type, target, external=True)
+        return True
+
     def restore_part_relationship(self, part_name: str, rels_part: str, rel_type: str) -> bool:
         """Re-create the relationship the source used to reach ``part_name``.
 
@@ -1388,6 +1401,12 @@ class PureDocxRenderer:
         # The mirror case: media that arrived with the model but that nothing in
         # the rebuilt document points at. Reported rather than shipped silently
         # -- the bytes would travel while the picture itself is gone.
+        # An external relationship has no part, so the orphan check below cannot
+        # see one go missing. Restored by type and target, which also means a
+        # link the rebuild already recreated is not written a second time.
+        for rels_part, rel_type, target in model.extras.get("source_external_relationships") or ():
+            self._package.restore_external_relationship(rels_part, rel_type, target)
+
         origins = model.extras.get("source_part_relationships") or {}
         for orphan in self._package.unreferenced_parts(("word/media/", "word/embeddings/",
                                                        "word/charts/", "word/diagrams/")):
