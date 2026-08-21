@@ -168,7 +168,15 @@ def _relationship_graph(
     roots: dict[str, Any],
     ignored: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, Any], list[str], set[str]]:
-    graph: dict[str, dict[str, int]] = {}
+    # Distinct targets, not relationship records. Word writes one record per
+    # hyperlink occurrence, so a document linking the same URL four times has
+    # four records and one target; any writer that allocates by target -- ours
+    # does -- collapses them, and every link still opens the same page. Counting
+    # records reported that as losing three links, which was the whole
+    # relationship_graph/hyperlink class in the corpus. A gate that calls a
+    # lossless collapse silent data loss is one people switch off, and the real
+    # losses go with it.
+    targets: dict[str, dict[str, set[str]]] = {}
     dangling: list[str] = []
     reached: set[str] = set()
     for name, root in roots.items():
@@ -176,15 +184,14 @@ def _relationship_graph(
             continue
         for node in root.findall(f"{{{_REL_NS}}}Relationship"):
             rel_type = (node.get("Type") or "").rsplit("/", 1)[-1] or "(untyped)"
-            entry = graph.setdefault(rel_type, {"count": 0, "external": 0})
-            entry["count"] += 1
+            entry = targets.setdefault(rel_type, {"internal": set(), "external": set()})
             if node.get("TargetMode") == "External":
-                entry["external"] += 1
+                entry["external"].add(node.get("Target") or "")
                 continue
             resolved = resolve_relationship_target(name, node.get("Target") or "")
             if resolved in ignored:
-                entry["count"] -= 1
                 continue
+            entry["internal"].add(resolved)
             reached.add(resolved)
             if resolved and resolved not in parts:
                 # Recorded by type and owner, never by rId: relationship ids are
@@ -192,7 +199,14 @@ def _relationship_graph(
                 dangling.append(f"{name}->{rel_type}")
     # A type whose only relationships were to ignored parts is not present.
     return (
-        {name: entry for name, entry in graph.items() if entry["count"] > 0},
+        {
+            rel_type: {
+                "distinct_targets": len(entry["internal"]) + len(entry["external"]),
+                "external": len(entry["external"]),
+            }
+            for rel_type, entry in targets.items()
+            if entry["internal"] or entry["external"]
+        },
         sorted(dangling),
         reached,
     )
