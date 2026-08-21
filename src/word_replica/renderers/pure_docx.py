@@ -769,6 +769,41 @@ class MutableDocxPackage:
         return rel_id
 
 
+    def restore_verbatim_relationships(
+        self, part_name: str, entries
+    ) -> list[str]:
+        """Rebuild the .rels of a part that was written back byte for byte.
+
+        The ids are written as they were, not reallocated: the bytes that use
+        them were preserved unchanged, so a fresh id would point the preserved
+        reference somewhere else.
+
+        An internal target whose part did not make it into the package is
+        skipped and returned, because restoring it would trade an orphaned part
+        for a dangling relationship -- and Word repairs the second one.
+        """
+        if part_name not in self.parts or not entries:
+            return []
+        rels_part = _rels_part_for(part_name)
+        missing: list[str] = []
+        root = etree.fromstring(
+            b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>'
+        )
+        for rel_id, rel_type, target, target_mode in entries:
+            external = target_mode == "External"
+            if not external and _resolve_rel_target(rels_part, target) not in self.parts:
+                missing.append(target)
+                continue
+            node = etree.SubElement(root, f"{{{REL_NS}}}Relationship")
+            node.set("Id", rel_id)
+            node.set("Type", rel_type)
+            node.set("Target", target)
+            if external:
+                node.set("TargetMode", "External")
+        if len(root):
+            self._write_xml(rels_part, root)
+        return missing
+
     def install_structured_part(self, part_name: str, content_type: str, rel_type: str, target: str, data: bytes) -> str:
         self.parts[part_name] = data
         self._ensure_override(part_name, content_type)
@@ -1217,6 +1252,19 @@ class PureDocxRenderer:
         orphan check then reported.
         """
         assert self._package is not None
+        # styles.xml and numbering.xml were written back unchanged, so the r:id
+        # values inside them are still the source's. Their .rels is restored
+        # here rather than in the stage that writes them, because the parts
+        # those relationships point at are installed in between.
+        for part, entries in (model.extras.get("verbatim_part_relationships") or {}).items():
+            for target in self._package.restore_verbatim_relationships(part, entries):
+                self._package.warnings.append(WarningItem(
+                    code="PURE_DOCX_VERBATIM_RELATIONSHIP_UNRESOLVED",
+                    message=(
+                        f"{part} referenced {target}, which is not in the rebuilt package"
+                    ),
+                    affects_status=True,
+                ))
         for missing in self._package.resolve_asset_references():
             self._package.warnings.append(WarningItem(
                 code="PURE_DOCX_ASSET_REFERENCE_UNRESOLVED",

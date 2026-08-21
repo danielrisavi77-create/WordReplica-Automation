@@ -995,6 +995,26 @@ class DocxParser:
                     if rel.target_mode == "External":
                         settings_relationships.append((rel.rel_type, rel.target))
             model.extras["settings_relationships"] = sorted(settings_relationships)
+            # styles.xml and numbering.xml are written back byte for byte, so
+            # any r:id inside them survives the rebuild and has to keep meaning
+            # what it meant. Dropping their .rels leaves the preserved bytes
+            # pointing at a relationship that no longer exists -- a picture
+            # bullet's image becomes an orphaned part and Word repairs the
+            # document on open, which is worse than losing the bullet.
+            #
+            # The ids are carried verbatim rather than reallocated for the same
+            # reason: the bytes that use them are verbatim too.
+            verbatim_relationships: dict[str, list[tuple[str, str, str, str | None]]] = {}
+            for part in ("word/styles.xml", "word/numbering.xml"):
+                if f"word/_rels/{part.rsplit('/', 1)[-1]}.rels" not in package.parts:
+                    continue
+                entries = [
+                    (rel_id, rel.rel_type, rel.target, rel.target_mode)
+                    for rel_id, rel in package.relationships(part).items()
+                ]
+                if entries:
+                    verbatim_relationships[part] = sorted(entries)
+            model.extras["verbatim_part_relationships"] = verbatim_relationships
             # mc:Ignorable on the document root declares which namespace
             # prefixes a reader may skip. The pure-docx shell template carries
             # its own, so without recording the source's, every rebuild
