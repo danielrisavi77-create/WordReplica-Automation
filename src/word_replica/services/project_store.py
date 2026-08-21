@@ -26,9 +26,20 @@ class ProjectPaths:
 
 
 class ProjectStore:
-    def __init__(self, app_root: Path | None = None) -> None:
+    def __init__(
+        self, app_root: Path | None = None, *, projects_under_app_root: bool = False
+    ) -> None:
+        """``projects_under_app_root`` keeps projects out of the source's tree.
+
+        A project normally lands beside the document it came from, which is
+        where someone rebuilding their own file expects to find it. A caller
+        reading a corpus it does not own -- the fidelity lab -- needs the
+        opposite, or every pass leaves a full project next to every document it
+        read. The default is unchanged.
+        """
         self.app_root = app_root or Path(user_documents_dir()) / "WordReplica" / "Projects"
         self.app_root.mkdir(parents=True, exist_ok=True)
+        self.projects_under_app_root = projects_under_app_root
         self.db_path = self.app_root / "projects.sqlite3"
         self._init_db()
 
@@ -44,7 +55,10 @@ class ProjectStore:
         source = source.resolve()
         snapshot = capture_source(source)
         project_id = uuid.uuid4().hex
-        root = source.parent / f"{source.stem}_rebuild" / project_id
+        # project_id is unique per call, so two documents of the same name from
+        # different directories cannot collide under a shared root.
+        home = self.app_root / "projects" if self.projects_under_app_root else source.parent
+        root = home / f"{source.stem}_rebuild" / project_id
         dirs = {
             name: root / name
             for name in ("source_snapshot", "working", "output", "backups", "logs", "qa")

@@ -151,12 +151,16 @@ class RebuildService:
         renderer=None,
         qa: Callable | None = None,
         interactive_service=None,
+        projects_under_app_root: bool = False,
     ) -> None:
         self.app_root = app_root
         self._parser = parser
         self._renderer = renderer
         self._qa = qa
         self._interactive_service = interactive_service
+        # Passed through to ProjectStore: a caller reading a corpus it does not
+        # own needs its projects kept out of that corpus's tree.
+        self.projects_under_app_root = projects_under_app_root
 
     @classmethod
     def for_testing(
@@ -203,7 +207,10 @@ class RebuildService:
         from word_replica.interactive.control import InteractiveRunControl
         from word_replica.services.interactive_rebuild import InteractiveRebuildService
 
-        store = ProjectStore(app_root=self.app_root)
+        store = ProjectStore(
+            app_root=self.app_root,
+            projects_under_app_root=self.projects_under_app_root,
+        )
         interactive = self._interactive_service or InteractiveRebuildService(
             parser=self._parser or DocxParser(), project_store=store
         )
@@ -227,7 +234,10 @@ class RebuildService:
                 reasons=["Word Replica v1 accepts .docx input only"],
             )
 
-        store = ProjectStore(app_root=self.app_root)
+        store = ProjectStore(
+            app_root=self.app_root,
+            projects_under_app_root=self.projects_under_app_root,
+        )
         snapshot = capture_source(source)
         paths = store.create_project(source, options)
         audit = AuditLog(paths.logs_dir / "audit.jsonl")

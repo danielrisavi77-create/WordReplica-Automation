@@ -186,7 +186,10 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("no eligible documents; run scan_cli first")
 
     workspace = Path(tempfile.mkdtemp(prefix="lane-p-"))
-    service = RebuildService(app_root=workspace)
+    # The corpus is read-only as far as the lab is concerned. Without this the
+    # rebuild leaves a full project -- snapshot, output, logs, QA -- beside every
+    # document it reads; a 400-document pass left 263 MB of them behind.
+    service = RebuildService(app_root=workspace, projects_under_app_root=True)
     options = _rebuild_options()
 
     outcomes: list[Outcome] = []
