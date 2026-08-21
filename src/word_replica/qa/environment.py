@@ -68,12 +68,40 @@ def _enumerate_windows_fonts() -> dict[str, Any]:
         return {"available": False, "count": 0, "names": [], "error": str(exc)}
 
 
+_PROBE_CACHE: dict[str, Any] = {}
+
+
+def reset_environment_probe_cache() -> None:
+    """Forget the probed environment. For tests; nothing in a run needs it."""
+    _PROBE_CACHE.clear()
+
+
+def _probe_once(key: str, probe) -> Any:
+    if key not in _PROBE_CACHE:
+        try:
+            _PROBE_CACHE[key] = probe()
+        except Exception as exc:  # a probe that raises must not block a report
+            _PROBE_CACHE[key] = {
+                "available": False,
+                "error": str(exc),
+                "exception_type": type(exc).__name__,
+            }
+    return _PROBE_CACHE[key]
+
+
 def capture_environment_fingerprint() -> dict[str, Any]:
     """Best-effort snapshot of the machine a QA/Golden run was verified on.
 
     Every sub-probe swallows its own failures so this never raises — a
     fingerprint with partial/error fields is still useful, and QA report
     generation must not be blocked by it.
+
+    The Word and font probes are taken once per process and reused. Neither can
+    change while a process runs, and the Word one is expensive in a way that
+    matters: it starts a dedicated Word through DispatchEx, so calling it from
+    every rebuild meant a pure-docx pass that needs no Word at all launched one
+    per document. Under contention with the Golden run those launches failed and
+    leaked WINWORD processes instead of quitting.
     """
     loc = locale.getlocale()
     return {
@@ -94,6 +122,6 @@ def capture_environment_fingerprint() -> dict[str, Any]:
             "default": loc[0],
             "encoding": loc[1] or sys.getdefaultencoding(),
         },
-        "word": _word_application_info(),
-        "fonts": _enumerate_windows_fonts(),
+        "word": _probe_once("word", lambda: _word_application_info()),
+        "fonts": _probe_once("fonts", lambda: _enumerate_windows_fonts()),
     }
