@@ -103,7 +103,8 @@ def _run_element(run: Run):
     node = _w("r")
     r_pr = None
     props = run.properties
-    if any(key in props for key in _RUN_PR_KEYS) or run.hidden:
+    extensions = props.get("extension_run_properties") or ()
+    if any(key in props for key in _RUN_PR_KEYS) or run.hidden or extensions:
         r_pr = etree.SubElement(node, f"{W}rPr")
         if any(props.get(key) is not None for _, key in _RUN_FONT_ATTRS):
             r_fonts = etree.SubElement(r_pr, f"{W}rFonts")
@@ -132,6 +133,16 @@ def _run_element(run: Run):
             _set_w(lang, "val", props.get("language"))
             _set_w(lang, "eastAsia", props.get("language_east_asia"))
             _set_w(lang, "bidi", props.get("language_bidi"))
+    if extensions and r_pr is not None:
+        # Appended last, which is where Word writes them and the only place they
+        # can go without disturbing the order w:rPr requires of its own children.
+        for fragment in extensions:
+            try:
+                r_pr.append(etree.fromstring(fragment))
+            except etree.XMLSyntaxError:
+                # A fragment that will not re-parse is dropped rather than
+                # allowed to corrupt the part; G10 reports the loss.
+                continue
     content_tokens = props.get("content_tokens") or ()
     has_field_tokens = any(token.get("kind") in _FIELD_TOKEN_KINDS for token in content_tokens)
     # A drawing token carries both: "kind" tells the interactive executor what

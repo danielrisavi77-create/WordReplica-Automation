@@ -364,6 +364,26 @@ def parse_run(node, ids: ElementIdFactory, path: str, package: DocxPackage | Non
         }
     )
     break_types: list[str] = []
+    # Run properties from outside the main namespace -- Word's own typography
+    # extensions, w14:textFill and the rest. The model does not represent them
+    # and the renderer builds a fresh w:rPr, so ignoring them meant losing them:
+    # a run that was a gradient came back flat.
+    #
+    # Only non-w: children are carried. An unmodelled w: property is a different
+    # question, because the renderer writes that namespace itself in a required
+    # order and copying elements into the middle of it is how a document starts
+    # needing repair.
+    if r_pr is not None:
+        from lxml import etree as _etree
+
+        extensions = [
+            _etree.tostring(child, encoding="unicode")
+            for child in r_pr
+            if isinstance(child.tag, str) and not child.tag.startswith(f"{{{W_NS}}}")
+        ]
+        if extensions:
+            properties["extension_run_properties"] = extensions
+
     content_tokens: list[dict[str, str]] = []
     for child in node:
         local = local_name(child)
