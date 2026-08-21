@@ -73,10 +73,14 @@ def test_ns_mask_sees_a_w15_feature_that_the_document_model_cannot(tmp_path):
     plain_model = DocxParser().parse(plain)
     w15_model = DocxParser().parse(with_w15)
 
-    # The part is not modelled at all -- it is not even kept as a preserved part.
-    assert plain_model.preserved_parts == {}
-    assert w15_model.preserved_parts == {}
-    # So every existing gate reports the two documents as equivalent...
+    # The part is carried now -- a part no relationship reaches is preserved
+    # rather than dropped, so a rebuild of this document keeps its w15 bytes.
+    # That makes the point sharper rather than weaker: the model gates are blind
+    # to the difference even when the difference survives the rebuild, because
+    # they compare parsed content and this part is never parsed.
+    assert "word/commentsExtended.xml" in w15_model.preserved_parts
+    assert "word/commentsExtended.xml" not in plain_model.preserved_parts
+    # Every existing gate still reports the two documents as equivalent...
     gates = build_model_gates(plain_model, w15_model)
     assert all(gate.passed for gate in gates.values()), {k: v.summary for k, v in gates.items()}
     # ...but the fingerprint can tell them apart.

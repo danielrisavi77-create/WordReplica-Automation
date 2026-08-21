@@ -597,6 +597,12 @@ _BODY_REFERENCED_PREFIXES = ("word/charts/", "word/embeddings/", "word/diagrams/
 # relationship" would also match styles.xml, settings.xml, numbering.xml,
 # fontTable.xml and theme1.xml -- parts the renderer builds itself, which
 # restoring verbatim would silently overwrite.
+_RENDERER_AUTHORED_PARTS = frozenset({
+    "word/document.xml",
+    "word/styles.xml",
+    "word/numbering.xml",
+    "word/settings.xml",
+})
 _ATTACHMENT_RELATIONSHIP_TYPES = frozenset({
     "customXml",
     "customXmlProps",
@@ -1137,6 +1143,26 @@ class DocxParser:
                         continue
                     external_relationships.append((rels_part, rel.rel_type, rel.target))
             model.extras["source_external_relationships"] = sorted(set(external_relationships))
+
+            # And parts no relationship reaches at all. Every mechanism above
+            # starts from a relationship, so a package holding an unreachable
+            # part -- LibreOffice leaves word/webSettings.xml and
+            # word/stylesWithEffects.xml behind this way -- lost it silently.
+            #
+            # Word does not read a part it cannot reach, which is the argument
+            # for carrying it rather than against: tidying away bytes the source
+            # shipped is a change to the package, just one whose harmlessness we
+            # would be asserting instead of checking.
+            for part in sorted(package.parts):
+                if part.endswith((".rels", "/")) or part == "[Content_Types].xml":
+                    continue
+                if part in part_relationships or part in model.preserved_parts:
+                    continue
+                # The renderer authors these itself; restoring a source copy
+                # would overwrite what it wrote.
+                if part in _RENDERER_AUTHORED_PARTS or part.startswith("docProps/"):
+                    continue
+                _preserve(part, None, sidecar=True)
 
             for rel in package.relationships("word/document.xml").values():
                 if rel.target_mode == "External":
