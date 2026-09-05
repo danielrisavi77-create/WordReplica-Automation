@@ -69,7 +69,9 @@ def evaluate_run(state: AutomationState, report: dict) -> AutomationDecision:
             promotion_ready=False,
         )
 
-    if score > state.best_score:
+    if full_pass:
+        state.no_improvement_count = 0
+    elif score > state.best_score:
         state.best_score = score
         state.no_improvement_count = 0
     else:

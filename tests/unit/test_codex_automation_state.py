@@ -39,6 +39,28 @@ def test_two_full_passes_on_same_commit_make_promotion_ready():
     assert second.promotion_ready is True
 
 
+def test_first_clean_full_pass_resets_stale_no_improvement_fail_safe():
+    gates = _gates(*[f"G{i}" for i in range(10)])
+    state = AutomationState(
+        last_gate_status=gates,
+        best_score=10,
+        no_improvement_count=21,
+    )
+    full = {
+        "gates": gates,
+        "full_pass": True,
+        "commit_sha": "new-clean-commit",
+        "worktree_clean": True,
+    }
+
+    decision = evaluate_run(state, full)
+
+    assert decision.stop_required is False
+    assert decision.promotion_ready is False
+    assert state.no_improvement_count == 0
+    assert state.consecutive_full_pass_same_commit == 1
+
+
 def test_dirty_worktree_full_pass_never_counts_toward_promotion():
     state = AutomationState()
     full = {
