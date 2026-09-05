@@ -155,6 +155,11 @@ class BlueprintCompiler:
         events.append(ReconstructionEvent("BeginTable", table.element_id, {"rows": plan.row_count, "columns": plan.column_count}))
         events.append(ReconstructionEvent("SetTableProperties", table.element_id, plan.properties))
         for index, width in enumerate(plan.properties.get("grid_column_widths", ()) or (), start=1):
+            # No declared width (autofit column) - leave Word's own layout in
+            # place rather than forcing a fabricated width. A width of 0 is
+            # rejected outright by Word's Columns(n).Width COM setter.
+            if width is None:
+                continue
             events.append(ReconstructionEvent("SetColumnWidth", table.element_id, {"column": index, "width_twips": width}))
         for row_index, row_props in enumerate(plan.row_properties, start=1):
             if row_props:
@@ -273,6 +278,21 @@ class BlueprintCompiler:
             props["hidden"] = True
         return props
 
+    @staticmethod
+    def _paragraph_closing_field_begins(paragraph: Paragraph) -> set[tuple[int, int]]:
+        """Positions (run_index, token_index) of every field_begin token whose
+        matching field_end also appears within this same paragraph."""
+        stack: list[tuple[int, int]] = []
+        closing: set[tuple[int, int]] = set()
+        for run_index, run in enumerate(paragraph.runs):
+            for token_index, token in enumerate(run.properties.get("content_tokens") or ()):
+                kind = token.get("kind")
+                if kind == "field_begin":
+                    stack.append((run_index, token_index))
+                elif kind == "field_end" and stack:
+                    closing.add(stack.pop())
+        return closing
+
     def _compile_paragraph(
         self,
         paragraph: Paragraph,
@@ -299,7 +319,8 @@ class BlueprintCompiler:
         for marker in paragraph.properties.get("inline_markers", ()) or ():
             markers_by_index.setdefault(int(marker.get("run_index", 0)), []).append(marker)
 
-        field_state: dict[str, Any] | None = None
+        field_stack: list[dict[str, Any]] = []
+        closing_field_begins = self._paragraph_closing_field_begins(paragraph)
         for run_index, run in enumerate(paragraph.runs):
             self._emit_inline_markers(markers_by_index.get(run_index, ()), events, paragraph.element_id)
             run_props = self._effective_run_properties(paragraph, run, style_definition)
@@ -308,33 +329,57 @@ class BlueprintCompiler:
             if not tokens:
                 self._compile_legacy_run_content(run, events)
                 continue
-            for token in tokens:
+            for token_index, token in enumerate(tokens):
                 kind = token.get("kind")
                 if kind == "field_begin":
-                    field_state = {"instruction": [], "result": [], "source_element_id": run.element_id, "separated": False}
+                    # A field whose result spans beyond this paragraph (e.g. a TOC
+                    # field, whose visible result is many paragraphs of hyperlinked
+                    # text and nested PAGEREF fields) can never close here, so it is
+                    # left as an inert marker: its instruction/separate/end tokens
+                    # are simply skipped rather than swallowing everything nested
+                    # inside it as an unreachable "cached result". Only a field that
+                    # both opens and closes within this paragraph is tracked.
+                    if (run_index, token_index) in closing_field_begins:
+                        field_stack.append({"instruction": [], "result": [], "source_element_id": run.element_id})
                     continue
-                if kind == "field_instruction" and field_state is not None:
-                    field_state["instruction"].append(str(token.get("value", "")))
+                if kind == "field_instruction":
+                    if field_stack:
+                        field_stack[-1]["instruction"].append(str(token.get("value", "")))
                     continue
-                if kind == "field_separate" and field_state is not None:
-                    field_state["separated"] = True
+                if kind == "field_separate":
+                    if field_stack:
+                        field_stack[-1]["separated"] = True
                     continue
-                if kind == "field_end" and field_state is not None:
-                    instruction = "".join(field_state["instruction"]).strip()
-                    cached_result = "".join(field_state["result"])
-                    events.append(ReconstructionEvent(
-                        "CreateField", field_state["source_element_id"],
-                        {"instruction": instruction, "cached_result": cached_result},
-                    ))
-                    field_state = None
+                if kind == "field_end":
+                    if field_stack:
+                        finished = field_stack.pop()
+                        instruction = "".join(finished["instruction"]).strip()
+                        cached_result = "".join(finished["result"])
+                        payload: dict[str, Any] = {"instruction": instruction, "cached_result": cached_result}
+                        result_properties = finished.get("result_properties")
+                        if result_properties is not None:
+                            payload["result_properties"] = result_properties
+                        events.append(ReconstructionEvent(
+                            "CreateField", finished["source_element_id"], payload,
+                        ))
                     continue
-                if field_state is not None:
+                if field_stack and field_stack[-1].get("separated"):
                     # Keep the semantic field while preserving its source cached result.
                     # The cached text is not replayed as ordinary InsertCharacter events.
-                    if field_state.get("separated"):
-                        if kind == "text": field_state["result"].append(str(token.get("value", "")))
-                        elif kind == "tab": field_state["result"].append("\t")
-                        elif kind in {"line_break", "page_break"}: field_state["result"].append("\n")
+                    # Capture the formatting of the run that carries the result text too:
+                    # the field's closing marker run (always empty/default-formatted) emits
+                    # its own ApplyRunProperties event right after, which would otherwise
+                    # silently overwrite the result's real formatting before CreateField fires.
+                    top = field_stack[-1]
+                    if kind == "text":
+                        top["result"].append(str(token.get("value", "")))
+                        top.setdefault("result_properties", run_props)
+                    elif kind == "tab":
+                        top["result"].append("\t")
+                        top.setdefault("result_properties", run_props)
+                    elif kind in {"line_break", "page_break"}:
+                        top["result"].append("\n")
+                        top.setdefault("result_properties", run_props)
                     continue
                 self._compile_token(token, run, events, location)
         self._emit_inline_markers(markers_by_index.get(len(paragraph.runs), ()), events, paragraph.element_id)

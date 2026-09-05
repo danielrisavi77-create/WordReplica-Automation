@@ -9,6 +9,49 @@ from word_replica.services.project_store import ProjectStore
 from tests.fixtures.build_fixtures import build_plain_text
 
 
+def test_failed_interactive_event_is_audited_with_exact_context(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from word_replica.services.interactive_rebuild import _InteractiveServiceObserver
+
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    observer = _InteractiveServiceObserver(
+        SimpleNamespace(total_events=1, total_visible_characters=0, events=()),
+        SimpleNamespace(),
+        audit,
+    )
+    event = SimpleNamespace(
+        event_type="ApplyRunProperties",
+        source_element_id="paragraph-7-run-2",
+    )
+
+    class RejectedCall(RuntimeError):
+        hresult = -2147418111
+
+    observer.event_failed(
+        49,
+        event,
+        {"story": "body", "range_start": 120, "range_end": 120},
+        RejectedCall("Call was rejected by callee."),
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    failures = [row for row in rows if row["event_type"] == "INTERACTIVE_EVENT_FAILED"]
+    assert failures[-1]["payload"] == {
+        "event_index": 49,
+        "event_type": "ApplyRunProperties",
+        "source_element_id": "paragraph-7-run-2",
+        "error_type": "RejectedCall",
+        "error_hresult": -2147418111,
+        "error": "Call was rejected by callee.",
+    }
+
+
 def test_unexpected_word_bookmarks_are_removed_from_saved_package(tmp_path):
     from lxml import etree
 
@@ -728,22 +771,174 @@ def test_source_footer_parts_and_reference_types_are_restored(tmp_path):
         b"<w:sectPr><w:footerReference w:type='even' r:id='rId1'/><w:footerReference w:type='default' r:id='rId2'/></w:sectPr>"
         b"</w:body></w:document>"
     )
-    rels = b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'/>"
+    source_rels = (
+        b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"
+        b"<Relationship Id='rId1' Type='.../footer' Target='footer1.xml'/></Relationships>"
+    )
+    # Word renumbers physical footer parts on rebuild - the output package's
+    # "default" footer physically lives in footerB.xml, a name the source
+    # package never used, even though it is the semantically matching footer.
+    output_rels = (
+        b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"
+        b"<Relationship Id='rId1' Type='.../footer' Target='footerA.xml'/>"
+        b"<Relationship Id='rId2' Type='.../footer' Target='footerB.xml'/></Relationships>"
+    )
     with ZipFile(source, "w", ZIP_DEFLATED) as archive:
         archive.writestr("word/document.xml", document_source)
+        archive.writestr("word/_rels/document.xml.rels", source_rels)
         archive.writestr("word/footer1.xml", b"<w:ftr xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:p><w:r><w:t>source</w:t></w:r></w:p></w:ftr>")
     with ZipFile(output, "w", ZIP_DEFLATED) as archive:
         archive.writestr("word/document.xml", document_output)
-        archive.writestr("word/footer1.xml", b"output")
-        archive.writestr("word/_rels/document.xml.rels", rels)
+        archive.writestr("word/_rels/document.xml.rels", output_rels)
+        archive.writestr("word/footerA.xml", b"even-placeholder")
+        archive.writestr("word/footerB.xml", b"output")
 
     restored = InteractiveRebuildService._restore_source_footer_stories(output, source, [{"default"}])
 
     assert restored == 2
     with ZipFile(output) as archive:
-        assert b"source" in archive.read("word/footer1.xml")
+        assert b"source" in archive.read("word/footerB.xml")
         root = etree.fromstring(archive.read("word/document.xml"))
         assert len(root.xpath("//*[local-name()='footerReference' and @*[local-name()='type']='even']")) == 0
+        assert len(root.xpath("//*[local-name()='footerReference' and @*[local-name()='type']='default']")) == 1
+
+
+def test_footer_restoration_does_not_cross_sections_that_share_a_part_name(tmp_path):
+    # Regression: physical footer part numbering is independent of section order.
+    # Section 0's and section 1's "default" footers can end up sharing the exact
+    # same filename between the source and output packages (e.g. both happen to
+    # be "footer2.xml") purely by numbering coincidence - matching by filename
+    # would silently swap section 1's real content into section 0, and vice
+    # versa. Confirmed live against a real two-section document.
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    document = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main' "
+        b"xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'><w:body>"
+        b"<w:p><w:pPr><w:sectPr><w:footerReference w:type='default' r:id='rId1'/></w:sectPr></w:pPr></w:p>"
+        b"<w:sectPr><w:footerReference w:type='default' r:id='rId2'/></w:sectPr>"
+        b"</w:body></w:document>"
+    )
+    source_rels = (
+        b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"
+        b"<Relationship Id='rId1' Type='.../footer' Target='footer1.xml'/>"
+        b"<Relationship Id='rId2' Type='.../footer' Target='footer2.xml'/></Relationships>"
+    )
+    # In the output package, section 0's default footer physically lands in
+    # footer2.xml (numbering coincidentally collides with source's section 1).
+    output_rels = (
+        b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"
+        b"<Relationship Id='rId1' Type='.../footer' Target='footer2.xml'/>"
+        b"<Relationship Id='rId2' Type='.../footer' Target='footer1.xml'/></Relationships>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document)
+        archive.writestr("word/_rels/document.xml.rels", source_rels)
+        archive.writestr("word/footer1.xml", b"<w:ftr xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:p><w:r><w:t>section-zero</w:t></w:r></w:p></w:ftr>")
+        archive.writestr("word/footer2.xml", b"<w:ftr xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:p><w:r><w:t>section-one</w:t></w:r></w:p></w:ftr>")
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document)
+        archive.writestr("word/_rels/document.xml.rels", output_rels)
+        archive.writestr("word/footer1.xml", b"stale-section-one")
+        archive.writestr("word/footer2.xml", b"stale-section-zero")
+
+    restored = InteractiveRebuildService._restore_source_footer_stories(
+        output, source, [{"default"}, {"default"}],
+    )
+
+    assert restored == 2
+    with ZipFile(output) as archive:
+        # Section 0's footer (physically footer2.xml in the output) must get
+        # section-zero's content, not section-one's, despite the name collision.
+        assert archive.read("word/footer2.xml") == b"<w:ftr xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:p><w:r><w:t>section-zero</w:t></w:r></w:p></w:ftr>"
+        assert archive.read("word/footer1.xml") == b"<w:ftr xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:p><w:r><w:t>section-one</w:t></w:r></w:p></w:ftr>"
+
+
+def test_footer_reference_dropped_entirely_by_word_is_rebuilt(tmp_path):
+    # Regression: confirmed live that inserting an absolutely positioned image
+    # triggers Word's automatic repagination, which can silently delete a
+    # section's <w:footerReference> altogether (not just corrupt its content) -
+    # leaving that section with no footer at all in the saved package. There is
+    # no existing reference left to redirect in that case, so it must be rebuilt
+    # from scratch: a new relationship, a new physical part, a new Content_Types
+    # override, and a new <w:footerReference> reinserted into the section.
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    document_source = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main' "
+        b"xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'><w:body>"
+        b"<w:p><w:pPr><w:sectPr><w:footerReference w:type='default' r:id='rId1'/></w:sectPr></w:pPr></w:p>"
+        b"<w:sectPr><w:footerReference w:type='default' r:id='rId2'/></w:sectPr>"
+        b"</w:body></w:document>"
+    )
+    # Word dropped section 0's footerReference entirely while rebuilding.
+    document_output = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main' "
+        b"xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'><w:body>"
+        b"<w:p><w:pPr><w:sectPr/></w:pPr></w:p>"
+        b"<w:sectPr><w:footerReference w:type='default' r:id='rId1'/></w:sectPr>"
+        b"</w:body></w:document>"
+    )
+    source_rels = (
+        b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"
+        b"<Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer' Target='footer1.xml'/>"
+        b"<Relationship Id='rId2' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer' Target='footer2.xml'/></Relationships>"
+    )
+    output_rels = (
+        b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"
+        b"<Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer' Target='footer1.xml'/></Relationships>"
+    )
+    content_types = (
+        b"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'>"
+        b"<Override PartName='/word/footer1.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml'/>"
+        b"</Types>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document_source)
+        archive.writestr("word/_rels/document.xml.rels", source_rels)
+        archive.writestr("word/footer1.xml", b"<w:ftr xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:p><w:r><w:t>section-zero</w:t></w:r></w:p></w:ftr>")
+        archive.writestr("word/footer2.xml", b"<w:ftr xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:p><w:r><w:t>section-one</w:t></w:r></w:p></w:ftr>")
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document_output)
+        archive.writestr("word/_rels/document.xml.rels", output_rels)
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("word/footer1.xml", b"<w:ftr xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:p><w:r><w:t>section-one</w:t></w:r></w:p></w:ftr>")
+
+    restored = InteractiveRebuildService._restore_source_footer_stories(
+        output, source, [{"default"}, {"default"}],
+    )
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        doc_root = etree.fromstring(archive.read("word/document.xml"))
+        rels_root = etree.fromstring(archive.read("word/_rels/document.xml.rels"))
+        types_root = etree.fromstring(archive.read("[Content_Types].xml"))
+        ns = {
+            "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        }
+        sections = doc_root.xpath("//w:sectPr", namespaces=ns)
+        section_zero_refs = sections[0].xpath("./w:footerReference", namespaces=ns)
+        assert len(section_zero_refs) == 1
+        assert section_zero_refs[0].get("{%s}type" % ns["w"]) == "default"
+        new_rid = section_zero_refs[0].get("{%s}id" % ns["r"])
+        rel = next(r for r in rels_root if r.get("Id") == new_rid)
+        new_target = rel.get("Target")
+        assert new_target != "footer1.xml"  # must not collide with section 1's part
+        assert archive.read(f"word/{new_target}") == b"<w:ftr xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:p><w:r><w:t>section-zero</w:t></w:r></w:p></w:ftr>"
+        override = types_root.xpath(
+            f"//*[local-name()='Override' and @PartName='/word/{new_target}']"
+        )
+        assert len(override) == 1
+        assert override[0].get("ContentType") == "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"
+        # Section 1's own footer must be untouched.
+        section_one_refs = sections[1].xpath("./w:footerReference", namespaces=ns)
+        assert len(section_one_refs) == 1
+        assert section_one_refs[0].get("{%s}id" % ns["r"]) == "rId1"
 
 
 def test_relationship_free_source_header_story_is_restored_after_word_updates_field(tmp_path):
@@ -1080,6 +1275,59 @@ def test_cross_paragraph_field_does_not_block_restoration_of_other_fields(tmp_pa
     assert root.xpath("//w:t/text()", namespaces=ns) == ["OUTPUT TOC", "OUTPUT FLAT"]
 
 
+def test_missing_cross_paragraph_toc_shell_is_restored_without_changing_visible_text(tmp_path):
+    """Regression: WordReplica types every visible TOC entry and recreates its
+    nested PAGEREF fields, but the outer TOC begin/instruction/separate/end
+    spans several paragraphs and therefore is absent from the saved output.
+    Restoring only that outer shell must recover the semantic field without
+    replacing any visible result text or nested field.
+    """
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    source_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body>"
+        b"<w:p><w:r><w:fldChar w:fldCharType='begin'/></w:r>"
+        b"<w:r><w:instrText> TOC \\o &quot;1-3&quot; \\h \\z \\u </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>One</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r><w:r><w:instrText> PAGEREF _Toc1 \\h </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>1</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='end'/></w:r></w:p>"
+        b"<w:p><w:r><w:t>Two</w:t></w:r></w:p>"
+        b"<w:p><w:r><w:t>Three</w:t></w:r><w:r><w:fldChar w:fldCharType='end'/></w:r></w:p>"
+        b"</w:body></w:document>"
+    )
+    output_xml = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body>"
+        b"<w:p><w:r><w:t>One</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='begin'/></w:r><w:r><w:instrText> PAGEREF _Toc1 \\h </w:instrText></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='separate'/></w:r><w:r><w:t>1</w:t></w:r>"
+        b"<w:r><w:fldChar w:fldCharType='end'/></w:r></w:p>"
+        b"<w:p><w:r><w:t>Two</w:t></w:r></w:p>"
+        b"<w:p><w:r><w:t>Three</w:t></w:r></w:p>"
+        b"</w:body></w:document>"
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_source_cross_paragraph_field_shells(output, source)
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    assert root.xpath("//w:t/text()", namespaces=ns) == ["One", "1", "Two", "Three"]
+    assert root.xpath("//w:instrText/text()", namespaces=ns) == [
+        ' TOC \\o "1-3" \\h \\z \\u ',
+        " PAGEREF _Toc1 \\h ",
+    ]
+    assert len(root.xpath("//w:fldChar[@w:fldCharType='begin']", namespaces=ns)) == 2
+    assert len(root.xpath("//w:fldChar[@w:fldCharType='end']", namespaces=ns)) == 2
+
+
 def test_outer_field_does_not_overwrite_nested_output_result_inside_instruction(tmp_path):
     from lxml import etree
 
@@ -1269,9 +1517,84 @@ def test_blocked_preflight_never_creates_word_controller(tmp_path):
     assert (paths.logs_dir/"preflight.json").exists()
 
 
-def test_ready_start_executes_blueprint_and_writes_truthful_checkpoint(tmp_path):
+def test_first_event_failure_leaves_a_resumable_initial_checkpoint(tmp_path):
+    import json
+    import shutil
+
+    import pytest
+
+    from word_replica.interactive.control import InteractiveRunControl
+
+    source = build_plain_text(tmp_path / "source.docx")
+    store = ProjectStore(tmp_path / "projects")
+    options = RebuildOptions(reconstruction_mode=ReconstructionMode.INTERACTIVE)
+    paths = store.create_project(source, options)
+    audit = AuditLog(paths.logs_dir / "audit.jsonl")
+    service = InteractiveRebuildService(word_probe=lambda: True, project_store=store)
+    prepared = service.prepare(source, options, paths, audit)
+
+    class FirstEventFailureController:
+        def open_blank(self):
+            pass
+
+        def set_asset_resolver(self, resolver):
+            self.resolver = resolver
+
+        def execute_event(self, event):
+            raise RuntimeError("first event failed")
+
+        def save(self, path):
+            shutil.copy2(source, path)
+
+        def current_state_snapshot(self):
+            return {
+                "story": "body",
+                "range_start": 0,
+                "range_end": 0,
+                "paragraph_started": False,
+            }
+
+        def set_custom_property(self, name, value):
+            pass
+
+        def close(self):
+            pass
+
+    control = InteractiveRunControl()
+    control.start()
+    with pytest.raises(RuntimeError, match="first event failed"):
+        service.start(
+            prepared,
+            controller_factory=FirstEventFailureController,
+            control=control,
+        )
+
+    checkpoint_path = paths.logs_dir / "interactive_checkpoint.json"
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert checkpoint["last_completed_event_index"] == -1
+    assert checkpoint["status"] == "RUNNING"
+    assert checkpoint["output_path"] == str(
+        paths.output_dir / "source_reconstructed.docx"
+    )
+    assert Path(checkpoint["output_path"]).exists()
+
+
+def test_ready_start_executes_blueprint_and_writes_truthful_checkpoint(tmp_path, monkeypatch):
     from word_replica.interactive.control import InteractiveRunControl
     from word_replica.qa.render import RenderQaResult
+    from word_replica.services import interactive_rebuild as service_module
+
+    environment_calls = []
+
+    def capture_environment(*, include_word):
+        environment_calls.append(include_word)
+        return {}
+
+    monkeypatch.setattr(
+        service_module,
+        "capture_environment_fingerprint",
+        capture_environment,
+    )
     source=build_plain_text(tmp_path/"source.docx")
     store=ProjectStore(tmp_path/"projects")
     options=RebuildOptions(reconstruction_mode=ReconstructionMode.INTERACTIVE,
@@ -1311,6 +1634,7 @@ def test_ready_start_executes_blueprint_and_writes_truthful_checkpoint(tmp_path)
     assert result.save_count > 0
     assert (paths.logs_dir/"interactive_checkpoint.json").exists()
     assert store.get_project(paths.project_id)["status"] in {"VERIFYING","COMPLETED"}
+    assert environment_calls == [False]
 
 
 def test_default_controller_receives_background_visibility(tmp_path, monkeypatch):
@@ -1876,4 +2200,450 @@ def test_prepare_and_resume_recompute_identical_model_fingerprint_with_metadata_
     restored_model = service._parse_model_for_options(source, restored_options)
     restored_blueprint = BlueprintCompiler().compile(restored_model)
     assert restored_blueprint.source_model_fingerprint == prepared.blueprint.source_model_fingerprint
-    assert restored_blueprint.fingerprint == prepared.blueprint.fingerprint
+
+
+def test_source_numbering_definition_is_restored_after_word_mints_its_own_list(tmp_path):
+    # Regression: the interactive renderer can only ask Word for
+    # ListFormat.ApplyNumberDefault(), which mints a brand-new list (a
+    # different numId, Word's own default indent for that level) instead of
+    # reusing the source's actual numbering definition (numId=31, with its
+    # own indent baked into the level, not the paragraph). Both the numId
+    # mismatch and the silent indent drift must be fixed together by
+    # redirecting the numId reference back to source and replacing Word's
+    # generated numbering.xml with source's.
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    ns_decl = "xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'"
+    source_xml = (
+        f"<w:document {ns_decl}><w:body>"
+        "<w:p><w:pPr><w:numPr><w:ilvl w:val='0'/><w:numId w:val='31'/></w:numPr></w:pPr>"
+        "<w:r><w:t>Reference entry</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    ).encode()
+    output_xml = (
+        f"<w:document {ns_decl}><w:body>"
+        "<w:p><w:pPr><w:numPr><w:ilvl w:val='0'/><w:numId w:val='1'/></w:numPr></w:pPr>"
+        "<w:r><w:t>Reference entry</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    ).encode()
+    source_numbering = (
+        f"<w:numbering {ns_decl}>"
+        "<w:abstractNum w:abstractNumId='7'><w:lvl w:ilvl='0'>"
+        "<w:numFmt w:val='decimal'/><w:pPr><w:ind w:left='567' w:hanging='0'/></w:pPr>"
+        "</w:lvl></w:abstractNum>"
+        "<w:num w:numId='31'><w:abstractNumId w:val='7'/></w:num>"
+        "</w:numbering>"
+    ).encode()
+    output_numbering = (
+        f"<w:numbering {ns_decl}>"
+        "<w:abstractNum w:abstractNumId='0'><w:lvl w:ilvl='0'>"
+        "<w:numFmt w:val='decimal'/><w:pPr><w:ind w:left='927' w:hanging='360'/></w:pPr>"
+        "</w:lvl></w:abstractNum>"
+        "<w:num w:numId='1'><w:abstractNumId w:val='0'/></w:num>"
+        "</w:numbering>"
+    ).encode()
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+        archive.writestr("word/numbering.xml", source_numbering)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+        archive.writestr("word/numbering.xml", output_numbering)
+
+    restored = InteractiveRebuildService._restore_source_numbering_definitions(output, source)
+
+    assert restored == 1
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with ZipFile(output) as archive:
+        output_root = etree.fromstring(archive.read("word/document.xml"))
+        restored_numbering = archive.read("word/numbering.xml")
+    assert output_root.xpath("string(//w:numId/@w:val)", namespaces=ns) == "31"
+    assert restored_numbering == source_numbering
+
+
+def test_source_paragraph_explicit_indent_override_is_restored_alongside_numid(tmp_path):
+    # Regression: a source list paragraph can carry its own explicit <w:ind>
+    # overriding the numbering level's own indent (e.g. a tighter hanging
+    # indent for a bibliography-style entry). ApplyNumberDefault() resets the
+    # paragraph's indent to the list's own default when it runs - confirmed
+    # live: it fires after ApplyParagraphProperties already set the explicit
+    # indent, clobbering it - so the numId fix alone (which only helps when
+    # source has no paragraph-level override at all) is not enough here.
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    ns_decl = "xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'"
+    source_xml = (
+        f"<w:document {ns_decl}><w:body>"
+        "<w:p><w:pPr><w:numPr><w:ilvl w:val='0'/><w:numId w:val='2'/></w:numPr>"
+        "<w:ind w:left='567' w:firstLine='0'/></w:pPr>"
+        "<w:r><w:t>Reference entry</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    ).encode()
+    output_xml = (
+        f"<w:document {ns_decl}><w:body>"
+        "<w:p><w:pPr><w:numPr><w:ilvl w:val='0'/><w:numId w:val='2'/></w:numPr>"
+        "<w:ind w:left='927'/></w:pPr>"
+        "<w:r><w:t>Reference entry</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    ).encode()
+    numbering = b"<w:numbering xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'/>"
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+        archive.writestr("word/numbering.xml", numbering)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+        archive.writestr("word/numbering.xml", numbering)
+
+    restored = InteractiveRebuildService._restore_source_numbering_definitions(output, source)
+
+    assert restored == 1
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with ZipFile(output) as archive:
+        output_root = etree.fromstring(archive.read("word/document.xml"))
+    ind = output_root.find(".//w:ind", namespaces=ns)
+    assert ind.get(f"{{{ns['w']}}}left") == "567"
+    assert ind.get(f"{{{ns['w']}}}firstLine") == "0"
+
+
+def test_invisible_field_marker_run_formatting_is_restored(tmp_path):
+    # Regression: a multi-paragraph field's closing fldChar can land alone in
+    # its own paragraph, carrying its own formatting (e.g. bold) but no
+    # visible text - the renderer never creates that field at all (it can
+    # only replay a field whose begin/end are in the same paragraph), so the
+    # paragraph ends up with zero runs instead of source's one empty,
+    # formatted run. The fldChar/instrText content itself must NOT come
+    # back - only the formatting shell, since the field was never recreated.
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    ns_decl = "xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'"
+    source_xml = (
+        f"<w:document {ns_decl}><w:body>"
+        "<w:p><w:r><w:rPr><w:b/><w:bCs/><w:noProof/></w:rPr>"
+        "<w:fldChar w:fldCharType='end'/></w:r></w:p>"
+        "</w:body></w:document>"
+    ).encode()
+    output_xml = f"<w:document {ns_decl}><w:body><w:p/></w:body></w:document>".encode()
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_invisible_field_marker_run_formatting(output, source)
+
+    assert restored == 1
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with ZipFile(output) as archive:
+        output_root = etree.fromstring(archive.read("word/document.xml"))
+    runs = output_root.findall(".//w:r", namespaces=ns)
+    assert len(runs) == 1
+    assert runs[0].find("w:rPr/w:b", namespaces=ns) is not None
+    assert runs[0].find("w:fldChar", namespaces=ns) is None
+
+
+def test_invisible_field_marker_run_formatting_is_not_restored_when_source_paragraph_has_visible_text(tmp_path):
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    ns_decl = "xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'"
+    source_xml = (
+        f"<w:document {ns_decl}><w:body>"
+        "<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Visible</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    ).encode()
+    output_xml = f"<w:document {ns_decl}><w:body><w:p/></w:body></w:document>".encode()
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    before = output.read_bytes()
+    restored = InteractiveRebuildService._restore_invisible_field_marker_run_formatting(output, source)
+
+    assert restored == 0
+    assert output.read_bytes() == before
+
+
+def test_source_numbering_definitions_are_not_restored_when_numid_already_matches(tmp_path):
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    ns_decl = "xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'"
+    matching_xml = (
+        f"<w:document {ns_decl}><w:body>"
+        "<w:p><w:pPr><w:numPr><w:ilvl w:val='0'/><w:numId w:val='31'/></w:numPr></w:pPr>"
+        "<w:r><w:t>Reference entry</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    ).encode()
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", matching_xml)
+        archive.writestr("word/numbering.xml", b"<w:numbering xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'/>")
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", matching_xml)
+        archive.writestr("word/numbering.xml", b"<w:numbering xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'/>")
+
+    before = output.read_bytes()
+    restored = InteractiveRebuildService._restore_source_numbering_definitions(output, source)
+
+    assert restored == 0
+    assert output.read_bytes() == before
+
+
+def test_restore_source_run_segmentation_keeps_fast_text_layout_fidelity(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    ns_decl = "xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'"
+    rsid_attr = "w:rsidP='00112233'"
+    source_xml = (
+        f"<w:document {ns_decl}><w:body>"
+        "<w:p><w:pPr><w:jc w:val='both'/></w:pPr>"
+        "<w:r><w:t>First </w:t></w:r><w:r><w:t>second</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    ).encode()
+    output_xml = (
+        f"<w:document {ns_decl}><w:body>"
+        f"<w:p {rsid_attr}><w:pPr><w:jc w:val='both'/></w:pPr>"
+        "<w:r><w:lastRenderedPageBreak/><w:t>First second</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    ).encode()
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", source_xml)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", output_xml)
+
+    restored = InteractiveRebuildService._restore_source_run_segmentation(output, source)
+
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    paragraph = root.xpath("//w:body/w:p", namespaces=ns)[0]
+    runs = paragraph.findall("w:r", namespaces=ns)
+
+    assert restored == 1
+    assert ["".join(run.itertext()) for run in runs] == ["First ", "second"]
+    assert not paragraph.xpath(".//w:lastRenderedPageBreak", namespaces=ns)
+    assert paragraph.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}rsidP") is None
+
+
+def test_restore_declared_source_package_parts_and_relationships(tmp_path):
+    from types import SimpleNamespace
+
+    from word_replica.domain.model import PreservedPart
+    from word_replica.qa.preservation import build_preservation_gate
+
+    package_rels = "http://schemas.openxmlformats.org/package/2006/relationships"
+    office_rels = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    document = (
+        b"<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>"
+        b"<w:body><w:p><w:r><w:t>Text</w:t></w:r></w:p></w:body></w:document>"
+    )
+    content_types = (
+        b"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'>"
+        b"<Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/>"
+        b"<Default Extension='png' ContentType='image/png'/>"
+        b"<Default Extension='jpeg' ContentType='image/jpeg'/>"
+        b"<Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/>"
+        b"<Override PartName='/word/numbering.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml'/>"
+        b"<Override PartName='/customXml/item1.xml' ContentType='application/xml'/>"
+        b"<Override PartName='/customXml/itemProps1.xml' ContentType='application/vnd.openxmlformats-officedocument.customXmlProperties+xml'/>"
+        b"</Types>"
+    )
+    root_rels = (
+        f"<Relationships xmlns='{package_rels}'>"
+        f"<Relationship Id='rId1' Type='{office_rels}/officeDocument' Target='word/document.xml'/>"
+        f"<Relationship Id='rId2' Type='{package_rels}/metadata/thumbnail' Target='docProps/thumbnail.jpeg'/>"
+        "</Relationships>"
+    ).encode()
+    document_rels = (
+        f"<Relationships xmlns='{package_rels}'>"
+        f"<Relationship Id='rId1' Type='{office_rels}/customXml' Target='../customXml/item1.xml'/>"
+        f"<Relationship Id='rId2' Type='{office_rels}/numbering' Target='numbering.xml'/>"
+        "</Relationships>"
+    ).encode()
+    custom_rels = (
+        f"<Relationships xmlns='{package_rels}'>"
+        f"<Relationship Id='rId1' Type='{office_rels}/customXmlProps' Target='itemProps1.xml'/>"
+        "</Relationships>"
+    ).encode()
+    custom_item = b"<b:Sources xmlns:b='http://schemas.openxmlformats.org/officeDocument/2006/bibliography'/>"
+    custom_props = b"<ds:datastoreItem xmlns:ds='http://schemas.openxmlformats.org/officeDocument/2006/customXml'/>"
+    numbering = b"<w:numbering xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'/>"
+    source_parts = {
+        "[Content_Types].xml": content_types,
+        "_rels/.rels": root_rels,
+        "word/document.xml": document,
+        "word/_rels/document.xml.rels": document_rels,
+        "word/numbering.xml": numbering,
+        "customXml/item1.xml": custom_item,
+        "customXml/itemProps1.xml": custom_props,
+        "customXml/_rels/item1.xml.rels": custom_rels,
+        "word/media/image1.png": b"orphan-image",
+        "docProps/thumbnail.jpeg": b"thumbnail",
+    }
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        for name, data in source_parts.items():
+            archive.writestr(name, data)
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types.replace(
+            b"<Default Extension='png' ContentType='image/png'/>", b""
+        ).replace(
+            b"<Default Extension='jpeg' ContentType='image/jpeg'/>", b""
+        ).replace(
+            b"<Override PartName='/word/numbering.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml'/>", b""
+        ).replace(
+            b"<Override PartName='/customXml/item1.xml' ContentType='application/xml'/>", b""
+        ).replace(
+            b"<Override PartName='/customXml/itemProps1.xml' ContentType='application/vnd.openxmlformats-officedocument.customXmlProperties+xml'/>", b""
+        ))
+        archive.writestr("_rels/.rels", root_rels.replace(
+            f"<Relationship Id='rId2' Type='{package_rels}/metadata/thumbnail' Target='docProps/thumbnail.jpeg'/>".encode(), b""
+        ))
+        archive.writestr("word/document.xml", document)
+        archive.writestr(f"word/_rels/document.xml.rels", f"<Relationships xmlns='{package_rels}'/>".encode())
+
+    def preserved(name, rel_type=None, *, sidecar=False, owner="word/_rels/document.xml.rels"):
+        return PreservedPart(name, None, rel_type, "sha", source_parts[name], sidecar, owner)
+
+    model = SimpleNamespace(
+        numbering_xml=numbering,
+        preserved_parts={
+            name: part for name, part in [
+                ("customXml/item1.xml", preserved("customXml/item1.xml", f"{office_rels}/customXml")),
+                ("customXml/itemProps1.xml", preserved("customXml/itemProps1.xml", sidecar=True)),
+                ("customXml/_rels/item1.xml.rels", preserved("customXml/_rels/item1.xml.rels", sidecar=True)),
+                ("word/media/image1.png", preserved("word/media/image1.png", sidecar=True)),
+                ("docProps/thumbnail.jpeg", preserved("docProps/thumbnail.jpeg", f"{package_rels}/metadata/thumbnail", owner="_rels/.rels")),
+            ]
+        },
+    )
+
+    restored = InteractiveRebuildService._restore_source_package_parts(output, source, model)
+
+    assert restored == 6
+    assert build_preservation_gate(source, output).passed is True
+
+
+def test_restore_source_footer_topology_collapses_word_materialized_duplicates(tmp_path):
+    from lxml import etree
+
+    from word_replica.qa.preservation import build_preservation_gate
+
+    w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    r = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    pr = "http://schemas.openxmlformats.org/package/2006/relationships"
+    ct = "http://schemas.openxmlformats.org/package/2006/content-types"
+    footer_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+
+    def document(first_rid, second_rid):
+        return (
+            f"<w:document xmlns:w='{w}' xmlns:r='{r}'><w:body>"
+            f"<w:p><w:pPr><w:sectPr><w:footerReference w:type='default' r:id='{first_rid}'/>"
+            f"</w:sectPr></w:pPr></w:p><w:sectPr>"
+            f"<w:footerReference w:type='default' r:id='{second_rid}'/>"
+            f"</w:sectPr></w:body></w:document>"
+        ).encode()
+
+    def relationships(entries):
+        body = "".join(
+            f"<Relationship Id='{rid}' Type='{r}/footer' Target='{target}'/>"
+            for rid, target in entries
+        )
+        return f"<Relationships xmlns='{pr}'>{body}</Relationships>".encode()
+
+    def content_types(count):
+        overrides = "".join(
+            f"<Override PartName='/word/footer{index}.xml' ContentType='{footer_type}'/>"
+            for index in range(1, count + 1)
+        )
+        return (
+            f"<Types xmlns='{ct}'>"
+            f"<Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/>"
+            f"{overrides}</Types>"
+        ).encode()
+
+    source_footer = f"<w:ftr xmlns:w='{w}'><w:p/></w:ftr>".encode()
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types(3))
+        archive.writestr("word/document.xml", document("rIdReplica1", "rIdReplica1"))
+        archive.writestr("word/_rels/document.xml.rels", relationships([
+            ("rIdReplica1", "footer1.xml"),
+            ("rIdReplica2", "footer2.xml"),
+            ("rIdReplica3", "footer3.xml"),
+        ]))
+        archive.writestr("word/footer1.xml", source_footer)
+        archive.writestr("word/footer2.xml", f"<w:ftr xmlns:w='{w}'><w:p><w:r><w:t>unused-two</w:t></w:r></w:p></w:ftr>".encode())
+        archive.writestr("word/footer3.xml", f"<w:ftr xmlns:w='{w}'><w:p><w:r><w:t>unused-three</w:t></w:r></w:p></w:ftr>".encode())
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types(4))
+        archive.writestr("word/document.xml", document("rId10", "rId15"))
+        archive.writestr("word/_rels/document.xml.rels", relationships([
+            ("rId9", "footer1.xml"), ("rId10", "footer2.xml"),
+            ("rId12", "footer3.xml"), ("rId15", "footer4.xml"),
+        ]))
+        archive.writestr("word/footer1.xml", b"word-empty-one")
+        archive.writestr("word/footer2.xml", source_footer)
+        archive.writestr("word/footer3.xml", b"word-empty-three")
+        archive.writestr("word/footer4.xml", source_footer)
+
+    restored = InteractiveRebuildService._restore_source_footer_topology(output, source)
+
+    assert restored > 0
+    assert build_preservation_gate(source, output).passed is True
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+        rels_root = etree.fromstring(archive.read("word/_rels/document.xml.rels"))
+        targets = {node.get("Id"): node.get("Target") for node in rels_root}
+    refs = root.xpath("//w:footerReference/@r:id", namespaces={"w": w, "r": r})
+    assert len(refs) == 2
+    assert targets[refs[0]] == targets[refs[1]] == "footer1.xml"
+
+
+def test_restore_source_compatibility_settings_removes_word_added_defaults(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+    def settings(extra):
+        return (
+            f"<w:settings xmlns:w='{w}'><w:zoom w:percent='100'/><w:compat>"
+            f"<w:compatSetting w:name='compatibilityMode' w:uri='http://schemas.microsoft.com/office/word' w:val='14'/>"
+            f"{extra}</w:compat></w:settings>"
+        ).encode()
+
+    word_added = "".join(
+        f"<w:compatSetting w:name='{name}' w:uri='http://schemas.microsoft.com/office/word' w:val='1'/>"
+        for name in (
+            "overrideTableStyleFontSizeAndJustification",
+            "enableOpenTypeFeatures",
+            "doNotFlipMirrorIndents",
+        )
+    )
+    with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/settings.xml", settings(""))
+    with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("word/settings.xml", settings(word_added))
+        archive.writestr("word/unchanged.bin", b"unchanged")
+
+    restored = InteractiveRebuildService._restore_source_compatibility_settings(
+        output, source
+    )
+
+    assert restored == 1
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/settings.xml"))
+        assert archive.read("word/unchanged.bin") == b"unchanged"
+    names = root.xpath(
+        "./w:compat/w:compatSetting/@w:name", namespaces={"w": w}
+    )
+    assert names == ["compatibilityMode"]
+    assert root.xpath("./w:zoom/@w:percent", namespaces={"w": w}) == ["100"]

@@ -51,6 +51,7 @@ def process_creation_filetime(pid: int) -> int:
         kernel32.CloseHandle(handle)
 
 ENV_OWNERSHIP_FILE = "WORD_REPLICA_WORD_OWNERSHIP_FILE"
+ENV_OWNER_PROCESS_PID = "WORD_REPLICA_WORD_OWNER_PID"
 
 
 def _default_pid_resolver(hwnd: int) -> int:
@@ -169,7 +170,10 @@ def record_owned_word(application, *, role: str, pid_resolver: Callable[[int], i
     entry = {
         "pid": pid,
         "hwnd": hwnd,
-        "owner_process_pid": int(os.getpid() if owner_pid is None else owner_pid),
+        "owner_process_pid": int(
+            os.environ.get(ENV_OWNER_PROCESS_PID, os.getpid())
+            if owner_pid is None else owner_pid
+        ),
         "role": str(role),
         "started_filetime": started_filetime,
         "recorded_utc": datetime.now(timezone.utc).isoformat(),

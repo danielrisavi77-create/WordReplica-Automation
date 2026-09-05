@@ -14,18 +14,19 @@ PUBLIC_KEY_PATH = FIXTURE_DIR / "public-key.spki.b64url"
 
 # The published fixture signs over this exact 28-byte public source vector.
 SOURCE_BYTES = "PK-public-repair-contract-v1".encode("utf-8")
+TARGET_BYTES = "PK-public-repair-contract-v1-target".encode("utf-8")
 NOW = datetime(2026, 8, 16, 10, 30, tzinfo=timezone.utc)  # inside the fixture's 10:00-11:00 window
-ENGINE_VERSION = "1.0.0"  # matches the fixture's engineMinVersion == engineMaxVersion
+ENGINE_VERSION = "0.1.0"  # matches the fixture's engineMinVersion == engineMaxVersion
 
 
-def _write_package(tmp_path: Path, *, source_bytes: bytes = SOURCE_BYTES, target_bytes: bytes = b"corrected") -> RepairPackageRequest:
+def _write_package(tmp_path: Path, *, source_bytes: bytes = SOURCE_BYTES, target_bytes: bytes = TARGET_BYTES) -> RepairPackageRequest:
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
     original_dir = tmp_path / "in"
     original_dir.mkdir()
     original_path = original_dir / contract["sourceFileName"]
     original_path.write_bytes(source_bytes)
 
-    target_path = original_dir / contract["outputPolicy"]["suggestedFileName"]
+    target_path = original_dir / contract["targetFileName"]
     target_path.write_bytes(target_bytes)
 
     contract_path = tmp_path / "contract.json"
@@ -46,6 +47,8 @@ def test_validates_a_correct_package_and_reserves_an_output_path(tmp_path):
     request = _write_package(tmp_path)
     validated = load_and_validate_package(request, now=NOW, engine_version=ENGINE_VERSION)
     assert validated.original_snapshot.sha256 == validated.contract.source_sha256
+    assert validated.target_snapshot.sha256 == validated.contract.target_sha256
+    assert validated.target_snapshot.size == validated.contract.target_size
     assert validated.output_path.name == validated.contract.output_policy.suggested_file_name
     assert validated.output_path.parent == request.output_dir.resolve()
     assert not validated.output_path.exists()
@@ -102,6 +105,21 @@ def test_rejects_source_bytes_that_do_not_match_the_signed_hash(tmp_path):
     with pytest.raises(RepairPackageError) as excinfo:
         load_and_validate_package(request, now=NOW, engine_version=ENGINE_VERSION)
     assert excinfo.value.code == "source-hash-mismatch"
+
+
+def test_rejects_target_bytes_that_do_not_match_the_signed_hash_before_word(tmp_path):
+    tampered_same_size = bytes([TARGET_BYTES[0] ^ 1]) + TARGET_BYTES[1:]
+    request = _write_package(tmp_path, target_bytes=tampered_same_size)
+    with pytest.raises(RepairPackageError) as excinfo:
+        load_and_validate_package(request, now=NOW, engine_version=ENGINE_VERSION)
+    assert excinfo.value.code == "target-hash-mismatch"
+
+
+def test_rejects_target_size_mismatch_before_hash_check(tmp_path):
+    request = _write_package(tmp_path, target_bytes=TARGET_BYTES + b"!")
+    with pytest.raises(RepairPackageError) as excinfo:
+        load_and_validate_package(request, now=NOW, engine_version=ENGINE_VERSION)
+    assert excinfo.value.code == "target-size-mismatch"
 
 
 def test_rejects_before_created_at(tmp_path):

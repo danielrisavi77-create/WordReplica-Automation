@@ -11,8 +11,9 @@ VALID_KWARGS = dict(
     source_sha256="b" * 64,
     target_sha256="c" * 64,
     project_id="project-1",
-    output_path=r"C:\out\repaired.docx",
-    engine_version="1.0.0",
+    working_output_path=r"C:\projects\project-1\output\working.docx",
+    destination_path=r"C:\out\repaired.docx",
+    engine_version="0.1.0",
 )
 
 
@@ -39,9 +40,10 @@ def test_stored_binding_json_has_exact_schema_keys_and_no_document_text(tmp_path
     data = json.loads(path.read_text(encoding="utf-8"))
     assert set(data.keys()) == {
         "schemaVersion", "jobId", "contractSha256", "sourceSha256", "targetSha256",
-        "projectId", "outputPath", "engineVersion",
+        "projectId", "workingOutputPath", "destinationPath", "engineVersion",
     }
-    assert data["schemaVersion"] == 1
+    assert data["schemaVersion"] == 2
+    assert data["workingOutputPath"] != data["destinationPath"]
 
 
 def test_validate_succeeds_when_every_bound_value_matches(tmp_path):
@@ -53,7 +55,9 @@ def test_validate_succeeds_when_every_bound_value_matches(tmp_path):
         contract_sha256=VALID_KWARGS["contract_sha256"],
         source_sha256=VALID_KWARGS["source_sha256"],
         target_sha256=VALID_KWARGS["target_sha256"],
-        output_path=VALID_KWARGS["output_path"],
+        project_id=VALID_KWARGS["project_id"],
+        working_output_path=VALID_KWARGS["working_output_path"],
+        destination_path=VALID_KWARGS["destination_path"],
         engine_version=VALID_KWARGS["engine_version"],
     )
     assert validated == binding
@@ -63,7 +67,9 @@ def test_validate_succeeds_when_every_bound_value_matches(tmp_path):
     ("contract_sha256", "z" * 64),
     ("source_sha256", "z" * 64),
     ("target_sha256", "z" * 64),
-    ("output_path", r"C:\out\different.docx"),
+    ("project_id", "project-2"),
+    ("working_output_path", r"C:\projects\project-1\output\different.docx"),
+    ("destination_path", r"C:\out\different.docx"),
     ("engine_version", "2.0.0"),
 ])
 def test_validate_rejects_any_drifted_bound_value(tmp_path, field, new_value):
@@ -74,7 +80,9 @@ def test_validate_rejects_any_drifted_bound_value(tmp_path, field, new_value):
         "contract_sha256": VALID_KWARGS["contract_sha256"],
         "source_sha256": VALID_KWARGS["source_sha256"],
         "target_sha256": VALID_KWARGS["target_sha256"],
-        "output_path": VALID_KWARGS["output_path"],
+        "project_id": VALID_KWARGS["project_id"],
+        "working_output_path": VALID_KWARGS["working_output_path"],
+        "destination_path": VALID_KWARGS["destination_path"],
         "engine_version": VALID_KWARGS["engine_version"],
     }
     call_kwargs[field] = new_value
@@ -99,7 +107,9 @@ def test_validate_rejects_a_binding_filed_under_the_wrong_job_id(tmp_path):
             contract_sha256=VALID_KWARGS["contract_sha256"],
             source_sha256=VALID_KWARGS["source_sha256"],
             target_sha256=VALID_KWARGS["target_sha256"],
-            output_path=VALID_KWARGS["output_path"],
+            project_id=VALID_KWARGS["project_id"],
+            working_output_path=VALID_KWARGS["working_output_path"],
+            destination_path=VALID_KWARGS["destination_path"],
             engine_version=VALID_KWARGS["engine_version"],
         )
     assert excinfo.value.code == "binding-mismatch"
@@ -118,7 +128,7 @@ def test_load_rejects_a_binding_with_wrong_schema_version(tmp_path):
     binding = RepairRunBinding.build(**VALID_KWARGS)
     path = store.create(binding)
     data = json.loads(path.read_text(encoding="utf-8"))
-    data["schemaVersion"] = 2
+    data["schemaVersion"] = 1
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(RepairPackageError) as excinfo:
         store.load(binding.job_id)
@@ -135,3 +145,24 @@ def test_load_rejects_a_binding_with_unexpected_keys(tmp_path):
     with pytest.raises(RepairPackageError) as excinfo:
         store.load(binding.job_id)
     assert excinfo.value.code == "invalid-binding"
+
+
+def test_build_rejects_aliased_working_and_destination_paths():
+    with pytest.raises(ValueError):
+        RepairRunBinding.build(
+            **{
+                **VALID_KWARGS,
+                "destination_path": VALID_KWARGS["working_output_path"],
+            }
+        )
+
+
+def test_store_is_idempotent_for_same_binding_but_refuses_rebinding(tmp_path):
+    store = RepairRunBindingStore(app_root=tmp_path)
+    binding = RepairRunBinding.build(**VALID_KWARGS)
+    first = store.create(binding)
+    assert store.create(binding) == first
+    changed = RepairRunBinding.build(**{**VALID_KWARGS, "project_id": "project-2"})
+    with pytest.raises(RepairPackageError) as excinfo:
+        store.create(changed)
+    assert excinfo.value.code == "binding-mismatch"

@@ -215,26 +215,96 @@ def _story_blocks_projection(model, blocks) -> list[dict]:
 
 
 def _header_footer_projection(model) -> dict:
+    # model.headers/model.footers are keyed by physical part name
+    # ("word/footer1.xml"), which a rebuild can freely renumber (Word
+    # materializes its own even/first/default variants on save) without
+    # changing which section a story actually belongs to. Comparing by that
+    # name would silently pair up semantically unrelated stories that happen
+    # to share a number - key by (section index, story type) instead, resolved
+    # through each model's own section -> relationship -> part mapping, so the
+    # comparison survives that renumbering.
+    def by_section_and_type(kind: str, story_map: dict) -> dict:
+        result: dict[str, Any] = {}
+        for index, section in enumerate(model.sections):
+            for ref in (section.properties.get(f"{kind}_refs") or []):
+                rel = model.relationships.get(f"word/document.xml:{ref.get('rel_id')}")
+                if rel is None or rel.target not in story_map:
+                    continue
+                key = f"{index}:{ref.get('type', 'default')}"
+                result[key] = _story_blocks_projection(model, story_map[rel.target])
+        if not result and story_map:
+            # No section -> relationship mapping was available to resolve
+            # (e.g. a hand-built model in a test that skips that plumbing) -
+            # fall back to the original part-name keying rather than silently
+            # comparing nothing.
+            return {
+                str(key): _story_blocks_projection(model, blocks)
+                for key, blocks in sorted(story_map.items(), key=lambda item: str(item[0]))
+            }
+        return result
+
     return {
-        "headers": {
-            str(key): _story_blocks_projection(model, blocks)
-            for key, blocks in sorted(model.headers.items(), key=lambda item: str(item[0]))
-        },
-        "footers": {
-            str(key): _story_blocks_projection(model, blocks)
-            for key, blocks in sorted(model.footers.items(), key=lambda item: str(item[0]))
-        },
+        "headers": by_section_and_type("header", model.headers),
+        "footers": by_section_and_type("footer", model.footers),
     }
+
+
+def _normalize_field_instruction(instruction: str) -> str:
+    # \* MERGEFORMAT is a cosmetic "preserve formatting on update" switch, not
+    # part of the field's identity or result - Word adds or duplicates it
+    # unconditionally whenever it serializes a field as fldSimple on save
+    # (confirmed live: a source instruction that already ends in \* MERGEFORMAT
+    # comes back with it appended a second time), regardless of what the
+    # source instruction actually specified. Comparing fidelity on it would
+    # flag a difference Word itself introduces on every save, not one the
+    # renderer controls.
+    tokens = instruction.split()
+    normalized: list[str] = []
+    index = 0
+    while index < len(tokens):
+        if (
+            tokens[index] == "\\*"
+            and index + 1 < len(tokens)
+            and tokens[index + 1].casefold() == "mergeformat"
+        ):
+            index += 2
+            continue
+        normalized.append(tokens[index])
+        index += 1
+    return " ".join(normalized)
+
+
+def _fields_projection(fields) -> dict:
+    # Keyed by content, not list position: a field with no counterpart on the
+    # other side (e.g. a multi-paragraph TOC field the renderer can never
+    # replay - see BlueprintCompiler._paragraph_closing_field_begins) would
+    # otherwise shift every same-index comparison after it for the rest of
+    # the document, drowning out real mismatches in positional noise. Same
+    # (instruction, result_text) pairs occurring more than once are
+    # disambiguated by their own occurrence order, which still only shifts
+    # within that one repeated group instead of the whole remaining list.
+    from collections import Counter
+
+    occurrence_counts: Counter = Counter()
+    projected: dict[str, dict] = {}
+    for entry in fields:
+        instruction = _normalize_field_instruction(entry.instruction)
+        base_key = f"{instruction}::{entry.result_text}"
+        occurrence_counts[base_key] += 1
+        key = f"{base_key}#{occurrence_counts[base_key]}"
+        projected[key] = {
+            "instruction": instruction,
+            "result_text": entry.result_text,
+            "locked": entry.locked,
+        }
+    return projected
 
 
 def _semantic_projection(model) -> dict:
     from word_replica.qa.content import _walk_blocks
 
     return {
-        "fields": [
-            {"instruction": field.instruction, "result_text": field.result_text, "locked": field.locked}
-            for field in model.fields
-        ],
+        "fields": _fields_projection(model.fields),
         "bookmarks": [
             {"name": bookmark.name, "start_path": bookmark.start_path, "end_path": bookmark.end_path}
             for bookmark in model.bookmarks
@@ -272,29 +342,19 @@ def build_model_gates(source_model, output_model) -> dict[str, GateResult]:
 
 
 def build_visual_gate(render_result, *, changed_pixel_tolerance: float, mae_tolerance: float) -> GateResult:
-    from word_replica.qa.render import ANTIALIASING_BLUR_RADIUS
+    from word_replica.qa.render import (
+        ANTIALIASING_BLUR_RADIUS,
+        BLURRED_ANTIALIASING_CHANGED_PIXEL_ALLOWANCE,
+        BLURRED_ANTIALIASING_MAE_ALLOWANCE,
+        LEGACY_ANTIALIASING_CHANGED_PIXEL_ALLOWANCE,
+        LEGACY_ANTIALIASING_MAE_ALLOWANCE,
+        visual_metric_acceptance_mode,
+    )
 
-    antialiasing_ratio_allowance = max(changed_pixel_tolerance, 0.03)
-    antialiasing_mae_allowance = max(mae_tolerance, 1.0)
-    blurred_antialiasing_ratio_allowance = max(changed_pixel_tolerance, 0.04)
-    blurred_antialiasing_mae_allowance = max(mae_tolerance, 1.0)
-
-    def acceptance_mode(metric) -> str | None:
-        if not metric.same_dimensions:
-            return None
-        strict = metric.changed_pixel_ratio <= changed_pixel_tolerance and metric.mean_absolute_error <= mae_tolerance
-        if strict:
-            return "strict"
-        antialiasing = metric.changed_pixel_ratio <= antialiasing_ratio_allowance and metric.mean_absolute_error <= antialiasing_mae_allowance
-        if antialiasing:
-            return "legacy_antialiasing"
-        blurred_mae = getattr(metric, "blurred_mean_absolute_error", None)
-        blurred_antialiasing = (
-            blurred_mae is not None
-            and metric.changed_pixel_ratio <= blurred_antialiasing_ratio_allowance
-            and blurred_mae <= blurred_antialiasing_mae_allowance
-        )
-        return "blurred_antialiasing" if blurred_antialiasing else None
+    antialiasing_ratio_allowance = max(changed_pixel_tolerance, LEGACY_ANTIALIASING_CHANGED_PIXEL_ALLOWANCE)
+    antialiasing_mae_allowance = max(mae_tolerance, LEGACY_ANTIALIASING_MAE_ALLOWANCE)
+    blurred_antialiasing_ratio_allowance = max(changed_pixel_tolerance, BLURRED_ANTIALIASING_CHANGED_PIXEL_ALLOWANCE)
+    blurred_antialiasing_mae_allowance = max(mae_tolerance, BLURRED_ANTIALIASING_MAE_ALLOWANCE)
 
     first = None
     acceptance_mode_counts = {
@@ -305,7 +365,11 @@ def build_visual_gate(render_result, *, changed_pixel_tolerance: float, mae_tole
     }
     blur_assisted_pages = []
     for index, metric in enumerate(getattr(render_result, "metrics", []) or [], start=1):
-        mode = acceptance_mode(metric)
+        mode = visual_metric_acceptance_mode(
+            metric,
+            changed_pixel_tolerance=changed_pixel_tolerance,
+            mae_tolerance=mae_tolerance,
+        )
         if mode is None:
             acceptance_mode_counts["failed"] += 1
         else:
@@ -390,9 +454,12 @@ def audit_docx_pair(
     pdf_comparer=None,
     page_text_extractor=None,
     compatibility_mode_reader=None,
+    gate_names: Sequence[str] = DEFAULT_GATE_NAMES,
     visual_dpi: int = 144,
     changed_pixel_tolerance: float = 0.001,
     mae_tolerance: float = 0.25,
+    custom_properties_dropped_by_policy: bool = False,
+    application_properties_rewritten_by_policy: bool = False,
 ) -> dict[str, Any]:
     from pathlib import Path
     from word_replica.parser.parser import DocxParser
@@ -409,6 +476,15 @@ def audit_docx_pair(
     source_model = parser.parse(Path(source_docx))
     output_model = parser.parse(Path(output_docx))
     gates = build_model_gates(source_model, output_model)
+    if "G10" in gate_names:
+        from word_replica.qa.preservation import build_preservation_gate
+
+        gates["G10"] = build_preservation_gate(
+            Path(source_docx),
+            Path(output_docx),
+            custom_properties_dropped_by_policy=custom_properties_dropped_by_policy,
+            application_properties_rewritten_by_policy=application_properties_rewritten_by_policy,
+        )
 
     source_pdf = qa_dir / "source.pdf"
     output_pdf = qa_dir / "output.pdf"
@@ -461,4 +537,5 @@ def audit_docx_pair(
         source_page_count=len(source_page_texts) if source_page_texts else None,
         output_page_count=len(output_page_texts) if output_page_texts else None,
         compatibility_mode=compatibility_mode,
+        gate_names=gate_names,
     )

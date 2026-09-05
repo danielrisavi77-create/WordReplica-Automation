@@ -17,6 +17,7 @@ class CodexAutomationConfig:
     reconstruction_timeout_seconds: int = 14_400
     audit_timeout_seconds: int = 1800
     keep_success_runs: int = 1
+    minimum_free_space_mb: int = 0
     keep_failure_runs: int = 2
     visual_dpi: int = 144
     changed_pixel_tolerance: float = 0.001

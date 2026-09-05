@@ -33,7 +33,7 @@ def test_the_word_probe_runs_once_however_many_fingerprints_are_taken(monkeypatc
     environment.reset_environment_probe_cache()
 
     for _ in range(5):
-        environment.capture_environment_fingerprint()
+        environment.capture_environment_fingerprint(include_word=True)
 
     assert len(calls) == 1
 
@@ -62,7 +62,7 @@ def test_the_word_information_still_reaches_the_fingerprint(monkeypatch):
     )
     environment.reset_environment_probe_cache()
 
-    fingerprint = environment.capture_environment_fingerprint()
+    fingerprint = environment.capture_environment_fingerprint(include_word=True)
 
     assert fingerprint["word"]["version"] == "14.0"
     assert fingerprint["word"]["build"] == "7015"
@@ -94,7 +94,7 @@ def test_a_failing_probe_is_reported_rather_than_raised(monkeypatch):
     monkeypatch.setattr(environment, "_enumerate_windows_fonts", probe)
     environment.reset_environment_probe_cache()
 
-    fingerprint = environment.capture_environment_fingerprint()
+    fingerprint = environment.capture_environment_fingerprint(include_word=True)
 
     assert fingerprint["word"]["available"] is False
     assert fingerprint["fonts"]["available"] is False
@@ -109,8 +109,38 @@ def test_the_cache_can_be_reset(monkeypatch):
     )
 
     environment.reset_environment_probe_cache()
-    environment.capture_environment_fingerprint()
+    environment.capture_environment_fingerprint(include_word=True)
     environment.reset_environment_probe_cache()
-    environment.capture_environment_fingerprint()
+    environment.capture_environment_fingerprint(include_word=True)
 
     assert len(calls) == 2
+
+
+def test_a_word_free_fingerprint_does_not_launch_word(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        environment,
+        "_word_application_info",
+        lambda: (calls.append(1), {"available": True})[1],
+    )
+    environment.reset_environment_probe_cache()
+
+    fingerprint = environment.capture_environment_fingerprint(include_word=False)
+
+    assert calls == []
+    assert fingerprint["word"] == {"available": False, "skipped": True}
+
+
+def test_the_default_fingerprint_is_word_free(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        environment,
+        "_word_application_info",
+        lambda: (calls.append(1), {"available": True})[1],
+    )
+    environment.reset_environment_probe_cache()
+
+    fingerprint = environment.capture_environment_fingerprint()
+
+    assert calls == []
+    assert fingerprint["word"] == {"available": False, "skipped": True}

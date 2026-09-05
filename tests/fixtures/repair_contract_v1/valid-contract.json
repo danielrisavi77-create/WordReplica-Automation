@@ -5,10 +5,13 @@
   "sourceSha256": "f2d108400a0174d8737b8529bf3956fb6108e75c303158e93ef8de799fdafcbe",
   "sourceSize": 28,
   "sourceFileName": "Kalogjera - seminar Havel.docx",
+  "targetSha256": "561a4ba09db7f3bc9a109ac02496321f8d866ececc338fc11a6fe30436977cb7",
+  "targetSize": 35,
+  "targetFileName": "Kalogjera - seminar Havel-popravljeno.docx",
   "createdAt": "2026-08-16T10:00:00.000Z",
   "expiresAt": "2026-08-16T11:00:00.000Z",
-  "engineMinVersion": "1.0.0",
-  "engineMaxVersion": "1.0.0",
+  "engineMinVersion": "0.1.0",
+  "engineMaxVersion": "0.1.0",
   "requests": [
     {
       "requestId": "req-0001",
@@ -66,6 +69,6 @@
   "contractSignature": {
     "algorithm": "ES256-P1363",
     "keyId": "fixture-2026-08-16",
-    "value": "kUHG4o0z2IdsccN50beFhHFId10E06jWoBmMlW-i6ODbN7IolFKU77T-HZplH_RWQPSzW3usOcJUBxyxUsxsnQ"
+    "value": "73dEJ6j4FTKMyjpe91SI_k5KOAS9Yb4PFe9TBNmebH8BtxnbkN1z2Zv9m71WRD980oCPFYclDIBbYuyqz44NTQ"
   }
 }

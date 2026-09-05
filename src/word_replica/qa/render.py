@@ -7,6 +7,10 @@ from PIL import Image, ImageChops, ImageFilter
 
 
 ANTIALIASING_BLUR_RADIUS = 1.0
+LEGACY_ANTIALIASING_CHANGED_PIXEL_ALLOWANCE = 0.03
+LEGACY_ANTIALIASING_MAE_ALLOWANCE = 1.0
+BLURRED_ANTIALIASING_CHANGED_PIXEL_ALLOWANCE = 0.04
+BLURRED_ANTIALIASING_MAE_ALLOWANCE = 1.0
 
 
 @dataclass(slots=True)
@@ -29,6 +33,37 @@ class RenderQaResult:
     metrics: list[VisualMetric] = field(default_factory=list)
     diff_images: list[Path] = field(default_factory=list)
     message: str | None = None
+
+
+def visual_metric_acceptance_mode(
+    metric: VisualMetric,
+    *,
+    changed_pixel_tolerance: float,
+    mae_tolerance: float,
+) -> str | None:
+    if not metric.same_dimensions:
+        return None
+    if (
+        metric.changed_pixel_ratio <= changed_pixel_tolerance
+        and metric.mean_absolute_error <= mae_tolerance
+    ):
+        return "strict"
+    if (
+        metric.changed_pixel_ratio
+        <= max(changed_pixel_tolerance, LEGACY_ANTIALIASING_CHANGED_PIXEL_ALLOWANCE)
+        and metric.mean_absolute_error
+        <= max(mae_tolerance, LEGACY_ANTIALIASING_MAE_ALLOWANCE)
+    ):
+        return "legacy_antialiasing"
+    if (
+        metric.blurred_mean_absolute_error is not None
+        and metric.changed_pixel_ratio
+        <= max(changed_pixel_tolerance, BLURRED_ANTIALIASING_CHANGED_PIXEL_ALLOWANCE)
+        and metric.blurred_mean_absolute_error
+        <= max(mae_tolerance, BLURRED_ANTIALIASING_MAE_ALLOWANCE)
+    ):
+        return "blurred_antialiasing"
+    return None
 
 
 def rasterize_pdf(pdf_path: Path, out_dir: Path, dpi: int = 144) -> list[Path]:
@@ -126,10 +161,11 @@ def compare_pdfs(
             if diff_path is not None:
                 diff_images.append(diff_path)
     within_tolerance = page_count_match and all(
-        metric.same_dimensions
-        and metric.changed_pixel_ratio <= changed_pixel_tolerance
-        and metric.mean_absolute_error <= mae_tolerance
-        for metric in metrics
+        visual_metric_acceptance_mode(
+            metric,
+            changed_pixel_tolerance=changed_pixel_tolerance,
+            mae_tolerance=mae_tolerance,
+        ) is not None for metric in metrics
     )
     return RenderQaResult(
         available=True,

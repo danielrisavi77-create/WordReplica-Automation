@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import shutil
+
+
+_GOLDEN_RUN_DIR = re.compile(r"^\d{8}T\d{6}Z_[0-9a-fA-F]{8}(?:_\d+)?$")
 
 
 def _report(path: Path) -> dict:
@@ -32,3 +36,17 @@ def prune_diagnostics(root: Path, *, keep_success: int = 1, keep_failures: int =
         if path not in keep:
             shutil.rmtree(path)
     return sorted(keep, key=lambda p: p.name)
+
+
+def prune_stale_work(root: Path) -> list[Path]:
+    """Remove abandoned Golden run directories while preserving all other work."""
+    root = Path(root)
+    if not root.exists():
+        return []
+    removed = []
+    for path in sorted(root.iterdir(), key=lambda item: item.name):
+        if not path.is_dir() or not _GOLDEN_RUN_DIR.fullmatch(path.name):
+            continue
+        shutil.rmtree(path)
+        removed.append(path)
+    return removed

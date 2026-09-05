@@ -1,15 +1,8 @@
 """Explicit-path preflight for a local Lekta repair package.
 
-Real difference from the original plan: Lekta's actual signed Repair
-Contract v1 binds only the *source* identity (sourceSha256/sourceSize/
-sourceFileName) plus an operation list — it does not sign a target hash,
-because the contract is created before the fixers run and the corrected
-bytes do not exist yet. So the target document's identity is NOT
-cryptographically verified here; it is trusted by explicit local path plus
-a filename match against the contract's own outputPolicy.suggestedFileName.
-Only the original source has a real cryptographic integrity guarantee.
-This must stay honestly reflected in the completion report (Task 5), not
-papered over as if it were an equivalent check.
+The strict v1 cutover binds both the source identity and the exact corrected
+target identity. A package is rejected before Word opens if either document's
+name, size, or SHA-256 differs from the signed contract.
 
 Nothing in this module touches Microsoft Word or any COM object; every
 failure here happens before Word could ever be started.
@@ -25,7 +18,11 @@ from pathlib import Path
 from typing import Any
 
 from word_replica.domain.errors import RepairPackageError
-from word_replica.repair_contract.contract import RepairContractSchemaError, RepairContractV1
+from word_replica.repair_contract.contract import (
+    RepairContractSchemaError,
+    RepairContractV1,
+    wordreplica_supports_fixer,
+)
 from word_replica.repair_contract.signature import RepairContractSignatureError, decode_spki, verify_signed_contract
 from word_replica.services.source_guard import SourceSnapshot, capture_source
 
@@ -138,12 +135,10 @@ def load_and_validate_package(
         raise RepairPackageError(
             "filename-mismatch", f"original file name must be {contract.source_file_name!r}, got {original_path.name!r}"
         )
-    # Not signed by the contract (see module docstring): a naming convention,
-    # not a cryptographic guarantee that this is the file Lekta produced.
-    if target_path.name != contract.output_policy.suggested_file_name:
+    if target_path.name != contract.target_file_name:
         raise RepairPackageError(
             "filename-mismatch",
-            f"target file name must be {contract.output_policy.suggested_file_name!r}, got {target_path.name!r}",
+            f"target file name must be {contract.target_file_name!r}, got {target_path.name!r}",
         )
 
     original_snapshot = capture_source(original_path)
@@ -153,6 +148,10 @@ def load_and_validate_package(
         raise RepairPackageError("source-size-mismatch")
 
     target_snapshot = capture_source(target_path)
+    if target_snapshot.size != contract.target_size:
+        raise RepairPackageError("target-size-mismatch")
+    if target_snapshot.sha256 != contract.target_sha256:
+        raise RepairPackageError("target-hash-mismatch")
 
     created_at = _parse_iso8601_utc(contract.created_at)
     expires_at = _parse_iso8601_utc(contract.expires_at)
@@ -173,6 +172,13 @@ def load_and_validate_package(
         raise RepairPackageError("engine-out-of-range", str(exc)) from exc
     if not engine_ok:
         raise RepairPackageError("engine-out-of-range", engine_version)
+    unsupported = [
+        item.fixer_id
+        for item in contract.requests
+        if not wordreplica_supports_fixer(engine_version, item.fixer_id)
+    ]
+    if unsupported:
+        raise RepairPackageError("unsupported-engine-fixer", ",".join(sorted(set(unsupported))))
 
     if output_dir.exists() and not output_dir.is_dir():
         raise RepairPackageError("invalid-output-dir", str(output_dir))

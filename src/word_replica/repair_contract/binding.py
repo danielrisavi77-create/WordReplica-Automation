@@ -4,16 +4,17 @@ Stored under the WordReplica app root at repair_jobs/<job_id>/binding.json.
 Written atomically (temp file then replace) so a crash mid-write never
 leaves a half-written binding. Resume must revalidate every bound value
 before Word reopens; any drift (a changed contract, original, target,
-output path, engine version, or a binding filed under the wrong job)
+project, working/output paths, engine version, or a binding filed under the wrong job)
 fails closed rather than resuming against inputs that no longer match
 what was originally verified.
 
 Never stores document text, an entitlement token, or a private key —
-only hashes, the job/project identifiers and the output path.
+only hashes, the job/project identifiers and the two distinct output paths.
 """
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -21,10 +22,10 @@ from platformdirs import user_documents_dir
 
 from word_replica.domain.errors import RepairPackageError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _FIELDS = (
     "schemaVersion", "jobId", "contractSha256", "sourceSha256", "targetSha256",
-    "projectId", "outputPath", "engineVersion",
+    "projectId", "workingOutputPath", "destinationPath", "engineVersion",
 )
 
 
@@ -36,7 +37,8 @@ class RepairRunBinding:
     source_sha256: str
     target_sha256: str
     project_id: str
-    output_path: str
+    working_output_path: str
+    destination_path: str
     engine_version: str
 
     @classmethod
@@ -48,9 +50,14 @@ class RepairRunBinding:
         source_sha256: str,
         target_sha256: str,
         project_id: str,
-        output_path: str | Path,
+        working_output_path: str | Path,
+        destination_path: str | Path,
         engine_version: str,
     ) -> "RepairRunBinding":
+        working = str(Path(working_output_path))
+        destination = str(Path(destination_path))
+        if os.path.normcase(os.path.abspath(working)) == os.path.normcase(os.path.abspath(destination)):
+            raise ValueError("working output and destination must be different paths")
         return cls(
             schema_version=SCHEMA_VERSION,
             job_id=job_id,
@@ -58,7 +65,8 @@ class RepairRunBinding:
             source_sha256=source_sha256,
             target_sha256=target_sha256,
             project_id=project_id,
-            output_path=str(Path(output_path)),
+            working_output_path=working,
+            destination_path=destination,
             engine_version=engine_version,
         )
 
@@ -71,7 +79,8 @@ class RepairRunBinding:
             "sourceSha256": data["source_sha256"],
             "targetSha256": data["target_sha256"],
             "projectId": data["project_id"],
-            "outputPath": data["output_path"],
+            "workingOutputPath": data["working_output_path"],
+            "destinationPath": data["destination_path"],
             "engineVersion": data["engine_version"],
         }
 
@@ -81,14 +90,14 @@ class RepairRunBinding:
             raise ValueError("binding.json has an unexpected shape")
         if data["schemaVersion"] != SCHEMA_VERSION:
             raise ValueError(f"unsupported binding schema version: {data['schemaVersion']!r}")
-        return cls(
-            schema_version=data["schemaVersion"],
+        return cls.build(
             job_id=data["jobId"],
             contract_sha256=data["contractSha256"],
             source_sha256=data["sourceSha256"],
             target_sha256=data["targetSha256"],
             project_id=data["projectId"],
-            output_path=data["outputPath"],
+            working_output_path=data["workingOutputPath"],
+            destination_path=data["destinationPath"],
             engine_version=data["engineVersion"],
         )
 
@@ -103,6 +112,11 @@ class RepairRunBindingStore:
 
     def create(self, binding: RepairRunBinding) -> Path:
         path = self._binding_path(binding.job_id)
+        if path.exists():
+            existing = self.load(binding.job_id)
+            if existing == binding:
+                return path
+            raise RepairPackageError("binding-mismatch", "refusing to replace an existing job binding")
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = path.with_suffix(".json.tmp")
         tmp_path.write_text(json.dumps(binding.to_json(), indent=2, sort_keys=True), encoding="utf-8")
@@ -129,7 +143,9 @@ class RepairRunBindingStore:
         contract_sha256: str,
         source_sha256: str,
         target_sha256: str,
-        output_path: str | Path,
+        project_id: str,
+        working_output_path: str | Path,
+        destination_path: str | Path,
         engine_version: str,
     ) -> RepairRunBinding:
         """Load the stored binding for job_id and fail closed on any drift.
@@ -148,8 +164,12 @@ class RepairRunBindingStore:
             mismatched.append("source_sha256")
         if binding.target_sha256 != target_sha256:
             mismatched.append("target_sha256")
-        if binding.output_path != str(Path(output_path)):
-            mismatched.append("output_path")
+        if binding.project_id != project_id:
+            mismatched.append("project_id")
+        if binding.working_output_path != str(Path(working_output_path)):
+            mismatched.append("working_output_path")
+        if binding.destination_path != str(Path(destination_path)):
+            mismatched.append("destination_path")
         if binding.engine_version != engine_version:
             mismatched.append("engine_version")
         if mismatched:

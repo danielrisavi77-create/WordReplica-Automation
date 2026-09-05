@@ -100,6 +100,23 @@ def test_renderer_roundtrips_headers_footers_and_notes(tmp_path):
     assert text_map(actual.endnotes) == text_map(expected.endnotes)
 
 
+def test_footer_field_is_not_duplicated_into_document_body(tmp_path):
+    from tests.fixtures.build_fixtures import build_headers_footers_numbers
+    from word_replica.parser.parser import DocxParser
+
+    source = build_headers_footers_numbers(tmp_path / "source.docx")
+    model = DocxParser().parse(source)
+    output = tmp_path / "rebuilt.docx"
+
+    PureDocxRenderer().render(model, output, context=None)
+
+    with ZipFile(output) as archive:
+        document_xml = archive.read("word/document.xml")
+        footer_xml = archive.read("word/footer1.xml")
+    assert b"instrText" not in document_xml
+    assert footer_xml.count(b"instrText") == 2
+
+
 def test_fresh_shell_uses_current_reconstruction_timestamp(tmp_path):
     from datetime import datetime, timezone
     from word_replica.opc.package_reader import DocxPackage
@@ -278,6 +295,43 @@ def test_renderer_registers_content_type_for_installed_png_asset(tmp_path):
         if node.tag.endswith('Override') and node.get('PartName')
     }
     assert defaults.get('png') == 'image/png' or overrides.get('word/media/image1.png') == 'image/png'
+
+
+def test_restore_part_relationship_recreates_the_missing_relationship():
+    # Regression: this called a bare `_rels_owner(...)` name that pure_docx.py
+    # never imported (it's a module-level helper in parser.py) - a NameError
+    # on every real invocation, caught only by whatever code path actually
+    # exercises this method, which nothing in the test suite did until now.
+    from word_replica.renderers.pure_docx import MutableDocxPackage
+
+    package = MutableDocxPackage({
+        "word/document.xml": b"<w:document/>",
+        "word/embeddings/oleObject1.bin": b"binary-data",
+    })
+
+    restored = package.restore_part_relationship(
+        "word/embeddings/oleObject1.bin",
+        "word/_rels/document.xml.rels",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject",
+    )
+
+    assert restored is True
+    assert b"oleObject1.bin" in package.parts["word/_rels/document.xml.rels"]
+
+
+def test_restore_part_relationship_refused_when_part_is_absent():
+    from word_replica.renderers.pure_docx import MutableDocxPackage
+
+    package = MutableDocxPackage({"word/document.xml": b"<w:document/>"})
+
+    restored = package.restore_part_relationship(
+        "word/embeddings/oleObject1.bin",
+        "word/_rels/document.xml.rels",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject",
+    )
+
+    assert restored is False
+    assert "word/_rels/document.xml.rels" not in package.parts
 
 
 def test_header_part_uses_ooxml_hdr_root_not_truncated_hea(tmp_path):

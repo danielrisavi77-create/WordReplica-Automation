@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from pathlib import Path
 import json
 import re
+import shutil
+import tempfile
 import time
 from typing import Any
+import uuid
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from lxml import etree
@@ -22,6 +26,10 @@ WD_CHARACTER = 1
 WD_LINE_BREAK = 6
 WD_PAGE_BREAK = 7
 WD_FORMAT_DOCX = 16
+_DEFAULT_COM_RETRY_ATTEMPTS = 600
+_TABLE_BATCH_COM_RETRY_ATTEMPTS = 100
+_COM_RETRY_ATTEMPTS = ContextVar("word_replica_com_retry_attempts", default=_DEFAULT_COM_RETRY_ATTEMPTS)
+
 
 RPC_E_CALL_REJECTED = -2147418111
 
@@ -35,6 +43,7 @@ _WORD_MIN_COM_COLUMN_WIDTH_POINTS = 12.0
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _VALID_BOOKMARK_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,39}$")
 _BOOKMARK_NAME_MAX_LENGTH = 40
+_ROTATING_CHECKPOINT_NAME = re.compile(r"^wr-[0-9a-f]{16}\.docx$")
 
 
 def sanitize_word_bookmark_name(name: str, *, taken: set[str]) -> str:
@@ -83,6 +92,49 @@ def _replace_with_retry(source: Path, destination: Path, *, attempts: int = 60, 
             time.sleep(delay_seconds)
     if last is not None:
         raise last
+
+
+def _unlink_with_retry(path: Path, *, attempts: int = 60, delay_seconds: float = 0.5) -> None:
+    """Remove a redundant Word-owned file after the application has quit."""
+    last: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except OSError as exc:
+            last = exc
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(delay_seconds)
+    if last is not None:
+        raise last
+
+
+def _copy_checkpoint_snapshot(source: Path, destination: Path) -> None:
+    """Atomically mirror a Word-saved rotating file to the stable checkpoint path."""
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with source.open("rb") as read_handle, temporary.open("wb") as write_handle:
+            shutil.copyfileobj(read_handle, write_handle, length=1024 * 1024)
+            write_handle.flush()
+        _replace_with_retry(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _rotating_checkpoint_path(destination: Path) -> Path:
+    filename = f"wr-{uuid.uuid4().hex[:16]}.docx"
+    sibling = destination.with_name(filename)
+    if len(str(sibling)) < 255:
+        return sibling
+    return Path(tempfile.gettempdir()) / "WordReplica" / "checkpoints" / filename
+
+
+def _is_rotating_checkpoint(path: Path, destination: Path) -> bool:
+    return bool(_ROTATING_CHECKPOINT_NAME.fullmatch(path.name)) and (
+        path.parent == destination.parent
+        or path.parent == Path(tempfile.gettempdir()) / "WordReplica" / "checkpoints"
+    )
 
 
 def _restore_bookmark_names(docx_path: str | Path, rewrites: dict[str, str]) -> None:
@@ -186,7 +238,17 @@ def _is_rejected_com_call(exc: Exception) -> bool:
     return hresult == RPC_E_CALL_REJECTED
 
 
-def _retry_rejected_com_call(operation, *, attempts: int = 600, delay_seconds: float = 0.1):
+@contextmanager
+def _com_retry_budget(attempts: int):
+    token = _COM_RETRY_ATTEMPTS.set(int(attempts))
+    try:
+        yield
+    finally:
+        _COM_RETRY_ATTEMPTS.reset(token)
+
+
+def _retry_rejected_com_call(operation, *, attempts: int | None = None, delay_seconds: float = 0.1):
+    attempts = _COM_RETRY_ATTEMPTS.get() if attempts is None else int(attempts)
     last = None
     for attempt in range(attempts):
         try:
@@ -236,6 +298,7 @@ class InteractiveWordController:
         self._bookmark_com_names: set[str] = set()
         self._bookmark_name_rewrites: dict[str, str] = {}
         self._last_saved_path: Path | None = None
+        self._checkpoint_delivery_path: Path | None = None
         self._pending_note: Any | None = None
         self._active_note_index: int | None = None
         self._active_story = "body"
@@ -252,6 +315,8 @@ class InteractiveWordController:
         self._paragraph_format_context_generation = 0
         self._last_paragraph_properties_key: tuple[int, str, int] | None = None
         self._paragraph_style_cache: dict[tuple[str, str], Any] = {}
+        self._styles_collection: Any | None = None
+        self._resume_visibility_pending = False
         self._table_batch_metrics: dict[str, object] | None = None
 
     @classmethod
@@ -276,6 +341,7 @@ class InteractiveWordController:
             _retry_setattr(self.application, "Visible", False)
         documents = _retry_getattr(self.application, "Documents")
         self.document = _retry_rejected_com_call(lambda: documents.Add())
+        self._styles_collection = _retry_getattr(self.document, "Styles", None)
         self.active_range = _retry_rejected_com_call(lambda: self.document.Range(0, 0))
         if self.visible:
             _retry_setattr(self.application, "Visible", True)
@@ -298,42 +364,80 @@ class InteractiveWordController:
         self._owned_word_pid = record_owned_word(
             self.application, role="interactive", existing_word_pids=existing_word_pids
         )
-        self.application.Visible = self.visible
-        self.document = self.application.Documents.Open(
-            str(Path(path).resolve()), ReadOnly=False, AddToRecentFiles=False
+        _retry_setattr(self.application, "DisplayAlerts", 0)
+        if not self.visible:
+            _retry_setattr(self.application, "Visible", False)
+        documents = _retry_getattr(self.application, "Documents")
+        source_path = Path(path).resolve()
+        self.document = _retry_rejected_com_call(
+            lambda: documents.Open(
+                str(source_path), ReadOnly=False, AddToRecentFiles=False
+            )
         )
-        end = max(int(self.document.Content.Start), int(self.document.Content.End) - 1)
-        self.active_range = self.document.Range(end, end)
+        self._styles_collection = _retry_getattr(self.document, "Styles", None)
+        content = _retry_getattr(self.document, "Content")
+        start = int(_retry_getattr(content, "Start"))
+        end = max(start, int(_retry_getattr(content, "End")) - 1)
+        self.active_range = _retry_rejected_com_call(
+            lambda: self.document.Range(end, end)
+        )
+        self._last_saved_path = source_path
+        self._checkpoint_delivery_path = source_path
+        self._resume_visibility_pending = bool(self.visible)
         self._paragraph_started = True
+
+    def _show_resumed_document_if_requested(self) -> None:
+        if not self._resume_visibility_pending:
+            return
+        if self.application is None or self.document is None:
+            raise RuntimeError("interactive Word document is not open")
+        _retry_setattr(self.application, "Visible", True)
+        activate_document = _retry_getattr(self.document, "Activate", None)
+        if callable(activate_document):
+            _retry_rejected_com_call(activate_document)
+        activate_application = _retry_getattr(self.application, "Activate", None)
+        if callable(activate_application):
+            _retry_rejected_com_call(activate_application)
+        self._resume_visibility_pending = False
 
 
     def _resume_range_for_story(self, story: str, start: int, end: int, *, section_index: int | None = None, note_index: int | None = None):
         if self.document is None:
             raise RuntimeError("interactive Word document is not open")
         if story == "body":
-            return self.document.Range(int(start), int(end))
+            return _retry_rejected_com_call(
+                lambda: self.document.Range(int(start), int(end))
+            )
         if story.startswith("header:") or story.startswith("footer:"):
             section_i = int(section_index or 0) + 1
-            section = self.document.Sections(section_i)
+            sections = _retry_getattr(self.document, "Sections")
+            section = _retry_rejected_com_call(lambda: sections(section_i))
             story_type = story.split(":", 1)[1]
             story_i = {"default": 1, "first": 2, "even": 3}.get(story_type, 1)
-            collection = section.Headers if story.startswith("header:") else section.Footers
-            target = self._duplicate_range(collection(story_i).Range)
-            if hasattr(target, "SetRange"):
-                target.SetRange(int(start), int(end))
+            collection_name = "Headers" if story.startswith("header:") else "Footers"
+            collection = _retry_getattr(section, collection_name)
+            story_part = _retry_rejected_com_call(lambda: collection(story_i))
+            target = self._duplicate_range(_retry_getattr(story_part, "Range"))
+            set_range = _retry_getattr(target, "SetRange", None)
+            if callable(set_range):
+                _retry_rejected_com_call(lambda: set_range(int(start), int(end)))
             else:
-                target.Start = int(start); target.End = int(end)
+                _retry_setattr(target, "Start", int(start))
+                _retry_setattr(target, "End", int(end))
             return target
         if story in {"footnote", "endnote"}:
             if note_index is None:
                 raise RuntimeError(f"checkpoint is missing {story} index")
-            collection = self.document.Footnotes if story == "footnote" else self.document.Endnotes
-            note = collection(int(note_index))
-            target = self._duplicate_range(note.Range)
-            if hasattr(target, "SetRange"):
-                target.SetRange(int(start), int(end))
+            collection_name = "Footnotes" if story == "footnote" else "Endnotes"
+            collection = _retry_getattr(self.document, collection_name)
+            note = _retry_rejected_com_call(lambda: collection(int(note_index)))
+            target = self._duplicate_range(_retry_getattr(note, "Range"))
+            set_range = _retry_getattr(target, "SetRange", None)
+            if callable(set_range):
+                _retry_rejected_com_call(lambda: set_range(int(start), int(end)))
             else:
-                target.Start = int(start); target.End = int(end)
+                _retry_setattr(target, "Start", int(start))
+                _retry_setattr(target, "End", int(end))
             return target
         raise RuntimeError(f"resume story is not rehydratable: {story}")
 
@@ -351,7 +455,10 @@ class InteractiveWordController:
         self._active_section_index = int(section_index)
         self._section_started = bool(state.get("section_started", False))
         if self._section_started:
-            self._active_section = self.document.Sections(self._active_section_index + 1)
+            sections = _retry_getattr(self.document, "Sections")
+            self._active_section = _retry_rejected_com_call(
+                lambda: sections(self._active_section_index + 1)
+            )
         story = str(getattr(checkpoint, "story", "body"))
         note_index = state.get("note_index")
         active_table_element_id = getattr(checkpoint, "table_element_id", None)
@@ -384,17 +491,21 @@ class InteractiveWordController:
             self._story_stack.append((return_range, bool(state.get("return_paragraph_started", True)), return_story))
         self._table_stack.clear()
         if self._active_table_element_id:
-            tables = getattr(self.active_range, "Tables", None)
-            if tables is None or int(getattr(tables, "Count", 0)) < 1:
+            tables = _retry_getattr(self.active_range, "Tables", None)
+            if tables is None or int(_retry_getattr(tables, "Count", 0)) < 1:
                 raise RuntimeError("checkpoint table context cannot be rehydrated from the saved Word range")
-            table = tables(1)
-            after_range = self._duplicate_range(table.Range)
-            with suppress(Exception): after_range.Collapse(WD_COLLAPSE_END)
+            table = _retry_rejected_com_call(lambda: tables(1))
+            after_range = self._duplicate_range(_retry_getattr(table, "Range"))
+            collapse = _retry_getattr(after_range, "Collapse", None)
+            if callable(collapse):
+                with suppress(Exception):
+                    _retry_rejected_com_call(lambda: collapse(WD_COLLAPSE_END))
             self._table_stack.append({
                 "table": table, "cells": {}, "parent_range": self.active_range,
                 "after_range": after_range, "element_id": self._active_table_element_id,
                 "structure_complete": bool(state.get("table_structure_complete", True)),
             })
+        self._show_resumed_document_if_requested()
 
     def resume_state_snapshot(self) -> dict[str, Any]:
         snapshot = self.current_state_snapshot()
@@ -552,7 +663,10 @@ class InteractiveWordController:
         if self.document is None:
             return
         defaults = event.payload
-        styles = _retry_getattr(self.document, "Styles", None)
+        styles = self._styles_collection
+        if styles is None:
+            styles = _retry_getattr(self.document, "Styles", None)
+            self._styles_collection = styles
         if styles is None:
             return
         try:
@@ -674,19 +788,29 @@ class InteractiveWordController:
             reset = _retry_getattr(font, "Reset", None)
             if callable(reset):
                 _retry_rejected_com_call(reset)
+        # Every property below is best-effort: Word occasionally rejects a Font
+        # property set outright ("Property '<unknown>.X> can not be set") when
+        # the target is a range still settling right after creation (e.g. a
+        # field's Result range immediately after Fields.Add) - confirmed live,
+        # and which specific property trips it is not consistent run to run.
+        # None of these are essential to reconstruction succeeding, so each is
+        # wrapped individually rather than letting one rejection abort the rest.
         for key, attribute in (
             ("bold", "Bold"),
             ("italic", "Italic"),
             ("strike", "StrikeThrough"),
         ):
             if key in props:
-                _retry_setattr(font, attribute, self._word_bool(props[key]))
+                with suppress(Exception):
+                    _retry_setattr(font, attribute, self._word_bool(props[key]))
         if "underline" in props:
-            _retry_setattr(font, "Underline", 1 if props["underline"] else 0)
+            with suppress(Exception):
+                _retry_setattr(font, "Underline", 1 if props["underline"] else 0)
 
         font_name = props.get("font_ascii") or props.get("font_hansi")
         if font_name:
-            _retry_setattr(font, "Name", str(font_name))
+            with suppress(Exception):
+                _retry_setattr(font, "Name", str(font_name))
         if self._contains_east_asia_text(text) and props.get("font_east_asia"):
             with suppress(Exception):
                 _retry_setattr(font, "NameFarEast", str(props["font_east_asia"]))
@@ -694,21 +818,25 @@ class InteractiveWordController:
             with suppress(Exception):
                 _retry_setattr(font, "NameBi", str(props["font_cs"]))
         if props.get("size_half_points") is not None:
-            _retry_setattr(font, "Size", self._half_points_to_points(props["size_half_points"]))
+            with suppress(Exception):
+                _retry_setattr(font, "Size", self._half_points_to_points(props["size_half_points"]))
 
         color = props.get("color")
         if color and str(color).lower() not in {"auto", "none"}:
-            _retry_setattr(font, "Color", self._word_color(str(color)))
+            with suppress(Exception):
+                _retry_setattr(font, "Color", self._word_color(str(color)))
         if props.get("hidden"):
             with suppress(Exception):
                 _retry_setattr(font, "Hidden", self._word_bool(props["hidden"]))
         vert = props.get("vert_align")
         if vert == "superscript":
-            _retry_setattr(font, "Superscript", -1)
-            _retry_setattr(font, "Subscript", 0)
+            with suppress(Exception):
+                _retry_setattr(font, "Superscript", -1)
+                _retry_setattr(font, "Subscript", 0)
         elif vert == "subscript":
-            _retry_setattr(font, "Subscript", -1)
-            _retry_setattr(font, "Superscript", 0)
+            with suppress(Exception):
+                _retry_setattr(font, "Subscript", -1)
+                _retry_setattr(font, "Superscript", 0)
         if props.get("character_spacing") not in {None, "0", 0}:
             with suppress(Exception):
                 _retry_setattr(font, "Spacing", float(props["character_spacing"]) / 20.0)
@@ -740,7 +868,10 @@ class InteractiveWordController:
         )
         if cache_key in self._paragraph_style_cache:
             return self._paragraph_style_cache[cache_key]
-        styles = _retry_getattr(self.document, "Styles", None)
+        styles = self._styles_collection
+        if styles is None:
+            styles = _retry_getattr(self.document, "Styles", None)
+            self._styles_collection = styles
         if styles is None:
             return None
         name = str((definition or {}).get("name") or style_id)
@@ -900,13 +1031,13 @@ class InteractiveWordController:
 
     @staticmethod
     def _duplicate_range(value: Any) -> Any:
-        duplicate = getattr(value, "Duplicate", value)
+        duplicate = _retry_getattr(value, "Duplicate", value)
         # pywin32 COM dispatch objects can be callable because __call__ invokes
         # the object's default property. A Word Range.Duplicate property is
         # already a Range; calling it can coerce it to its default text value.
         if hasattr(duplicate, "_oleobj_"):
             return duplicate
-        return duplicate() if callable(duplicate) else duplicate
+        return _retry_rejected_com_call(duplicate) if callable(duplicate) else duplicate
 
     def _current_table(self) -> dict[str, Any]:
         if not self._table_stack:
@@ -947,17 +1078,27 @@ class InteractiveWordController:
         field = _retry_rejected_com_call(lambda: self.document.Fields.Add(
             Range=field_range, Type=-1, Text=instruction, PreserveFormatting=True,
         ))
+        # Do not refresh a field while later source content may not exist yet. Word
+        # otherwise recalculates position-dependent fields (e.g. PAGE) the next time
+        # it repaginates - which happens automatically and repeatedly while the rest
+        # of the document is still being built - permanently overwriting the source
+        # cached result with whatever page the field happens to land on mid-build.
+        # Locked must be set BEFORE Result.Text is assigned: setting it after the
+        # field has already been implicitly recalculated is too late (confirmed live -
+        # a field otherwise silently recalculates to the in-progress page number the
+        # moment Locked is touched, before it ever gets a chance to latch).
+        with suppress(Exception): field.Locked = True
         cached_result = event.payload.get("cached_result")
         cached_text = None
         if cached_result is not None:
             cached_text = str(cached_result)
             with suppress(Exception): field.Result.Text = cached_text
-        # Do not refresh a field while later source content may not exist yet.
-        # The source cached result remains visible and the output remains a real field.
         result = self._duplicate_range(field.Result)
-        if cached_text is not None and self._active_run_properties is not None:
+        result_properties = event.payload.get("result_properties")
+        apply_properties = result_properties if result_properties is not None else self._active_run_properties
+        if cached_text is not None and apply_properties is not None:
             self.active_range = result
-            self._apply_post_insert_run_properties(self._active_run_properties, cached_text)
+            self._apply_post_insert_run_properties(apply_properties, cached_text)
         with suppress(Exception): result.Collapse(WD_COLLAPSE_END)
         move = _retry_getattr(result, "Move", None)
         if not callable(move):
@@ -1241,7 +1382,8 @@ class InteractiveWordController:
         }
         self._table_batch_metrics = None
         try:
-            self._execute_table_batch(event, metrics)
+            with _com_retry_budget(_TABLE_BATCH_COM_RETRY_ATTEMPTS):
+                self._execute_table_batch(event, metrics)
         except Exception:
             failed_phase = str(metrics.pop("_phase", "unknown"))
             phase_started = float(metrics.pop("_phase_started", started))
@@ -1552,12 +1694,24 @@ class InteractiveWordController:
             with suppress(Exception): row.AllowBreakAcrossPages = not bool(props["cant_split"])
 
     def _event_SetCellProperties(self, event: ReconstructionEvent) -> None:
-        ctx = self._current_table(); cell = ctx["cells"][(int(event.payload["row"]), int(event.payload["column"]))]
+        ctx = self._current_table()
+        key = (int(event.payload["row"]), int(event.payload["column"]))
+        cell = ctx["cells"][key]
         props = event.payload.get("properties", {})
         if props.get("vertical_alignment") is not None:
             mapping = {"top": 0, "center": 1, "bottom": 3}
             if props["vertical_alignment"] in mapping:
-                cell.VerticalAlignment = mapping[props["vertical_alignment"]]
+                try:
+                    _retry_setattr(cell, "VerticalAlignment", mapping[props["vertical_alignment"]])
+                except AttributeError:
+                    # Cells returned by Range.Cells enumeration can be an
+                    # untyped CDispatch whose writable properties are unknown
+                    # to pywin32. Reacquire only that exceptional cell through
+                    # Table.Cell; the normal fast path still does zero root
+                    # lookups.
+                    cell = _retry_rejected_com_call(lambda: ctx["table"].Cell(*key))
+                    ctx["cells"][key] = cell
+                    _retry_setattr(cell, "VerticalAlignment", mapping[props["vertical_alignment"]])
         if props.get("width") is not None and props.get("width_type") in {None, "dxa"}:
             with suppress(Exception):
                 cell.PreferredWidthType = 3
@@ -1633,19 +1787,69 @@ class InteractiveWordController:
             return False
         return all(bool(ctx.get("structure_complete", False)) for ctx in self._table_stack)
 
-    def save(self, path: str | Path) -> None:
+    def save(self, path: str | Path) -> Path:
         if self.document is None:
             raise RuntimeError("interactive Word document is not open")
-        destination = Path(path)
+        destination = Path(path).resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        _retry_rejected_com_call(lambda: self.document.SaveAs2(str(destination), FileFormat=WD_FORMAT_DOCX))
+        previous_active_path = self._last_saved_path
+        if previous_active_path is None:
+            active_save_path = destination
+        else:
+            # Word 2010 can permanently reject Document.Save/SaveAs2 when the
+            # destination is the file currently open in the visible COM session.
+            # Saving to a fresh sibling path is reliable; mirror those flushed bytes
+            # to the stable checkpoint path so resume metadata never points at the
+            # transient, Word-locked file.
+            active_save_path = _rotating_checkpoint_path(destination)
+            active_save_path.parent.mkdir(parents=True, exist_ok=True)
+        save_as = lambda: self.document.SaveAs2(
+            str(active_save_path), FileFormat=WD_FORMAT_DOCX
+        )
+        try:
+            _retry_rejected_com_call(
+                save_as,
+                attempts=10 if self.visible and self.application is not None else 600,
+            )
+        except Exception as exc:
+            if (
+                not _is_rejected_com_call(exc)
+                or not self.visible
+                or self.application is None
+            ):
+                raise
+            # A visible Word 2010 window can remain in UI-busy mode even after
+            # repeated message pumping. Quiesce only this owned application and
+            # retry the already-rotated save path while hidden. Visibility restore
+            # is best effort and must not invalidate a durable checkpoint save.
+            _retry_setattr(self.application, "Visible", False)
+            try:
+                _retry_rejected_com_call(save_as)
+            finally:
+                with suppress(Exception):
+                    _retry_setattr(self.application, "Visible", True)
+        self._last_saved_path = active_save_path
+        self._checkpoint_delivery_path = destination
+        if active_save_path != destination:
+            _copy_checkpoint_snapshot(active_save_path, destination)
+        if (
+            previous_active_path is not None
+            and previous_active_path != destination
+            and previous_active_path != active_save_path
+            and _is_rotating_checkpoint(previous_active_path, destination)
+        ):
+            # SaveAs2 can release the previous Word path a moment after returning.
+            # This file is only redundant cleanup; a transient lock must never
+            # invalidate the successfully mirrored stable checkpoint above.
+            with suppress(OSError):
+                previous_active_path.unlink(missing_ok=True)
         # Bookmark-name restoration is deferred to close() rather than done here:
         # Word keeps this exact file open (and locked) as its active document for
         # as long as this session runs, so a rename-based rewrite against it here
         # deterministically fails with WinError 5 (confirmed - even hidden/hasn't-
         # yet-been-touched-again, the file stays locked the entire time the
         # document stays open, not just briefly after SaveAs2 returns).
-        self._last_saved_path = destination
+        return destination
 
     def restore_pending_bookmark_names(self) -> None:
         """Rewrite sanitized COM-safe bookmark names back to their source names
@@ -1704,16 +1908,43 @@ class InteractiveWordController:
         )
 
     def close(self) -> None:
+        rotating_cleanup_path: Path | None = None
         if self.document is not None:
             with suppress(Exception):
                 _retry_rejected_com_call(lambda: self.document.Close(False))
             self.document = None
+            self._styles_collection = None
+            self._resume_visibility_pending = False
             # Only reachable once Word has actually released its lock on the
             # saved file (see restore_pending_bookmark_names / save()).
             with suppress(Exception):
                 self.restore_pending_bookmark_names()
             with suppress(Exception):
                 self.restore_pending_narrow_column_widths()
+            if (
+                self._last_saved_path is not None
+                and self._checkpoint_delivery_path is not None
+                and self._last_saved_path != self._checkpoint_delivery_path
+            ):
+                with suppress(Exception):
+                    active_path = self._last_saved_path
+                    delivery_path = self._checkpoint_delivery_path
+                    _copy_checkpoint_snapshot(active_path, delivery_path)
+                    if _is_rotating_checkpoint(active_path, delivery_path):
+                        rotating_cleanup_path = active_path
+                    self._last_saved_path = delivery_path
+        # Release every child COM proxy before asking Word to quit. Keeping a
+        # Range/Section/Table/Style dispatch alive can make Quit return while
+        # WINWORD still owns the rotating checkpoint file.
+        self.active_range = None
+        self._active_section = None
+        self._active_image = None
+        self._pending_note = None
+        self._table_stack.clear()
+        self._story_stack.clear()
+        self._floating_images.clear()
+        self._paragraph_style_cache.clear()
+        self._styles_collection = None
         application_quit = self.application is None
         if self.application is not None:
             try:
@@ -1722,12 +1953,17 @@ class InteractiveWordController:
             except Exception:
                 application_quit = False
             self.application = None
-        self.active_range = None
         if self._owns_com:
             with suppress(Exception):
                 import pythoncom
                 pythoncom.CoUninitialize()
             self._owns_com = False
+        if rotating_cleanup_path is not None:
+            # The stable checkpoint has already been copied and verified.
+            # Word 2010 can keep this redundant sibling locked even after
+            # Quit returns; never downgrade the reconstruction result for it.
+            with suppress(OSError):
+                _unlink_with_retry(rotating_cleanup_path)
         if application_quit and (
             self._owned_word_pid is None
             or self._owned_word_pid not in word_process_pids()
@@ -1875,8 +2111,8 @@ class InteractiveWordRenderer:
     def is_restart_safe(self) -> bool:
         return bool(getattr(self.controller, "is_restart_safe", lambda: True)())
 
-    def save(self, path: str | Path) -> None:
-        self.controller.save(path)
+    def save(self, path: str | Path) -> Path:
+        return self.controller.save(path)
 
     def current_state_snapshot(self) -> dict[str, Any]:
         return self.controller.current_state_snapshot()

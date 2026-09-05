@@ -26,12 +26,28 @@ def _mutate(raw: dict, path: list, value) -> dict:
 def test_parses_the_fixture_contract_without_touching_the_signature():
     contract = parse_repair_contract_v1(_load_raw())
     assert contract.contract_version == 1
-    assert contract.engine_min_version == "1.0.0"
+    assert contract.engine_min_version == "0.1.0"
+    assert contract.target_sha256 == "561a4ba09db7f3bc9a109ac02496321f8d866ececc338fc11a6fe30436977cb7"
+    assert contract.target_size == 35
+    assert contract.target_file_name == "Kalogjera - seminar Havel-popravljeno.docx"
     assert len(contract.requests) == 2
     assert len(contract.allowed_exceptions) == 1
     assert contract.verification_policy.required_gates == (
         "G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9",
     )
+
+
+def test_parsed_signed_request_params_are_deeply_immutable_and_detached_from_raw():
+    raw = _load_raw()
+    contract = parse_repair_contract_v1(raw)
+
+    raw["requests"][0]["params"]["fontName"] = "Tampered"
+    raw["requests"][1]["params"]["levels"].append(99)
+
+    assert contract.requests[0].params["fontName"] == "Times New Roman"
+    assert contract.requests[1].params["levels"] == (1, 2)
+    with pytest.raises(TypeError):
+        contract.requests[0].params["fontName"] = "Tampered"
 
 
 def test_rejects_unknown_top_level_key():
@@ -44,6 +60,38 @@ def test_rejects_unknown_top_level_key():
 def test_rejects_missing_top_level_key():
     raw = _load_raw()
     del raw["userId"]
+    with pytest.raises(RepairContractSchemaError) as excinfo:
+        parse_repair_contract_v1(raw)
+    assert excinfo.value.code == "invalid-shape"
+
+
+@pytest.mark.parametrize("field", ["targetSha256", "targetSize", "targetFileName"])
+def test_rejects_missing_signed_target_identity_field(field):
+    raw = _load_raw()
+    del raw[field]
+    with pytest.raises(RepairContractSchemaError) as excinfo:
+        parse_repair_contract_v1(raw)
+    assert excinfo.value.code == "invalid-shape"
+
+
+def test_rejects_non_lowercase_target_sha256():
+    raw = _mutate(_load_raw(), ["targetSha256"], "A" * 64)
+    with pytest.raises(RepairContractSchemaError) as excinfo:
+        parse_repair_contract_v1(raw)
+    assert excinfo.value.code == "invalid-hash"
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 20 * 1024 * 1024 + 1])
+def test_rejects_invalid_target_size(value):
+    raw = _mutate(_load_raw(), ["targetSize"], value)
+    with pytest.raises(RepairContractSchemaError) as excinfo:
+        parse_repair_contract_v1(raw)
+    assert excinfo.value.code == "invalid-shape"
+
+
+@pytest.mark.parametrize("value", ["../target.docx", "target.pdf", "CON.docx"])
+def test_rejects_unsafe_target_filename(value):
+    raw = _mutate(_load_raw(), ["targetFileName"], value)
     with pytest.raises(RepairContractSchemaError) as excinfo:
         parse_repair_contract_v1(raw)
     assert excinfo.value.code == "invalid-shape"

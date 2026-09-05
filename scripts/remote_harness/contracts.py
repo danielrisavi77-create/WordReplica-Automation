@@ -60,6 +60,11 @@ def normalize_failure(text: str) -> str:
     low = value.lower()
     if "-2147418111" in value or "call was rejected by callee" in low or "rpc_e_call_rejected" in low:
         return "RPC_E_CALL_REJECTED"
+    if (
+        "-2147023170" in value or "0x800706be" in low
+        or "remote procedure call failed" in low
+    ):
+        return "RPC_CALL_FAILED"
     if "0x800706ba" in low or "rpc server unavailable" in low or "rpc server is unavailable" in low:
         return "RPC_SERVER_UNAVAILABLE"
     if "'str' object has no attribute 'insertafter'" in low or "'str' object has no attribute 'paragraphformat'" in low:

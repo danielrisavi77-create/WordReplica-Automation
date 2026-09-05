@@ -143,3 +143,46 @@ def test_audit_records_compatibility_mode_reader_failure_without_raising(tmp_pat
     assert report["compatibility_mode"]["source"] is None
     assert report["compatibility_mode"]["output"] is None
     assert "no Word here" in report["compatibility_mode"]["error"]
+
+
+def test_audit_applies_declared_application_properties_policy_to_g10(tmp_path):
+    from tests.unit.test_qa_preservation import _package, _with_app_properties, _write
+
+    source = _write(
+        tmp_path / "source.docx", _with_app_properties(_package(), pages="3")
+    )
+    output = _write(
+        tmp_path / "output.docx", _with_app_properties(_package(), pages="97")
+    )
+
+    def exporter(docx, pdf, visible=False):
+        Path(pdf).write_bytes(b"pdf")
+        return Path(pdf)
+
+    render = RenderQaResult(
+        available=True,
+        within_tolerance=True,
+        page_count_match=True,
+        source_page_count=1,
+        rebuilt_page_count=1,
+        metrics=[VisualMetric(True, 0.0, 0.0, (10, 10), (10, 10))],
+    )
+    report = audit_docx_pair(
+        source,
+        output,
+        tmp_path / "qa",
+        run_id="r",
+        source_sha256="abc",
+        commit_sha="def",
+        reconstruction_status="PASS",
+        parser=Parser(),
+        pdf_exporter=exporter,
+        pdf_comparer=lambda a, b, q, **kwargs: render,
+        page_text_extractor=lambda p: ["A"],
+        compatibility_mode_reader=lambda source, output: {"source": 16, "output": 16},
+        gate_names=tuple(f"G{i}" for i in range(11)),
+        application_properties_rewritten_by_policy=True,
+    )
+
+    assert report["gates"]["G10"] is True
+    assert report["full_pass"] is True

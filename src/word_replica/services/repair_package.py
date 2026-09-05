@@ -14,6 +14,7 @@ from __future__ import annotations
 import shutil
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +29,7 @@ from word_replica.domain.enums import (
     RunStatus,
     VisibilityMode,
 )
+from word_replica.domain.errors import RepairPackageError
 from word_replica.repair_contract.binding import RepairRunBinding, RepairRunBindingStore
 from word_replica.repair_contract.contract import GOLDEN_GATES
 from word_replica.repair_contract.package import RepairPackageRequest, ValidatedRepairPackage, load_and_validate_package
@@ -35,8 +37,14 @@ from word_replica.repair_contract.report import RepairCompletionReport, build_co
 from word_replica.services.source_guard import assert_source_unchanged, sha256_file
 
 
+def repair_contract_required_gates(*, signed_target: bool) -> tuple[str, ...]:
+    if not signed_target:
+        return GOLDEN_GATES
+    return (*GOLDEN_GATES, "G10")
+
+
 def default_rebuild_options() -> RebuildOptions:
-    """Visible Word, maximum fidelity, fast interactive speed, table fast path."""
+    """Visible Word, maximum fidelity and speed, with the table fast path."""
     return RebuildOptions(
         renderer=RendererChoice.WORD,
         visibility=VisibilityMode.VISIBLE,
@@ -44,7 +52,7 @@ def default_rebuild_options() -> RebuildOptions:
         metadata=MetadataMode.FRESH,
         reconstruction_mode=ReconstructionMode.INTERACTIVE,
         interactive=InteractiveOptions(
-            speed_mode=InteractiveSpeedMode.FAST,
+            speed_mode=InteractiveSpeedMode.MAXIMUM,
             fidelity=InteractiveFidelity.MAXIMUM,
             enable_table_fast_path=True,
         ),
@@ -81,6 +89,84 @@ def _default_fields_update_checker(output_path: Path) -> bool | None:
     from word_replica.qa.word_render import check_fields_update_equality
 
     return check_fields_update_equality(output_path)
+
+
+def _copy_output_exclusive(source: Path, destination: Path) -> None:
+    created = False
+    try:
+        with Path(source).open("rb") as input_stream, Path(destination).open("xb") as output_stream:
+            created = True
+            shutil.copyfileobj(input_stream, output_stream)
+    except FileExistsError as exc:
+        raise RepairPackageError("output-path-collision", str(destination)) from exc
+    except Exception:
+        if created:
+            Path(destination).unlink(missing_ok=True)
+        raise
+
+
+def _is_reserved_output_name(candidate: Path, suggested_file_name: str) -> bool:
+    if candidate.name == suggested_file_name:
+        return True
+    suggested = Path(suggested_file_name)
+    if candidate.suffix != suggested.suffix:
+        return False
+    prefix = f"{suggested.stem} ("
+    candidate_stem = candidate.stem
+    if not candidate_stem.startswith(prefix) or not candidate_stem.endswith(")"):
+        return False
+    counter = candidate_stem[len(prefix):-1]
+    return counter.isdigit() and int(counter) >= 2
+
+
+def _same_file_identity_or_fail_closed(candidate: Path, protected: Path) -> bool:
+    try:
+        return candidate.samefile(protected)
+    except OSError as exc:
+        raise RepairPackageError(
+            "binding-mismatch", f"destination identity check failed: {exc}"
+        ) from exc
+
+
+def _assert_destination_not_protected_alias(
+    destination: Path, validated: ValidatedRepairPackage
+) -> None:
+    for protected_path in (
+        validated.original_snapshot.path,
+        validated.target_snapshot.path,
+    ):
+        if _same_file_identity_or_fail_closed(destination, protected_path):
+            raise RepairPackageError("binding-mismatch", "destination_path")
+
+
+def _validated_bound_destination(
+    request: RepairPackageRequest,
+    validated: ValidatedRepairPackage,
+    binding: RepairRunBinding,
+    working_output_path: Path,
+) -> Path:
+    destination = Path(binding.destination_path).resolve()
+    output_dir = request.output_dir.resolve()
+    if destination.parent != output_dir:
+        raise RepairPackageError("binding-mismatch", "destination_path")
+    if destination in {
+        validated.original_snapshot.path.resolve(),
+        validated.target_snapshot.path.resolve(),
+    }:
+        raise RepairPackageError("binding-mismatch", "destination_path")
+    if not _is_reserved_output_name(
+        destination, validated.contract.output_policy.suggested_file_name
+    ):
+        raise RepairPackageError("binding-mismatch", "destination_path")
+
+    if destination.exists():
+        _assert_destination_not_protected_alias(destination, validated)
+        working_output_path = Path(working_output_path).resolve()
+        if not destination.is_file() or not working_output_path.is_file():
+            raise RepairPackageError("binding-mismatch", "working_output_path")
+        if sha256_file(destination) != sha256_file(working_output_path):
+            raise RepairPackageError("output-path-collision", str(destination))
+    return destination
 
 
 class RepairPackageService:
@@ -150,29 +236,71 @@ class RepairPackageService:
         started = time.monotonic()
         if self.preview_sink is not None:
             self._play_preview(validated, interactive_control)
-            result = self.rebuild_service.rebuild(validated.target_snapshot.path, self.rebuild_options)
+            result = self.rebuild_service.rebuild(
+                validated.target_snapshot.path,
+                self.rebuild_options,
+                expected_source_snapshot=validated.target_snapshot,
+            )
+            if result.project_id is not None and result.output_path is not None:
+                self._persist_binding(
+                    validated,
+                    project_id=result.project_id,
+                    working_output_path=result.output_path,
+                )
         else:
+            def bind_before_word(prepared) -> None:
+                source_stem = Path(prepared.source_path).stem
+                self._persist_binding(
+                    validated,
+                    project_id=prepared.paths.project_id,
+                    working_output_path=prepared.paths.output_dir / f"{source_stem}_reconstructed.docx",
+                )
+
             result = self.rebuild_service.rebuild(
                 validated.target_snapshot.path,
                 self.rebuild_options,
                 interactive_control=interactive_control,
                 interactive_observer=interactive_observer,
+                interactive_pre_start=bind_before_word,
+                expected_source_snapshot=validated.target_snapshot,
             )
         elapsed = time.monotonic() - started
         return self._finish(validated, result, timing_seconds={"rebuild": elapsed})
+
+    def retry_checkpoint_sha256(self, job_id: str) -> str | None:
+        binding = self.binding_store.load(job_id)
+        project = self.rebuild_service.describe_interactive_project(binding.project_id)
+        if project.project_id != binding.project_id:
+            raise RepairPackageError("binding-mismatch", "project_id")
+        return self.rebuild_service.interactive_checkpoint_sha256(binding.project_id)
 
     def resume(
         self, request: RepairPackageRequest, job_id: str, *, interactive_control=None, interactive_observer=None
     ) -> RepairCompletionReport:
         now = self.clock()
         validated = load_and_validate_package(request, now=now, engine_version=self.engine_version)
+        candidate_binding = self.binding_store.load(job_id)
+        try:
+            project = self.rebuild_service.describe_interactive_project(candidate_binding.project_id)
+        except Exception as exc:
+            raise RepairPackageError("binding-mismatch", f"project_id: {exc}") from exc
+        if Path(project.source_path).resolve() != validated.target_snapshot.path.resolve():
+            raise RepairPackageError("binding-mismatch", "project source does not match the signed target")
         binding = self.binding_store.validate(
             job_id,
             contract_sha256=validated.contract_sha256,
             source_sha256=validated.original_snapshot.sha256,
             target_sha256=validated.target_snapshot.sha256,
-            output_path=validated.output_path,
+            project_id=project.project_id,
+            working_output_path=project.working_output_path,
+            destination_path=candidate_binding.destination_path,
             engine_version=self.engine_version,
+        )
+        validated = replace(
+            validated,
+            output_path=_validated_bound_destination(
+                request, validated, binding, Path(project.working_output_path)
+            ),
         )
         started = time.monotonic()
         if self.preview_sink is not None:
@@ -187,8 +315,20 @@ class RepairPackageService:
                 interactive_control=interactive_control,
                 interactive_observer=interactive_observer,
             )
+        if result.project_id != binding.project_id:
+            raise RepairPackageError("binding-mismatch", "result.project_id")
+        if result.output_path is not None:
+            if Path(result.output_path).resolve() != Path(binding.working_output_path).resolve():
+                raise RepairPackageError("binding-mismatch", "result.output_path")
+        elif result.status is RunStatus.PASS:
+            raise RepairPackageError("binding-mismatch", "result.output_path")
         elapsed = time.monotonic() - started
-        return self._finish(validated, result, timing_seconds={"resume": elapsed})
+        return self._finish(
+            validated,
+            result,
+            timing_seconds={"resume": elapsed},
+            reuse_existing_bound_output=True,
+        )
 
     def _original_unchanged(self, validated: ValidatedRepairPackage) -> bool:
         try:
@@ -197,24 +337,34 @@ class RepairPackageService:
         except Exception:
             return False
 
-    def _persist_binding(self, validated: ValidatedRepairPackage, result) -> None:
-        if result.project_id is None:
-            return
+    def _persist_binding(
+        self,
+        validated: ValidatedRepairPackage,
+        *,
+        project_id: str,
+        working_output_path: Path,
+    ) -> None:
         binding = RepairRunBinding.build(
             job_id=validated.contract.job_id,
             contract_sha256=validated.contract_sha256,
             source_sha256=validated.original_snapshot.sha256,
             target_sha256=validated.target_snapshot.sha256,
-            project_id=result.project_id,
-            output_path=validated.output_path,
+            project_id=project_id,
+            working_output_path=working_output_path,
+            destination_path=validated.output_path,
             engine_version=self.engine_version,
         )
         self.binding_store.create(binding)
 
     def _finish(
-        self, validated: ValidatedRepairPackage, result, *, timing_seconds: dict[str, float]
+        self,
+        validated: ValidatedRepairPackage,
+        result,
+        *,
+        timing_seconds: dict[str, float],
+        reuse_existing_bound_output: bool = False,
     ) -> RepairCompletionReport:
-        self._persist_binding(validated, result)
+        required_gates = repair_contract_required_gates(signed_target=True)
         reasons = tuple(result.reasons)
         original_unchanged = self._original_unchanged(validated)
         reconstruction_status = _status_value(result.status)
@@ -228,7 +378,7 @@ class RepairPackageService:
                 source_size=validated.original_snapshot.size,
                 target_sha256=validated.target_snapshot.sha256,
                 target_size=validated.target_snapshot.size,
-                required_gates=GOLDEN_GATES,
+                required_gates=required_gates,
                 project_id=result.project_id,
                 reconstruction_status=reconstruction_status,
                 original_unchanged=original_unchanged,
@@ -237,10 +387,17 @@ class RepairPackageService:
             )
 
         copy_started = time.monotonic()
-        shutil.copyfile(result.output_path, validated.output_path)
+        source_output_path = Path(result.output_path)
+        source_output_sha256 = sha256_file(source_output_path)
+        if reuse_existing_bound_output and validated.output_path.exists():
+            if not validated.output_path.is_file() or sha256_file(validated.output_path) != source_output_sha256:
+                raise RepairPackageError("output-path-collision", str(validated.output_path))
+            _assert_destination_not_protected_alias(validated.output_path, validated)
+        else:
+            _copy_output_exclusive(source_output_path, validated.output_path)
         output_sha256 = sha256_file(validated.output_path)
         output_size = validated.output_path.stat().st_size
-        if output_sha256 != sha256_file(Path(result.output_path)):
+        if output_sha256 != source_output_sha256:
             reasons = (*reasons, "output-copy-hash-mismatch")
         timing = {**timing_seconds, "copy": time.monotonic() - copy_started}
 
@@ -254,6 +411,9 @@ class RepairPackageService:
             source_sha256=validated.target_snapshot.sha256,
             commit_sha=self.engine_version,
             reconstruction_status=reconstruction_status,
+            gate_names=required_gates,
+            custom_properties_dropped_by_policy=True,
+            application_properties_rewritten_by_policy=True,
         )
         timing["audit"] = time.monotonic() - audit_started
         gates: dict[str, bool] = dict(audit_report.get("gates", {}))
@@ -265,7 +425,7 @@ class RepairPackageService:
             source_size=validated.original_snapshot.size,
             target_sha256=validated.target_snapshot.sha256,
             target_size=validated.target_snapshot.size,
-            required_gates=GOLDEN_GATES,
+            required_gates=required_gates,
             output_sha256=output_sha256,
             output_size=output_size,
             output_path=str(validated.output_path),

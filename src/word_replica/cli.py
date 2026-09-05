@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
+import tempfile
 from pathlib import Path
 
+from word_replica import __version__
 from word_replica.config import RebuildOptions
 from word_replica.domain.enums import FidelityMode, MetadataMode, RendererChoice, RunStatus, VisibilityMode
 from word_replica.domain.errors import RepairPackageError
@@ -18,9 +22,15 @@ from word_replica.services.rebuild import RebuildService
 
 _EXIT = {RunStatus.PASS: 0, RunStatus.WARN: 1, RunStatus.FAIL: 2}
 _REPAIR_POC_EXIT = {"FULL_PASS": 0, "RETRYABLE": 1, "FAILED": 2}
-# Must stay within the signed contract's engineMinVersion..engineMaxVersion
-# range (currently "1.0.0" in Lekta's published Repair Contract v1 fixture).
-REPAIR_ENGINE_VERSION = "1.0.0"
+# The repair capability contract is versioned with the installed engine.
+# A stale independent literal can make a valid signed package fail preflight.
+REPAIR_ENGINE_VERSION = __version__
+LEKTA_REPAIR_CLAIM_ENDPOINT = (
+    "https://zrrjttizjyfcxmcpgzml.supabase.co/functions/v1/repair-local-claim"
+)
+LEKTA_REPAIR_STATUS_ENDPOINT = (
+    "https://zrrjttizjyfcxmcpgzml.supabase.co/functions/v1/repair-local-status"
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,6 +60,10 @@ def build_parser() -> argparse.ArgumentParser:
     repair_poc_resume = sub.add_parser("repair-poc-resume")
     _add_repair_poc_package_arguments(repair_poc_resume)
     repair_poc_resume.add_argument("--job-id", required=True)
+
+    repair_runner = sub.add_parser("repair-runner")
+    repair_runner.add_argument("--launch", type=Path, required=True)
+    repair_runner.add_argument("--output-dir", type=Path, required=True)
 
     return parser
 
@@ -225,6 +239,136 @@ def run_repair_poc_resume(args, *, service=None, handoff=None) -> int:
     return _REPAIR_POC_EXIT.get(report.status, 2)
 
 
+def _default_one_shot_runner():
+    from word_replica.runner.http_transport import HttpsTransport
+    from word_replica.runner.one_shot import OneShotRunner
+    from word_replica.runner.trust_store import load_trust_keys
+    from word_replica.runner.secure_retry import SecureRetryStore
+    from word_replica.runner.word_preflight import run_word_preflight
+
+    trust_path = Path(__file__).resolve().parent / "runner" / "trusted_keys.json"
+    return OneShotRunner(
+        preflight=run_word_preflight,
+        transport=HttpsTransport(),
+        package_service=_default_repair_package_service("word"),
+        trust_keys=load_trust_keys(trust_path),
+        retry_store=SecureRetryStore(),
+    )
+
+
+_RUNNER_JOB_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.I,
+)
+
+
+def _resume_job_id(value) -> str | None:
+    if not isinstance(value, dict) or set(value) != {"version", "jobId", "resume"}:
+        return None
+    job_id = value.get("jobId")
+    if value.get("version") != 1 or value.get("resume") is not True:
+        raise ValueError("invalid local repair resume pointer")
+    if not isinstance(job_id, str) or not _RUNNER_JOB_ID.fullmatch(job_id):
+        raise ValueError("invalid local repair resume pointer")
+    return job_id
+
+
+def _replace_launch_with_resume_pointer(path: Path, job_id: str) -> None:
+    payload = json.dumps(
+        {"version": 1, "jobId": job_id, "resume": True},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix="lekta-resume-", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as target:
+            target.write(payload)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def execute_repair_runner_ticket(
+    ticket,
+    output_dir: Path,
+    *,
+    runner=None,
+    handoff=None,
+) -> int:
+    """Execute one in-memory launch ticket without persisting its bearer token.
+
+    The portable EXE reads the ticket from its Authenticode-preserving filename.
+    If the same job already has DPAPI state, resume wins before any second claim.
+    """
+    from word_replica.runner.one_shot import OneShotRunnerConfig
+
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    active_runner = runner or _default_one_shot_runner()
+    handoff = handoff or open_output_for_user
+    config = OneShotRunnerConfig(
+        claim_endpoint=LEKTA_REPAIR_CLAIM_ENDPOINT,
+        status_endpoint=LEKTA_REPAIR_STATUS_ENDPOINT,
+        output_dir=output_dir,
+    )
+    has_interrupted_job = getattr(active_runner, "has_interrupted_job", None)
+    if callable(has_interrupted_job) and has_interrupted_job(ticket.job_id):
+        result = active_runner.resume_interrupted(ticket.job_id, config)
+    else:
+        result = active_runner.run(ticket, config, on_claimed=None)
+    handoff(Path(result.output_path))
+    return 0
+
+
+def run_repair_runner(args, *, runner=None, handoff=None) -> int:
+    from word_replica.runner.lekta_claim import LaunchTicket
+    from word_replica.runner.one_shot import OneShotRunnerConfig
+
+    launch_path = Path(args.launch).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    handoff = handoff or open_output_for_user
+    try:
+        if launch_path.stat().st_size > 4096:
+            raise ValueError("launch ticket is too large")
+        raw_launch = json.loads(launch_path.read_text(encoding="utf-8"))
+        resume_job_id = _resume_job_id(raw_launch)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        active_runner = runner or _default_one_shot_runner()
+        config = OneShotRunnerConfig(
+            claim_endpoint=LEKTA_REPAIR_CLAIM_ENDPOINT,
+            status_endpoint=LEKTA_REPAIR_STATUS_ENDPOINT,
+            output_dir=output_dir,
+        )
+        if resume_job_id is not None:
+            result = active_runner.resume_interrupted(resume_job_id, config)
+        else:
+            ticket = LaunchTicket.parse(raw_launch)
+            has_interrupted_job = getattr(active_runner, "has_interrupted_job", None)
+            if callable(has_interrupted_job) and has_interrupted_job(ticket.job_id):
+                _replace_launch_with_resume_pointer(launch_path, ticket.job_id)
+                result = active_runner.resume_interrupted(ticket.job_id, config)
+            else:
+                result = active_runner.run(
+                    ticket,
+                    config,
+                    on_claimed=lambda job_id: _replace_launch_with_resume_pointer(
+                        launch_path, job_id
+                    ),
+                )
+        launch_path.unlink()
+        handoff(Path(result.output_path))
+        return 0
+    except Exception:
+        print("Lokalni Word popravak nije dovršen. Serverska verzija ostaje dostupna u Lekti.")
+        return 2
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if args.command == "rebuild":
@@ -233,6 +377,8 @@ def main() -> int:
         return run_repair_poc(args)
     if args.command == "repair-poc-resume":
         return run_repair_poc_resume(args)
+    if args.command == "repair-runner":
+        return run_repair_runner(args)
     if args.command == "inspect":
         return run_inspect(args.source)
     if args.command == "qa":

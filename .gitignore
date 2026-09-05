@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 .venv/
 .venv_harness/
+.venv_appbuild/
 
 # Local Codex/Golden data must never enter Git.
 golden/
@@ -20,6 +21,14 @@ state/
 *.zip
 event_trace.jsonl
 golden_report.json
+
+# Local investigations and generated reconstruction trees never enter Git.
+/_*.txt
+/_*.log
+/_*.pkl
+/_toc_repro*_rebuild/
+/tests/fixtures/corpus/*_rebuild/
+*.orig
 
 # Build/install outputs.
 build/

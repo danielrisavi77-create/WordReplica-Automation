@@ -18,6 +18,7 @@ from word_replica.domain.model import (
     RevisionSpan,
     Run,
     Section,
+    Table,
 )
 from word_replica.opc.package_reader import DocxPackage
 from word_replica.opc.properties import read_properties
@@ -446,6 +447,72 @@ def parse_run(node, ids: ElementIdFactory, path: str, package: DocxPackage | Non
     )
 
 
+def _extract_fields(model: "DocumentModel", ids: ElementIdFactory) -> list[Field]:
+    """Bracket-match every field_begin/field_end pair carried on run content_tokens
+    (already tokenized by _parse_run for every story) into its own Field entry.
+
+    Previously this collected every //w:instrText node in word/document.xml and
+    concatenated them into a single Field - so a document with a multi-paragraph
+    TOC field containing dozens of nested PAGEREF fields ended up with model.fields
+    holding exactly one entry whose instruction was the whole lot glued together.
+    Walking each story's own paragraphs with a stack (instead of a single global
+    XPath) also lets a field's begin/end span multiple paragraphs, which single-
+    paragraph bracket matching (used by the interactive renderer, which cannot
+    replay a field it can't fully reconstruct) deliberately does not attempt.
+    """
+    fields: list[Field] = []
+    stack: list[dict[str, Any]] = []
+
+    def walk_paragraph(paragraph: Paragraph) -> None:
+        for run in paragraph.runs:
+            for token in run.properties.get("content_tokens") or ():
+                kind = token.get("kind")
+                if kind == "field_begin":
+                    stack.append({"instruction": [], "result": [], "separated": False, "run_id": run.element_id})
+                elif kind == "field_instruction":
+                    if stack:
+                        stack[-1]["instruction"].append(str(token.get("value", "")))
+                elif kind == "field_separate":
+                    if stack:
+                        stack[-1]["separated"] = True
+                elif kind == "field_end":
+                    if stack:
+                        finished = stack.pop()
+                        fields.append(Field(
+                            ids.make("field", finished["run_id"]),
+                            "".join(finished["instruction"]).strip(),
+                            "".join(finished["result"]),
+                            False,
+                        ))
+                elif stack and stack[-1]["separated"]:
+                    if kind == "text":
+                        stack[-1]["result"].append(str(token.get("value", "")))
+                    elif kind == "tab":
+                        stack[-1]["result"].append("\t")
+                    elif kind in {"line_break", "page_break"}:
+                        stack[-1]["result"].append("\n")
+
+    def walk_blocks(blocks) -> None:
+        for block in blocks:
+            if isinstance(block, Paragraph):
+                walk_paragraph(block)
+            elif isinstance(block, Table):
+                for row in block.rows:
+                    for cell in row.cells:
+                        walk_blocks(cell.blocks)
+
+    walk_blocks(model.body)
+    for blocks in model.headers.values():
+        walk_blocks(blocks)
+    for blocks in model.footers.values():
+        walk_blocks(blocks)
+    for blocks in model.footnotes.values():
+        walk_blocks(blocks)
+    for blocks in model.endnotes.values():
+        walk_blocks(blocks)
+    return fields
+
+
 def _hyperlink_properties(node, package: DocxPackage | None) -> dict[str, Any]:
     """Where a hyperlink points, in whichever of the two ways it can.
 
@@ -516,8 +583,27 @@ def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage
     runs: list[Run] = []
     inline_markers: list[dict[str, Any]] = []
     r_index = 0
+    # Content a paragraph holds beside its runs rather than inside one. An
+    # equation is the case that matters: m:oMath sits directly in w:p, matched
+    # none of the branches below, and was dropped -- and since the renderer
+    # builds the paragraph from the model, dropped meant gone.
+    #
+    # Only children outside the w: namespace are carried, the same line drawn
+    # for run properties: an unmodelled w: element is a question about the
+    # model's coverage, and copying one in beside content the renderer also
+    # writes risks emitting it twice. Each fragment records how many runs came
+    # before it, so it goes back where it was.
+    paragraph_extensions: list[dict[str, Any]] = []
+
     for child_index, child in enumerate(node):
         local = local_name(child)
+        if isinstance(child.tag, str) and not child.tag.startswith(f"{{{W_NS}}}"):
+            from lxml import etree as _etree
+
+            paragraph_extensions.append(
+                {"after_run": r_index, "value": _etree.tostring(child, encoding="unicode")}
+            )
+            continue
         if local == "bookmarkStart":
             name = _attr(child, "name")
             if name and name != "_GoBack":
@@ -534,6 +620,19 @@ def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage
             # does not, and G0 sees nothing wrong because the text is exactly
             # what does survive.
             link = _hyperlink_properties(child, package) if local == "hyperlink" else None
+            # fldSimple is OOXML's shorthand for a field that never nests
+            # another field inside it - functionally identical to the
+            # fldChar-begin/instrText/fldChar-separate/.../fldChar-end
+            # sequence _parse_run tokenizes elsewhere, just spelled as one
+            # element with its instruction on an attribute. Word chooses
+            # freely between the two forms when it saves (confirmed: a field
+            # this renderer creates via Fields.Add comes back from SaveAs2 as
+            # fldSimple even though the source authored it with fldChar) so
+            # without synthesizing the same field_begin/instruction/separate/
+            # end content_tokens here, re-parsing Word's own saved output
+            # would silently see plain text instead of a field.
+            field_instruction = _attr(child, "instr") if local == "fldSimple" else None
+            nested_runs: list[Run] = []
             # An inline content control matched none of these, so the control
             # and everything in it was dropped without a trace. Unwrapping is
             # what already happens to a block-level control, whose paragraphs
@@ -551,12 +650,28 @@ def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage
                 )
                 if link is not None:
                     run.properties["hyperlink"] = {**link, "group": child_index}
+                nested_runs.append(run)
                 runs.append(run)
                 r_index += 1
+            if field_instruction is not None and nested_runs:
+                first_tokens = list(nested_runs[0].properties.get("content_tokens") or ())
+                nested_runs[0].properties["content_tokens"] = [
+                    {"kind": "field_begin"},
+                    {"kind": "field_instruction", "value": field_instruction},
+                    {"kind": "field_separate"},
+                    *first_tokens,
+                ]
+                last_tokens = list(nested_runs[-1].properties.get("content_tokens") or ())
+                nested_runs[-1].properties["content_tokens"] = [
+                    *last_tokens,
+                    {"kind": "field_end"},
+                ]
         # Deleted/move-from revision text is preserved as evidence but never
         # promoted into visible-final Run.text.
     if inline_markers:
         properties["inline_markers"] = inline_markers
+    if paragraph_extensions:
+        properties["paragraph_extensions"] = paragraph_extensions
     return Paragraph(
         ids.make("paragraph", path),
         runs=runs,
@@ -1056,18 +1171,7 @@ class DocxParser:
                     )
                 )
 
-            instruction_nodes = root.xpath("//w:instrText", namespaces=NS)
-            if instruction_nodes:
-                instruction = "".join(node.text or "" for node in instruction_nodes).strip()
-                first_path = tree.getpath(instruction_nodes[0])
-                model.fields.append(
-                    Field(
-                        ids.make("field", first_path),
-                        instruction,
-                        "",
-                        False,
-                    )
-                )
+            model.fields = _extract_fields(model, ids)
 
             if "word/comments.xml" in package.parts:
                 comments_root = package.read_xml("word/comments.xml")

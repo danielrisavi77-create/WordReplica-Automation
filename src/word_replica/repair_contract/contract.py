@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib import resources
+from types import MappingProxyType
 from typing import Any
 
 GOLDEN_GATES = ("G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9")
+MAX_DOCX_BYTES = 20 * 1024 * 1024
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.IGNORECASE
 )
@@ -30,12 +33,35 @@ _RESERVED_WINDOWS_NAMES = {
 _UNSAFE_FILENAME_CHARS = set('<>:"/\\|?*')
 
 with resources.files(__package__).joinpath("fixer_ids.json").open("r", encoding="utf-8") as _f:
-    FIXER_IDS: frozenset[str] = frozenset(json.load(_f))
+    _FIXER_ID_SEQUENCE: tuple[str, ...] = tuple(json.load(_f))
+
+FIXER_IDS: frozenset[str] = frozenset(_FIXER_ID_SEQUENCE)
 
 STANDALONE_DENIED_FIXER_IDS = frozenset({"footer-page-fixer"})
+WORDREPLICA_0_1_0_FIXER_IDS = tuple(
+    fixer_id for fixer_id in _FIXER_ID_SEQUENCE if fixer_id not in STANDALONE_DENIED_FIXER_IDS
+)
+
+
+def _fnv1a32(value: str) -> str:
+    fingerprint = 0x811C9DC5
+    for byte in value.encode("utf-8"):
+        fingerprint ^= byte
+        fingerprint = (fingerprint * 0x01000193) & 0xFFFFFFFF
+    return f"{fingerprint:08x}"
+
+
+WORDREPLICA_0_1_0_FIXER_FINGERPRINT = _fnv1a32("\n".join(WORDREPLICA_0_1_0_FIXER_IDS))
+if WORDREPLICA_0_1_0_FIXER_FINGERPRINT != "89791f7f":
+    raise RuntimeError("WordReplica 0.1.0 fixer allowlist drifted from the Lekta contract")
+
+
+def wordreplica_supports_fixer(engine_version: str, fixer_id: str) -> bool:
+    return engine_version == "0.1.0" and fixer_id in WORDREPLICA_0_1_0_FIXER_IDS
 
 _TOP_LEVEL_KEYS = frozenset({
     "contractVersion", "jobId", "userId", "sourceSha256", "sourceSize", "sourceFileName",
+    "targetSha256", "targetSize", "targetFileName",
     "createdAt", "expiresAt", "engineMinVersion", "engineMaxVersion", "requests",
     "allowedExceptions", "outputPolicy", "verificationPolicy", "contractSignature",
 })
@@ -86,11 +112,18 @@ def _require_bool(obj: dict, key: str, path: str) -> bool:
     return value
 
 
-def _require_int(obj: dict, key: str, path: str, *, minimum: int = 0) -> int:
+def _require_int(
+    obj: dict,
+    key: str,
+    path: str,
+    *,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> int:
     value = obj.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
         _fail("invalid-shape", f"{path}/{key}", "expected an integer")
-    if value < minimum:
+    if value < minimum or (maximum is not None and value > maximum):
         _fail("invalid-shape", f"{path}/{key}", "out of bounds")
     return value
 
@@ -142,7 +175,15 @@ class RepairContractRequestV1:
     request_id: str
     fixer_id: str
     rule_id: str
-    params: dict[str, Any]
+    params: Mapping[str, Any]
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +226,9 @@ class RepairContractV1:
     source_sha256: str
     source_size: int
     source_file_name: str
+    target_sha256: str
+    target_size: int
+    target_file_name: str
     created_at: str
     expires_at: str
     engine_min_version: str
@@ -211,7 +255,12 @@ def _parse_request(raw: dict, index: int) -> RepairContractRequestV1:
     params = raw.get("params")
     if not isinstance(params, dict):
         _fail("params-not-object", f"{path}/params")
-    return RepairContractRequestV1(request_id=request_id, fixer_id=fixer_id, rule_id=rule_id, params=params)
+    return RepairContractRequestV1(
+        request_id=request_id,
+        fixer_id=fixer_id,
+        rule_id=rule_id,
+        params=_freeze_json(params),
+    )
 
 
 def _parse_exception(raw: dict, index: int) -> AllowedExceptionV1:
@@ -290,6 +339,9 @@ def parse_repair_contract_v1(raw: Any) -> RepairContractV1:
     source_sha256 = _require_sha256_hex(raw, "sourceSha256", "$")
     source_size = _require_int(raw, "sourceSize", "$", minimum=0)
     source_file_name = _require_docx_filename(raw, "sourceFileName", "$")
+    target_sha256 = _require_sha256_hex(raw, "targetSha256", "$")
+    target_size = _require_int(raw, "targetSize", "$", minimum=1, maximum=MAX_DOCX_BYTES)
+    target_file_name = _require_docx_filename(raw, "targetFileName", "$")
     created_at = _require_iso8601(raw, "createdAt", "$")
     expires_at = _require_iso8601(raw, "expiresAt", "$")
     if expires_at <= created_at:
@@ -330,6 +382,9 @@ def parse_repair_contract_v1(raw: Any) -> RepairContractV1:
         source_sha256=source_sha256,
         source_size=source_size,
         source_file_name=source_file_name,
+        target_sha256=target_sha256,
+        target_size=target_size,
+        target_file_name=target_file_name,
         created_at=created_at,
         expires_at=expires_at,
         engine_min_version=engine_min,

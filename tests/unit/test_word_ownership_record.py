@@ -76,3 +76,19 @@ def test_multiple_owned_word_processes_coexist_and_clear_individually(tmp_path, 
     assert [item["pid"] for item in list_owned_words()] == [1001]
     clear_owned_word(1001)
     assert not record.exists()
+
+
+def test_record_owned_word_uses_inherited_orchestrator_owner_pid(tmp_path, monkeypatch):
+    record = tmp_path / "owned.json"
+    monkeypatch.setenv("WORD_REPLICA_WORD_OWNERSHIP_FILE", str(record))
+    monkeypatch.setenv("WORD_REPLICA_WORD_OWNER_PID", "2468")
+
+    record_owned_word(
+        FakeApplication(),
+        role="interactive",
+        pid_resolver=lambda hwnd: 4567,
+        process_identity_resolver=lambda pid: 987654321,
+    )
+
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    assert payload["owner_process_pid"] == 2468

@@ -67,8 +67,19 @@ def _default_manifest_probe(root: Path) -> tuple[bool, list[str]]:
         except ValueError:
             errors.append(f"malformed manifest line: {line}")
             continue
-        rel=rel.strip().lstrip("./\\")
-        path=root/rel
+        rel=rel.strip()
+        if rel.startswith("./") or rel.startswith(".\\"):
+            rel=rel[2:]
+        relative_path=Path(rel)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            errors.append(f"unsafe manifest path: {rel}")
+            continue
+        path=(root/relative_path).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            errors.append(f"unsafe manifest path: {rel}")
+            continue
         if not path.exists():
             errors.append(f"manifest file missing: {rel}")
             continue

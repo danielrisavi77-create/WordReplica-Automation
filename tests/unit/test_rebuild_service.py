@@ -146,6 +146,29 @@ def test_explicit_word_renderer_does_not_spawn_a_probe_word_process(monkeypatch)
     assert renderer.__class__.__name__ == "WordComRenderer"
 
 
+def test_pure_docx_rebuild_requests_a_word_free_environment_fingerprint(tmp_path, monkeypatch):
+    import word_replica.services.rebuild as module
+    from word_replica.domain.enums import RendererChoice
+
+    calls = []
+
+    def capture(*, include_word):
+        calls.append(include_word)
+        return {}
+
+    monkeypatch.setattr(module, "capture_environment_fingerprint", capture)
+    source = tmp_path / "source.docx"
+    source.write_bytes(b"fixture")
+
+    result = _service(tmp_path).rebuild(
+        source,
+        RebuildOptions(renderer=RendererChoice.DOCX),
+    )
+
+    assert result.status is RunStatus.PASS
+    assert calls == [False]
+
+
 def test_interactive_mode_routes_without_selecting_instant_renderer(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from word_replica.domain.enums import ReconstructionMode
@@ -163,6 +186,74 @@ def test_interactive_mode_routes_without_selecting_instant_renderer(tmp_path, mo
     result=service.rebuild(source,RebuildOptions(reconstruction_mode=ReconstructionMode.INTERACTIVE))
     assert result.status is RunStatus.WARN
     assert [x[0] for x in calls] == ["prepare","start"]
+
+
+def test_interactive_pre_start_callback_runs_after_prepare_and_before_word_start(tmp_path):
+    from types import SimpleNamespace
+    from word_replica.domain.enums import ReconstructionMode
+
+    source = tmp_path / "source.docx"
+    source.write_bytes(b"fixture")
+    calls = []
+
+    class InteractiveService:
+        project_store = None
+
+        def prepare(self, source, options, paths, audit, observer=None):
+            calls.append("prepare")
+            return SimpleNamespace(source_path=str(source), paths=paths)
+
+        def start(self, prepared, controller_factory=None, control=None, observer=None):
+            calls.append("start")
+            return __import__(
+                "word_replica.domain.results", fromlist=["RunResult"]
+            ).RunResult(RunStatus.WARN, None, None, project_id=prepared.paths.project_id)
+
+    service = RebuildService(app_root=tmp_path / "app", interactive_service=InteractiveService())
+
+    result = service.rebuild(
+        source,
+        RebuildOptions(reconstruction_mode=ReconstructionMode.INTERACTIVE),
+        interactive_pre_start=lambda prepared: calls.append("bind"),
+    )
+
+    assert result.status is RunStatus.WARN
+    assert calls == ["prepare", "bind", "start"]
+
+
+def test_expected_source_snapshot_uses_verified_private_project_copy(tmp_path):
+    from types import SimpleNamespace
+    from word_replica.domain.enums import ReconstructionMode
+    from word_replica.services.source_guard import capture_source
+
+    source = tmp_path / "signed-target.docx"
+    source.write_bytes(b"signed target bytes")
+    expected = capture_source(source)
+    prepared_sources = []
+
+    class InteractiveService:
+        project_store = None
+
+        def prepare(self, source, options, paths, audit, observer=None):
+            prepared_sources.append(Path(source))
+            return SimpleNamespace(source_path=str(source), paths=paths)
+
+        def start(self, prepared, controller_factory=None, control=None, observer=None):
+            return __import__(
+                "word_replica.domain.results", fromlist=["RunResult"]
+            ).RunResult(RunStatus.WARN, None, None, project_id=prepared.paths.project_id)
+
+    service = RebuildService(app_root=tmp_path / "app", interactive_service=InteractiveService())
+    result = service.rebuild(
+        source,
+        RebuildOptions(reconstruction_mode=ReconstructionMode.INTERACTIVE),
+        expected_source_snapshot=expected,
+    )
+
+    assert result.status is RunStatus.WARN
+    assert prepared_sources[0] != source.resolve()
+    assert prepared_sources[0].parent.name == "source_snapshot"
+    assert prepared_sources[0].read_bytes() == b"signed target bytes"
 
 
 def test_interactive_word_unavailable_never_falls_back_to_pure_docx(tmp_path):

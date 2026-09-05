@@ -6,6 +6,7 @@
   "audit_timeout_seconds": 1800,
   "keep_success_runs": 1,
   "keep_failure_runs": 2,
+  "minimum_free_space_mb": 2048,
   "visual_dpi": 144,
   "changed_pixel_tolerance": 0.001,
   "mae_tolerance": 0.25

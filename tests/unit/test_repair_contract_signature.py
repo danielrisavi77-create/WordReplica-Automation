@@ -35,6 +35,7 @@ def _mutate(raw: dict, path: list, value) -> dict:
 def test_verifies_the_published_lekta_fixture_contract():
     contract = verify_signed_contract(_load_raw(), _trusted_keys())
     assert contract.source_file_name == "Kalogjera - seminar Havel.docx"
+    assert contract.target_file_name == "Kalogjera - seminar Havel-popravljeno.docx"
     assert contract.output_policy.suggested_file_name == "Kalogjera - seminar Havel-popravljeno.docx"
     assert contract.job_id == "11111111-1111-4111-8111-111111111111"
     assert [request.fixer_id for request in contract.requests] == ["font-fixer", "heading-case-fixer"]
@@ -73,6 +74,9 @@ def test_rejects_a_63_byte_signature():
     (["sourceSha256"], "0" * 64),
     (["sourceSize"], 999999),
     (["sourceFileName"], "different-file-name.docx"),
+    (["targetSha256"], "0" * 64),
+    (["targetSize"], 999999),
+    (["targetFileName"], "different-target.docx"),
     (["requests", 0, "params", "fontSizePt"], 99),
     (["expiresAt"], "2099-01-01T00:00:00.000Z"),
     (["outputPolicy", "suggestedFileName"], "other-name.docx"),

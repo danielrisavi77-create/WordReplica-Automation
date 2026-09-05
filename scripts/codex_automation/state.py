@@ -41,6 +41,7 @@ def evaluate_run(state: AutomationState, report: dict) -> AutomationDecision:
         bool(report.get("full_pass"))
         and len(current) == len(required)
         and all(current.get(name, False) for name in required)
+        and bool(report.get("worktree_clean", True))
     )
 
     if full_pass:

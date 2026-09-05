@@ -8,6 +8,17 @@ from word_replica.renderers.word_ownership import clear_owned_word, record_owned
 WD_EXPORT_FORMAT_PDF = 17
 
 
+def _clear_owned_word_after_confirmed_exit(pid: int | None, *, quit_succeeded: bool) -> None:
+    if pid is None or not quit_succeeded:
+        return
+    try:
+        if pid in word_process_pids():
+            return
+    except Exception:
+        return
+    clear_owned_word(pid)
+
+
 def _export_with_application(application, docx_path: Path, pdf_path: Path) -> Path:
     doc = None
     try:
@@ -61,10 +72,14 @@ def export_docx_to_pdf_with_word(docx_path: Path, pdf_path: Path, visible: bool 
             application.DisplayAlerts = 0
         return _export_with_application(application, Path(docx_path), Path(pdf_path))
     finally:
+        quit_succeeded = application is None
         if application is not None:
-            with suppress(Exception):
+            try:
                 application.Quit()
-        clear_owned_word(owned_word_pid)
+                quit_succeeded = True
+            except Exception:
+                quit_succeeded = False
+        _clear_owned_word_after_confirmed_exit(owned_word_pid, quit_succeeded=quit_succeeded)
         with suppress(Exception):
             pythoncom.CoUninitialize()
 
@@ -111,10 +126,14 @@ def read_docx_pair_compatibility_mode(
             "output": _document_compatibility_mode(application, Path(output_docx_path)),
         }
     finally:
+        quit_succeeded = application is None
         if application is not None:
-            with suppress(Exception):
+            try:
                 application.Quit()
-        clear_owned_word(owned_word_pid)
+                quit_succeeded = True
+            except Exception:
+                quit_succeeded = False
+        _clear_owned_word_after_confirmed_exit(owned_word_pid, quit_succeeded=quit_succeeded)
         with suppress(Exception):
             pythoncom.CoUninitialize()
 
@@ -172,10 +191,14 @@ def detect_open_and_repair(docx_path: Path) -> bool | None:
     except Exception:
         return None
     finally:
+        quit_succeeded = application is None
         if application is not None:
-            with suppress(Exception):
+            try:
                 application.Quit()
-        clear_owned_word(owned_word_pid)
+                quit_succeeded = True
+            except Exception:
+                quit_succeeded = False
+        _clear_owned_word_after_confirmed_exit(owned_word_pid, quit_succeeded=quit_succeeded)
         with suppress(Exception):
             pythoncom.CoUninitialize()
 
@@ -227,10 +250,14 @@ def check_fields_update_equality(docx_path: Path) -> bool | None:
     except Exception:
         return None
     finally:
+        quit_succeeded = application is None
         if application is not None:
-            with suppress(Exception):
+            try:
                 application.Quit()
-        clear_owned_word(owned_word_pid)
+                quit_succeeded = True
+            except Exception:
+                quit_succeeded = False
+        _clear_owned_word_after_confirmed_exit(owned_word_pid, quit_succeeded=quit_succeeded)
         with suppress(Exception):
             pythoncom.CoUninitialize()
 
@@ -265,9 +292,13 @@ def export_docx_pair_to_pdf_with_word(
             Path(output_pdf_path),
         )
     finally:
+        quit_succeeded = application is None
         if application is not None:
-            with suppress(Exception):
+            try:
                 application.Quit()
-        clear_owned_word(owned_word_pid)
+                quit_succeeded = True
+            except Exception:
+                quit_succeeded = False
+        _clear_owned_word_after_confirmed_exit(owned_word_pid, quit_succeeded=quit_succeeded)
         with suppress(Exception):
             pythoncom.CoUninitialize()

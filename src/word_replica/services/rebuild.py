@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import shutil
@@ -32,6 +32,13 @@ from word_replica.services.source_guard import (
     capture_source,
     sha256_file,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class InteractiveProjectDescription:
+    project_id: str
+    source_path: Path
+    working_output_path: Path
 
 
 class RenderContext:
@@ -203,6 +210,32 @@ class RebuildService:
             return WordComRenderer(visible=options.visibility is VisibilityMode.VISIBLE), "word"
         return PureDocxRenderer(), "docx"
 
+    def describe_interactive_project(self, project_id: str) -> InteractiveProjectDescription:
+        store = ProjectStore(
+            app_root=self.app_root,
+            projects_under_app_root=self.projects_under_app_root,
+        )
+        project = store.get_project(project_id)
+        paths = store.paths_for_project(project_id)
+        source_path = Path(project["source_path"]).resolve()
+        return InteractiveProjectDescription(
+            project_id=project_id,
+            source_path=source_path,
+            working_output_path=paths.output_dir / f"{source_path.stem}_reconstructed.docx",
+        )
+
+    def interactive_checkpoint_sha256(self, project_id: str) -> str | None:
+        store = ProjectStore(
+            app_root=self.app_root,
+            projects_under_app_root=self.projects_under_app_root,
+        )
+        checkpoint_path = (
+            store.paths_for_project(project_id).logs_dir / "interactive_checkpoint.json"
+        )
+        if not checkpoint_path.is_file():
+            return None
+        return sha256_file(checkpoint_path)
+
     def resume_interactive(self, project_id: str, *, interactive_control=None, interactive_observer=None) -> RunResult:
         from word_replica.interactive.control import InteractiveRunControl
         from word_replica.services.interactive_rebuild import InteractiveRebuildService
@@ -224,7 +257,16 @@ class RebuildService:
             control.start()
         return interactive.resume(project_id, control, observer=interactive_observer)
 
-    def rebuild(self, source: Path, options: RebuildOptions, *, interactive_control=None, interactive_observer=None) -> RunResult:
+    def rebuild(
+        self,
+        source: Path,
+        options: RebuildOptions,
+        *,
+        interactive_control=None,
+        interactive_observer=None,
+        interactive_pre_start: Callable[[object], None] | None = None,
+        expected_source_snapshot: SourceSnapshot | None = None,
+    ) -> RunResult:
         source = Path(source).resolve()
         if source.suffix.lower() != ".docx":
             return RunResult(
@@ -239,7 +281,25 @@ class RebuildService:
             projects_under_app_root=self.projects_under_app_root,
         )
         snapshot = capture_source(source)
+        if expected_source_snapshot is not None:
+            if expected_source_snapshot.path.resolve() != source:
+                raise SourceIntegrityError("Expected source snapshot belongs to a different path")
+            if (
+                snapshot.sha256 != expected_source_snapshot.sha256
+                or snapshot.size != expected_source_snapshot.size
+            ):
+                raise SourceIntegrityError("Source no longer matches the verified package snapshot")
         paths = store.create_project(source, options)
+        rebuild_source = source
+        if expected_source_snapshot is not None:
+            private_source = paths.source_snapshot_dir / source.name
+            private_snapshot = capture_source(private_source)
+            if (
+                private_snapshot.sha256 != expected_source_snapshot.sha256
+                or private_snapshot.size != expected_source_snapshot.size
+            ):
+                raise SourceIntegrityError("Private project copy does not match the verified package snapshot")
+            rebuild_source = private_source
         audit = AuditLog(paths.logs_dir / "audit.jsonl")
         warnings_path = paths.logs_dir / "warnings.json"
         warnings: list[WarningItem] = []
@@ -267,7 +327,9 @@ class RebuildService:
                         interactive.project_store = store
                     except Exception:
                         pass
-                prepared = interactive.prepare(source, options, paths, audit, observer=interactive_observer)
+                prepared = interactive.prepare(rebuild_source, options, paths, audit, observer=interactive_observer)
+                if interactive_pre_start is not None:
+                    interactive_pre_start(prepared)
                 result = interactive.start(
                     prepared, control=interactive_control, observer=interactive_observer
                 )
@@ -278,7 +340,7 @@ class RebuildService:
             store.set_status(paths.project_id, "RUNNING")
             audit.append("PARSE_STARTED", {"source_path": str(source)})
             parser = self._parser or DocxParser()
-            model = self._parse(parser, source)
+            model = self._parse(parser, rebuild_source)
             audit.append("PARSE_COMPLETED", {})
 
             if isinstance(model, DocumentModel):
@@ -374,7 +436,9 @@ class RebuildService:
                 levels=qa_bundle.levels if qa_bundle is not None else {},
                 warnings=warnings,
                 render_result=qa_bundle.render if qa_bundle is not None else None,
-                environment=capture_environment_fingerprint(),
+                environment=capture_environment_fingerprint(
+                    include_word=renderer_name == "word"
+                ),
             )
             store.set_status(paths.project_id, status.value)
             audit.append(

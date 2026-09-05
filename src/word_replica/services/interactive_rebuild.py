@@ -9,7 +9,7 @@ import posixpath
 from pathlib import Path, PurePosixPath
 import tempfile
 import time
-from typing import Callable
+from typing import Any, Callable
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from word_replica.config import InteractiveOptions, RebuildOptions
@@ -188,6 +188,14 @@ class _InteractiveServiceObserver:
             callback(index, event, snapshot)
 
     def event_failed(self, index, event, snapshot, exc) -> None:
+        self.audit.append("INTERACTIVE_EVENT_FAILED", {
+            "event_index": index,
+            "event_type": event.event_type,
+            "source_element_id": event.source_element_id,
+            "error_type": type(exc).__name__,
+            "error_hresult": getattr(exc, "hresult", None),
+            "error": str(exc),
+        })
         callback = getattr(self.downstream, "event_failed", None) if self.downstream is not None else None
         if callback is not None:
             callback(index, event, snapshot, exc)
@@ -925,6 +933,110 @@ class InteractiveRebuildService:
         return restored
 
     @staticmethod
+    def _restore_source_run_segmentation(output_path: Path, source_path: Path) -> int:
+        """Restore source run boundaries in text-only body paragraphs.
+
+        Word can coalesce adjacent, equally formatted runs when it saves the
+        interactively typed document. In justified paragraphs those otherwise
+        semantic-neutral boundaries measurably alter glyph placement in Word's
+        PDF renderer. Keep the fast grouped COM insertion, then restore only
+        paragraphs whose direct content is plain runs and whose visible text is
+        already identical. Their source paragraph shell and run segmentation are
+        deterministic package fidelity; all non-text structures stay owned by the
+        reconstructed output.
+        """
+        from lxml import etree
+
+        namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        ns = {"w": namespace}
+        paragraph_properties_tag = f"{{{namespace}}}pPr"
+        run_tag = f"{{{namespace}}}r"
+        run_properties_tag = f"{{{namespace}}}rPr"
+        text_tag = f"{{{namespace}}}t"
+        rendered_break_tag = f"{{{namespace}}}lastRenderedPageBreak"
+
+        with ZipFile(source_path) as source_archive:
+            source_root = etree.fromstring(source_archive.read("word/document.xml"))
+        with ZipFile(output_path) as output_archive:
+            parts = {name: output_archive.read(name) for name in output_archive.namelist()}
+        output_root = etree.fromstring(parts["word/document.xml"])
+
+        def text_only_runs(paragraph):
+            if any(child.tag not in {paragraph_properties_tag, run_tag} for child in paragraph):
+                return None
+            runs = paragraph.findall("w:r", namespaces=ns)
+            for run in runs:
+                if any(
+                    child.tag not in {run_properties_tag, text_tag, rendered_break_tag}
+                    for child in run
+                ):
+                    return None
+            return runs
+
+        restored = 0
+        source_paragraphs = source_root.xpath("//w:body//w:p", namespaces=ns)
+        output_paragraphs = output_root.xpath("//w:body//w:p", namespaces=ns)
+        for source_paragraph, output_paragraph in zip(source_paragraphs, output_paragraphs):
+            source_runs = text_only_runs(source_paragraph)
+            output_runs = text_only_runs(output_paragraph)
+            if source_runs is None or output_runs is None:
+                continue
+            source_text = "".join(source_paragraph.xpath(".//w:t/text()", namespaces=ns))
+            output_text = "".join(output_paragraph.xpath(".//w:t/text()", namespaces=ns))
+            if source_text != output_text:
+                continue
+            source_properties = source_paragraph.find("w:pPr", namespaces=ns)
+            output_properties = output_paragraph.find("w:pPr", namespaces=ns)
+            if (
+                source_properties is not None
+                and source_properties.find(".//w:sectPr", namespaces=ns) is not None
+            ):
+                continue
+            source_run_xml = [etree.tostring(run) for run in source_runs]
+            output_run_xml = [etree.tostring(run) for run in output_runs]
+            source_properties_xml = (
+                etree.tostring(source_properties) if source_properties is not None else None
+            )
+            output_properties_xml = (
+                etree.tostring(output_properties) if output_properties is not None else None
+            )
+            if (
+                source_run_xml == output_run_xml
+                and source_properties_xml == output_properties_xml
+                and dict(source_paragraph.attrib) == dict(output_paragraph.attrib)
+            ):
+                continue
+            if output_properties is not None:
+                output_paragraph.remove(output_properties)
+            if source_properties is not None:
+                output_paragraph.insert(0, etree.fromstring(source_properties_xml))
+            for run in output_runs:
+                output_paragraph.remove(run)
+            for run in source_runs:
+                output_paragraph.append(etree.fromstring(etree.tostring(run)))
+            output_paragraph.attrib.clear()
+            output_paragraph.attrib.update(source_paragraph.attrib)
+            restored += 1
+
+        if not restored:
+            return 0
+        parts["word/document.xml"] = etree.tostring(
+            output_root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{output_path.name}.", suffix=".tmp", dir=output_path.parent
+        )
+        os.close(fd)
+        try:
+            with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
+                for name, data in parts.items():
+                    archive.writestr(name, data)
+            _replace_with_retry(Path(temporary_name), output_path)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return restored
+
+    @staticmethod
     def _restore_empty_runs(output_path: Path, source_path: Path) -> int:
         from lxml import etree
 
@@ -1257,27 +1369,457 @@ class InteractiveRebuildService:
         from lxml import etree
 
         namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-        ns = {"w": namespace, "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
-        with ZipFile(source_path) as source_archive:
-            source_parts = {name: source_archive.read(name) for name in source_archive.namelist() if name.startswith("word/footer") and name.endswith(".xml")}
-        with ZipFile(output_path) as output_archive:
-            parts = {name: output_archive.read(name) for name in output_archive.namelist()}
+        rel_namespace = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        ns = {"w": namespace, "r": rel_namespace}
+
+        def footer_targets_by_section(archive_path: Path) -> tuple[dict[int, dict[str, str]], dict[str, bytes]]:
+            with ZipFile(archive_path) as archive:
+                parts = {name: archive.read(name) for name in archive.namelist()}
+            document_root = etree.fromstring(parts["word/document.xml"])
+            rels_bytes = parts.get("word/_rels/document.xml.rels")
+            rel_map = {}
+            if rels_bytes is not None:
+                rels_root = etree.fromstring(rels_bytes)
+                rel_map = {rel.get("Id"): rel.get("Target") for rel in rels_root}
+            by_section: dict[int, dict[str, str]] = {}
+            for index, section in enumerate(document_root.xpath("//w:sectPr", namespaces=ns)):
+                types: dict[str, str] = {}
+                for ref in section.xpath("./w:footerReference", namespaces=ns):
+                    footer_type = ref.get(f"{{{namespace}}}type") or "default"
+                    rid = ref.get(f"{{{rel_namespace}}}id")
+                    target = rel_map.get(rid)
+                    if target is not None:
+                        types[footer_type] = f"word/{target}"
+                by_section[index] = types
+            return by_section, parts
+
+        # Physical footer part names (footer1.xml, footer2.xml, ...) are assigned
+        # independently by whichever tool last saved each package - Word routinely
+        # renumbers them on rebuild (e.g. it materializes empty even/first-page
+        # variants the source never declared). Matching parts by filename would
+        # therefore silently pair up unrelated footers from different sections that
+        # happen to share a number. Match by (section index, footer type) instead,
+        # resolved through each package's own relationships.
+        source_sections, source_parts = footer_targets_by_section(source_path)
+        output_sections, output_parts = footer_targets_by_section(output_path)
+        document_root = etree.fromstring(output_parts["word/document.xml"])
+        rels_root = etree.fromstring(output_parts["word/_rels/document.xml.rels"])
+        types_root = (
+            etree.fromstring(output_parts["[Content_Types].xml"])
+            if "[Content_Types].xml" in output_parts else None
+        )
+
         restored = 0
-        for name, data in source_parts.items():
-            if name in parts and parts[name] != data:
-                parts[name] = data
-                restored += 1
-        document_root = etree.fromstring(parts["word/document.xml"])
-        for index, section in enumerate(document_root.xpath("//w:sectPr", namespaces=ns)):
+        sections = document_root.xpath("//w:sectPr", namespaces=ns)
+        missing: list[tuple[Any, str, str]] = []  # (sectPr element, footer_type, source_target)
+        for index, section in enumerate(sections):
             allowed = expected_types[index] if index < len(expected_types) else set()
+            source_types = source_sections.get(index, {})
+            output_types = output_sections.get(index, {})
             for ref in section.xpath("./w:footerReference", namespaces=ns):
-                if (ref.get(f"{{{namespace}}}type") or "default") not in allowed:
+                footer_type = ref.get(f"{{{namespace}}}type") or "default"
+                if footer_type not in allowed:
                     ref.getparent().remove(ref)
                     restored += 1
+                    continue
+                source_target = source_types.get(footer_type)
+                output_target = output_types.get(footer_type)
+                if source_target is None or output_target is None:
+                    continue
+                source_data = source_parts.get(source_target)
+                if source_data is not None and output_parts.get(output_target) != source_data:
+                    output_parts[output_target] = source_data
+                    restored += 1
+            # A footer type the source declares for this section but that has no
+            # footerReference left in the output at all (e.g. Word's own automatic
+            # repagination silently dropped it while inserting an absolutely
+            # positioned image elsewhere in the document - confirmed live) can't be
+            # repaired above, since there is no existing reference to redirect.
+            # It must be rebuilt: a new relationship, a new physical part, and a
+            # new <w:footerReference> inserted back into this section.
+            present_types = {
+                ref.get(f"{{{namespace}}}type") or "default"
+                for ref in section.xpath("./w:footerReference", namespaces=ns)
+            }
+            for footer_type in sorted(allowed - present_types):
+                source_target = source_types.get(footer_type)
+                if source_target is None or source_target not in source_parts:
+                    continue
+                missing.append((section, footer_type, source_target))
+
+        if missing:
+            footer_rel_type = f"{rel_namespace}/footer"
+            footer_content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"
+            existing_rel_type = rels_root.xpath("//*[local-name()='Relationship' and contains(@Type, '/footer')]/@Type")
+            if existing_rel_type:
+                footer_rel_type = str(existing_rel_type[0])
+            if types_root is not None:
+                existing_content_type = types_root.xpath(
+                    "//*[local-name()='Override' and contains(@ContentType, '.footer+xml')]/@ContentType"
+                )
+                if existing_content_type:
+                    footer_content_type = str(existing_content_type[0])
+
+            def next_numbered_name(prefix: str, existing: set[str]) -> str:
+                n = 1
+                while f"{prefix}{n}.xml" in existing:
+                    n += 1
+                return f"{prefix}{n}.xml"
+
+            existing_rids = {rel.get("Id") for rel in rels_root}
+            existing_footer_files = {name.split("/", 1)[-1] for name in output_parts if name.startswith("word/footer")}
+
+            for section, footer_type, source_target in missing:
+                target_name = next_numbered_name("footer", existing_footer_files)
+                existing_footer_files.add(target_name)
+                new_rid = f"rId{len(existing_rids) + 1}"
+                while new_rid in existing_rids:
+                    new_rid = f"rId{int(new_rid[3:]) + 1}"
+                existing_rids.add(new_rid)
+
+                relationship = etree.SubElement(
+                    rels_root, "{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"
+                )
+                relationship.set("Id", new_rid)
+                relationship.set("Type", footer_rel_type)
+                relationship.set("Target", target_name)
+
+                if types_root is not None:
+                    override = etree.SubElement(
+                        types_root, "{http://schemas.openxmlformats.org/package/2006/content-types}Override"
+                    )
+                    override.set("PartName", f"/word/{target_name}")
+                    override.set("ContentType", footer_content_type)
+
+                new_ref = etree.Element(f"{{{namespace}}}footerReference")
+                new_ref.set(f"{{{namespace}}}type", footer_type)
+                new_ref.set(f"{{{rel_namespace}}}id", new_rid)
+                # footerReference elements must sort before pgSz/pgMar/etc per the
+                # OOXML sectPr content model - insert alongside any that remain.
+                existing_refs = section.xpath("./w:footerReference", namespaces=ns)
+                if existing_refs:
+                    existing_refs[-1].addnext(new_ref)
+                else:
+                    section.insert(0, new_ref)
+
+                output_parts[f"word/{target_name}"] = source_parts[source_target]
+                restored += 1
+
+        if not restored:
+            return 0
+        output_parts["word/document.xml"] = etree.tostring(
+            document_root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+        output_parts["word/_rels/document.xml.rels"] = etree.tostring(
+            rels_root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+        if types_root is not None:
+            output_parts["[Content_Types].xml"] = etree.tostring(
+                types_root, xml_declaration=True, encoding="UTF-8", standalone=True
+            )
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{output_path.name}.", suffix=".tmp", dir=output_path.parent
+        )
+        os.close(fd)
+        try:
+            with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
+                for name, data in output_parts.items():
+                    archive.writestr(name, data)
+            _replace_with_retry(Path(temporary_name), output_path)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return restored
+
+    @staticmethod
+    def _restore_source_footer_topology(output_path: Path, source_path: Path) -> int:
+        """Restore the source footer graph after Word materializes duplicates.
+
+        Word may split one footer shared by several sections into separate
+        physical parts and leave additional generated footer parts behind.
+        Restore only the footer subgraph from the signed source package: all
+        footer parts, footer relationships, content-type declarations, and the
+        direct footerReference children of each matching section. If section
+        topology or any referenced source part is incomplete, fail closed.
+        """
+        from lxml import etree
+
+        w_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        r_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        pr_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+        ct_ns = "http://schemas.openxmlformats.org/package/2006/content-types"
+        document_name = "word/document.xml"
+        rels_name = "word/_rels/document.xml.rels"
+        types_name = "[Content_Types].xml"
+        footer_content_type_suffix = ".wordprocessingml.footer+xml"
+
+        with ZipFile(source_path) as source_archive:
+            source_parts = {
+                name: source_archive.read(name) for name in source_archive.namelist()
+            }
+        with ZipFile(output_path) as output_archive:
+            output_parts = {
+                name: output_archive.read(name) for name in output_archive.namelist()
+            }
+        required = {document_name, rels_name, types_name}
+        if not required <= source_parts.keys() or not required <= output_parts.keys():
+            return 0
+
+        source_document = etree.fromstring(source_parts[document_name])
+        output_document = etree.fromstring(output_parts[document_name])
+        source_rels = etree.fromstring(source_parts[rels_name])
+        output_rels = etree.fromstring(output_parts[rels_name])
+        source_types = etree.fromstring(source_parts[types_name])
+        output_types = etree.fromstring(output_parts[types_name])
+        source_sections = source_document.xpath("//w:sectPr", namespaces={"w": w_ns})
+        output_sections = output_document.xpath("//w:sectPr", namespaces={"w": w_ns})
+        if len(source_sections) != len(output_sections):
+            return 0
+
+        def footer_relationships(root):
+            return [
+                node
+                for node in root.findall(f"{{{pr_ns}}}Relationship")
+                if (node.get("Type") or "").endswith("/footer")
+                and node.get("TargetMode") != "External"
+            ]
+
+        def footer_part_names(types_root):
+            return {
+                (node.get("PartName") or "").lstrip("/")
+                for node in types_root.findall(f"{{{ct_ns}}}Override")
+                if (node.get("ContentType") or "").endswith(footer_content_type_suffix)
+            }
+
+        source_footer_rels = footer_relationships(source_rels)
+        output_footer_rels = footer_relationships(output_rels)
+        source_footer_parts = footer_part_names(source_types)
+        output_footer_parts = footer_part_names(output_types)
+        if any(name not in source_parts for name in source_footer_parts):
+            return 0
+
+        source_rids = {node.get("Id") for node in source_footer_rels}
+        if any(
+            ref.get(f"{{{r_ns}}}id") not in source_rids
+            for section in source_sections
+            for ref in section.findall(f"{{{w_ns}}}footerReference")
+        ):
+            return 0
+        if not source_footer_rels and not output_footer_rels and not source_footer_parts and not output_footer_parts:
+            return 0
+
+        for node in output_footer_rels:
+            output_rels.remove(node)
+        for name in output_footer_parts:
+            output_parts.pop(name, None)
+            path = PurePosixPath(name)
+            output_parts.pop(str(path.parent / "_rels" / f"{path.name}.rels"), None)
+        for node in list(output_types.findall(f"{{{ct_ns}}}Override")):
+            if (node.get("PartName") or "").lstrip("/") in output_footer_parts:
+                output_types.remove(node)
+
+        used_ids = {
+            node.get("Id") for node in output_rels.findall(f"{{{pr_ns}}}Relationship")
+        }
+        rid_map: dict[str, str] = {}
+        next_id = 1
+        for source_rel in source_footer_rels:
+            source_id = source_rel.get("Id") or ""
+            new_id = source_id
+            if not new_id or new_id in used_ids:
+                while f"rId{next_id}" in used_ids:
+                    next_id += 1
+                new_id = f"rId{next_id}"
+                next_id += 1
+            used_ids.add(new_id)
+            rid_map[source_id] = new_id
+            restored_rel = deepcopy(source_rel)
+            restored_rel.set("Id", new_id)
+            output_rels.append(restored_rel)
+
+        source_overrides = {
+            (node.get("PartName") or "").lstrip("/"): node
+            for node in source_types.findall(f"{{{ct_ns}}}Override")
+        }
+        for name in source_footer_parts:
+            output_parts[name] = source_parts[name]
+            path = PurePosixPath(name)
+            sidecar = str(path.parent / "_rels" / f"{path.name}.rels")
+            if sidecar in source_parts:
+                output_parts[sidecar] = source_parts[sidecar]
+            declaration = source_overrides.get(name)
+            if declaration is not None:
+                output_types.append(deepcopy(declaration))
+
+        for source_section, output_section in zip(source_sections, output_sections):
+            for output_ref in list(output_section.findall(f"{{{w_ns}}}footerReference")):
+                output_section.remove(output_ref)
+            insertion_index = 0
+            for child in output_section:
+                if etree.QName(child).localname != "headerReference":
+                    break
+                insertion_index += 1
+            for source_ref in source_section.findall(f"{{{w_ns}}}footerReference"):
+                restored_ref = deepcopy(source_ref)
+                restored_ref.set(
+                    f"{{{r_ns}}}id", rid_map[source_ref.get(f"{{{r_ns}}}id")]
+                )
+                output_section.insert(insertion_index, restored_ref)
+                insertion_index += 1
+
+        output_parts[document_name] = etree.tostring(
+            output_document, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+        output_parts[rels_name] = etree.tostring(
+            output_rels, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+        output_parts[types_name] = etree.tostring(
+            output_types, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{Path(output_path).name}.", suffix=".tmp", dir=Path(output_path).parent
+        )
+        os.close(fd)
+        try:
+            with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
+                for name, data in output_parts.items():
+                    archive.writestr(name, data)
+            _replace_with_retry(Path(temporary_name), Path(output_path))
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return len(output_footer_rels) + len(source_footer_rels)
+
+    @staticmethod
+    def _restore_source_cross_paragraph_field_shells(output_path: Path, source_path: Path) -> int:
+        """Restore a missing outer TOC field without replacing its result.
+
+        WordReplica reconstructs every visible TOC paragraph and its nested
+        PAGEREF fields, but Word's Fields.Add API cannot create one field whose
+        cached result spans several paragraphs.  The saved document therefore
+        lacks only the outer begin/instruction/separate/end shell.  Copy that
+        shell from the source only when paragraph topology and every visible
+        result string in the covered range are identical.  Any less certain
+        shape fails closed.
+        """
+        from lxml import etree
+
+        namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        ns = {"w": namespace}
+        field_type_attr = f"{{{namespace}}}fldCharType"
+        paragraph_tag = f"{{{namespace}}}p"
+
+        with ZipFile(source_path) as source_archive:
+            source_root = etree.fromstring(source_archive.read("word/document.xml"))
+        with ZipFile(output_path) as output_archive:
+            parts = {name: output_archive.read(name) for name in output_archive.namelist()}
+        output_root = etree.fromstring(parts["word/document.xml"])
+
+        source_paragraphs = source_root.xpath("//w:body//w:p", namespaces=ns)
+        output_paragraphs = output_root.xpath("//w:body//w:p", namespaces=ns)
+        if len(source_paragraphs) != len(output_paragraphs):
+            return 0
+        source_paragraph_index = {paragraph: index for index, paragraph in enumerate(source_paragraphs)}
+
+        def owner_paragraph(node):
+            return next((ancestor for ancestor in node.iterancestors() if ancestor.tag == paragraph_tag), None)
+
+        records: list[dict] = []
+        stack: list[dict] = []
+        malformed = False
+        for node in source_root.xpath("//w:body//*[self::w:fldChar or self::w:instrText]", namespaces=ns):
+            local = etree.QName(node).localname
+            if local == "instrText":
+                if stack:
+                    stack[-1]["instruction_nodes"].append(node)
+                continue
+            field_type = node.get(field_type_attr)
+            if field_type == "begin":
+                stack.append({"begin": node, "instruction_nodes": [], "separate": None, "end": None})
+            elif field_type == "separate":
+                if not stack:
+                    malformed = True
+                    break
+                stack[-1]["separate"] = node
+            elif field_type == "end":
+                if not stack:
+                    malformed = True
+                    break
+                record = stack.pop()
+                record["end"] = node
+                records.append(record)
+        if malformed or stack:
+            return 0
+
+        output_instructions = {
+            " ".join((node.text or "").split()).casefold()
+            for node in output_root.xpath("//w:body//w:instrText", namespaces=ns)
+        }
+
+        restored = 0
+        for record in records:
+            begin_paragraph = owner_paragraph(record["begin"])
+            separate_paragraph = owner_paragraph(record["separate"]) if record["separate"] is not None else None
+            end_paragraph = owner_paragraph(record["end"])
+            if begin_paragraph is None or separate_paragraph is not begin_paragraph or end_paragraph is None:
+                continue
+            begin_index = source_paragraph_index[begin_paragraph]
+            end_index = source_paragraph_index[end_paragraph]
+            if begin_index >= end_index:
+                continue
+            instruction = "".join(node.text or "" for node in record["instruction_nodes"])
+            normalized_instruction = " ".join(instruction.split()).casefold()
+            if not (normalized_instruction == "toc" or normalized_instruction.startswith("toc ")):
+                continue
+            if normalized_instruction in output_instructions:
+                continue
+
+            begin_run = record["begin"].getparent()
+            separate_run = record["separate"].getparent()
+            end_run = record["end"].getparent()
+            if (
+                begin_run is None
+                or separate_run is None
+                or end_run is None
+                or begin_run.getparent() is not begin_paragraph
+                or separate_run.getparent() is not begin_paragraph
+                or end_run.getparent() is not end_paragraph
+            ):
+                continue
+            begin_children = list(begin_paragraph)
+            start = begin_children.index(begin_run)
+            separate = begin_children.index(separate_run)
+            if start > separate:
+                continue
+            end_children = list(end_paragraph)
+            end_position = end_children.index(end_run)
+            if any(child.xpath(".//w:t", namespaces=ns) for child in begin_children[:start]):
+                continue
+            if any(child.xpath(".//w:t", namespaces=ns) for child in end_children[end_position + 1 :]):
+                continue
+
+            source_visible = [
+                [node.text or "" for node in paragraph.xpath(".//w:t", namespaces=ns)]
+                for paragraph in source_paragraphs[begin_index : end_index + 1]
+            ]
+            output_visible = [
+                [node.text or "" for node in paragraph.xpath(".//w:t", namespaces=ns)]
+                for paragraph in output_paragraphs[begin_index : end_index + 1]
+            ]
+            if source_visible != output_visible:
+                continue
+
+            output_begin = output_paragraphs[begin_index]
+            output_end = output_paragraphs[end_index]
+            insert_at = 1 if output_begin.find("w:pPr", namespaces=ns) is not None else 0
+            for offset, shell_node in enumerate(begin_children[start : separate + 1]):
+                output_begin.insert(insert_at + offset, deepcopy(shell_node))
+            output_end.append(deepcopy(end_run))
+            output_instructions.add(normalized_instruction)
+            restored += 1
+
         if not restored:
             return 0
         parts["word/document.xml"] = etree.tostring(
-            document_root, xml_declaration=True, encoding="UTF-8", standalone=True
+            output_root, xml_declaration=True, encoding="UTF-8", standalone=True
         )
         fd, temporary_name = tempfile.mkstemp(
             prefix=f"{output_path.name}.", suffix=".tmp", dir=output_path.parent
@@ -1644,6 +2186,442 @@ class InteractiveRebuildService:
         return restored
 
     @staticmethod
+    def _restore_source_numbering_definitions(output_path: Path, source_path: Path) -> int:
+        """The interactive renderer cannot ask Word to reuse a source numId - it
+        can only call ListFormat.ApplyBulletDefault()/ApplyNumberDefault(), which
+        makes Word mint its own brand-new list definition (a different numId,
+        and Word's own default indent/format for that level, discarding whatever
+        indent the source's numbering level actually specified, and resetting
+        any explicit <w:ind> override the paragraph had of its own). Since
+        every list paragraph the renderer touches originates from a source
+        paragraph that already carries its own explicit numId (see
+        blueprint.py's CreateListBinding guard), it is always safe to redirect
+        each such paragraph's numId/ilvl/explicit indent back to its source
+        value and then replace Word's generated word/numbering.xml outright
+        with the source's - no output paragraph ends up referencing a numId
+        that source doesn't define.
+        """
+        from lxml import etree
+
+        namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        ns = {"w": namespace}
+        with ZipFile(source_path) as source_archive:
+            if "word/numbering.xml" not in source_archive.namelist():
+                return 0
+            source_numbering = source_archive.read("word/numbering.xml")
+            source_root = etree.fromstring(source_archive.read("word/document.xml"))
+        with ZipFile(output_path) as output_archive:
+            parts = {name: output_archive.read(name) for name in output_archive.namelist()}
+        if "word/document.xml" not in parts:
+            return 0
+        output_root = etree.fromstring(parts["word/document.xml"])
+        restored = 0
+        for source_p, output_p in zip(
+            source_root.xpath("//w:p", namespaces=ns), output_root.xpath("//w:p", namespaces=ns)
+        ):
+            source_num_id = source_p.find("w:pPr/w:numPr/w:numId", namespaces=ns)
+            if source_num_id is None or source_num_id.get(f"{{{namespace}}}val") is None:
+                continue
+            output_num_pr = output_p.find("w:pPr/w:numPr", namespaces=ns)
+            if output_num_pr is None:
+                continue
+            output_num_id = output_num_pr.find("w:numId", namespaces=ns)
+            if output_num_id is None:
+                continue
+            attr = f"{{{namespace}}}val"
+            changed = False
+            if output_num_id.get(attr) != source_num_id.get(attr):
+                output_num_id.set(attr, source_num_id.get(attr))
+                changed = True
+            source_ilvl = source_p.find("w:pPr/w:numPr/w:ilvl", namespaces=ns)
+            output_ilvl = output_num_pr.find("w:ilvl", namespaces=ns)
+            source_ilvl_val = source_ilvl.get(attr) if source_ilvl is not None else None
+            if output_ilvl is not None and source_ilvl_val is not None and output_ilvl.get(attr) != source_ilvl_val:
+                output_ilvl.set(attr, source_ilvl_val)
+                changed = True
+            # A source paragraph can also carry its own explicit <w:ind>
+            # overriding the numbering level's indent (e.g. a tighter hanging
+            # indent for a bibliography-style list). ApplyNumberDefault()
+            # resets the paragraph's indent to the list's own default when it
+            # runs (confirmed live: it fires after ApplyParagraphProperties
+            # already set the explicit indent, silently clobbering it), so
+            # this override needs the same restoration as numId/ilvl above.
+            source_ind = source_p.find("w:pPr/w:ind", namespaces=ns)
+            output_p_pr = output_p.find("w:pPr", namespaces=ns)
+            if source_ind is not None and output_p_pr is not None:
+                output_ind = output_p_pr.find("w:ind", namespaces=ns)
+                source_ind_xml = etree.tostring(source_ind)
+                if output_ind is None:
+                    output_p_pr.append(etree.fromstring(source_ind_xml))
+                    changed = True
+                elif etree.tostring(output_ind) != source_ind_xml:
+                    index = list(output_p_pr).index(output_ind)
+                    output_p_pr.remove(output_ind)
+                    output_p_pr.insert(index, etree.fromstring(source_ind_xml))
+                    changed = True
+            if changed:
+                restored += 1
+        if not restored:
+            return 0
+        parts["word/document.xml"] = etree.tostring(
+            output_root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+        parts["word/numbering.xml"] = source_numbering
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{output_path.name}.", suffix=".tmp", dir=output_path.parent
+        )
+        os.close(fd)
+        try:
+            with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
+                for name, data in parts.items():
+                    archive.writestr(name, data)
+            _replace_with_retry(Path(temporary_name), output_path)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return restored
+
+    @staticmethod
+    def _restore_invisible_field_marker_run_formatting(output_path: Path, source_path: Path) -> int:
+        """A run whose only content is a field-control marker (fldChar/
+        instrText, no <w:t>) is invisible but can still carry its own
+        formatting (e.g. bold) - this happens at the tail of a multi-
+        paragraph field the renderer can never fully replay (see
+        BlueprintCompiler._paragraph_closing_field_begins), where the
+        closing fldChar end lands alone in its own paragraph. Since the
+        renderer never creates that field at all, the paragraph ends up with
+        zero runs instead of the one empty, formatted run source has. This
+        restores that run's formatting shell only - never the fldChar/
+        instrText content itself, which would misrepresent a field the
+        renderer did not actually create.
+        """
+        from lxml import etree
+
+        namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        ns = {"w": namespace}
+        with ZipFile(source_path) as source_archive:
+            source_root = etree.fromstring(source_archive.read("word/document.xml"))
+        with ZipFile(output_path) as output_archive:
+            parts = {name: output_archive.read(name) for name in output_archive.namelist()}
+        output_root = etree.fromstring(parts["word/document.xml"])
+        source_paragraphs = source_root.xpath("//w:body//w:p", namespaces=ns)
+        output_paragraphs = output_root.xpath("//w:body//w:p", namespaces=ns)
+        restored = 0
+        for source_paragraph, output_paragraph in zip(source_paragraphs, output_paragraphs):
+            source_runs = source_paragraph.findall("w:r", namespaces=ns)
+            if not source_runs or output_paragraph.findall("w:r", namespaces=ns):
+                continue
+            has_visible_text = any(
+                (node.text or "").strip()
+                for run in source_runs
+                for node in run.findall("w:t", namespaces=ns)
+            )
+            if has_visible_text:
+                continue
+            for source_run in source_runs:
+                r_pr = source_run.find("w:rPr", namespaces=ns)
+                if r_pr is None:
+                    continue
+                new_run = etree.SubElement(output_paragraph, f"{{{namespace}}}r")
+                new_run.append(deepcopy(r_pr))
+                restored += 1
+        if not restored:
+            return 0
+        parts["word/document.xml"] = etree.tostring(
+            output_root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{output_path.name}.", suffix=".tmp", dir=output_path.parent
+        )
+        os.close(fd)
+        try:
+            with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
+                for name, data in parts.items():
+                    archive.writestr(name, data)
+            _replace_with_retry(Path(temporary_name), output_path)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return restored
+
+    @staticmethod
+    def _remove_word_added_note_reference_space(output_path: Path) -> int:
+        """Word unconditionally inserts one leading space before the first
+        text of every footnote/endnote it saves, regardless of what was
+        actually typed there - confirmed live: typing text with no leading
+        space at all still comes back from SaveAs2 with one added. When the
+        source text already starts with its own space (common - authors often
+        type a literal space after the reference mark), the result is two
+        spaces. There is nothing to compare against the source for: Word's
+        extra space is unconditional, so it is always safe to strip exactly
+        one leading space from the first text immediately after a
+        footnoteRef/endnoteRef marker.
+        """
+        from lxml import etree
+
+        namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        ns = {"w": namespace}
+        with ZipFile(output_path) as archive:
+            parts = {name: archive.read(name) for name in archive.namelist()}
+        restored = 0
+        roots: dict[str, object] = {}
+        for part_name in ("word/footnotes.xml", "word/endnotes.xml"):
+            if part_name not in parts:
+                continue
+            root = etree.fromstring(parts[part_name])
+            changed = False
+            for note in root.xpath("./w:footnote | ./w:endnote", namespaces=ns):
+                for paragraph in note.xpath("./w:p", namespaces=ns):
+                    runs = paragraph.xpath("./w:r", namespaces=ns)
+                    def has_marker(run) -> bool:
+                        return (
+                            run.find(f"{{{namespace}}}footnoteRef") is not None
+                            or run.find(f"{{{namespace}}}endnoteRef") is not None
+                        )
+
+                    marker_index = next(
+                        (i for i, run in enumerate(runs) if has_marker(run)),
+                        None,
+                    )
+                    if marker_index is None:
+                        continue
+                    for run in runs[marker_index + 1:]:
+                        t = run.find(f"w:t", namespaces=ns)
+                        if t is None:
+                            continue
+                        if t.text and t.text.startswith(" "):
+                            t.text = t.text[1:]
+                            restored += 1
+                            changed = True
+                        break
+            if changed:
+                roots[part_name] = root
+        if not restored:
+            return 0
+        for part_name, root in roots.items():
+            parts[part_name] = etree.tostring(
+                root, xml_declaration=True, encoding="UTF-8", standalone=True
+            )
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{output_path.name}.", suffix=".tmp", dir=output_path.parent
+        )
+        os.close(fd)
+        try:
+            with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
+                for name, data in parts.items():
+                    archive.writestr(name, data)
+            _replace_with_retry(Path(temporary_name), output_path)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return restored
+
+    @staticmethod
+    def _restore_source_compatibility_settings(output_path: Path, source_path: Path) -> int:
+        """Replace only Word's normalized w:compat subtree with the source one."""
+        from lxml import etree
+
+        settings_name = "word/settings.xml"
+        w_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        with ZipFile(source_path) as source_archive:
+            if settings_name not in source_archive.namelist():
+                return 0
+            source_settings = source_archive.read(settings_name)
+        with ZipFile(output_path) as output_archive:
+            parts = {
+                name: output_archive.read(name) for name in output_archive.namelist()
+            }
+        output_settings = parts.get(settings_name)
+        if output_settings is None:
+            return 0
+
+        source_root = etree.fromstring(source_settings)
+        output_root = etree.fromstring(output_settings)
+        source_compat = source_root.find(f"{{{w_ns}}}compat")
+        output_compat = output_root.find(f"{{{w_ns}}}compat")
+        source_xml = etree.tostring(source_compat) if source_compat is not None else None
+        output_xml = etree.tostring(output_compat) if output_compat is not None else None
+        if source_xml == output_xml:
+            return 0
+
+        if output_compat is not None:
+            insertion_index = output_root.index(output_compat)
+            output_root.remove(output_compat)
+        elif source_compat is not None:
+            insertion_index = min(source_root.index(source_compat), len(output_root))
+        else:
+            insertion_index = len(output_root)
+        if source_compat is not None:
+            output_root.insert(insertion_index, deepcopy(source_compat))
+        parts[settings_name] = etree.tostring(
+            output_root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{Path(output_path).name}.", suffix=".tmp", dir=Path(output_path).parent
+        )
+        os.close(fd)
+        try:
+            with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
+                for name, data in parts.items():
+                    archive.writestr(name, data)
+            _replace_with_retry(Path(temporary_name), Path(output_path))
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return 1
+
+    @staticmethod
+    def _restore_source_package_parts(output_path: Path, source_path: Path, model) -> int:
+        """Restore source parts the parser explicitly classified for transfer.
+
+        Interactive Word authoring starts with a new document, so Word cannot
+        recreate opaque package attachments, thumbnails, or unreferenced media.
+        The parser already separates those byte-preserved parts from authored
+        content. Restore only missing, declared parts plus an otherwise-unused
+        source numbering part, and recreate only their source relationships and
+        content-type declarations. Existing output parts are never overwritten.
+        """
+        from lxml import etree
+
+        content_type_ns = "http://schemas.openxmlformats.org/package/2006/content-types"
+        relationship_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+        output_path = Path(output_path)
+        source_path = Path(source_path)
+        with ZipFile(source_path) as source_archive:
+            source_parts = {
+                name: source_archive.read(name) for name in source_archive.namelist()
+            }
+        with ZipFile(output_path) as output_archive:
+            parts = {name: output_archive.read(name) for name in output_archive.namelist()}
+
+        desired = {
+            str(name): part.data
+            for name, part in getattr(model, "preserved_parts", {}).items()
+            if str(name) in source_parts
+        }
+        if (
+            getattr(model, "numbering_xml", None) is not None
+            and "word/numbering.xml" in source_parts
+        ):
+            desired.setdefault("word/numbering.xml", source_parts["word/numbering.xml"])
+        missing = {name: data for name, data in desired.items() if name not in parts}
+        if not missing:
+            return 0
+        parts.update(missing)
+
+        source_types = etree.fromstring(source_parts["[Content_Types].xml"])
+        output_types = etree.fromstring(parts["[Content_Types].xml"])
+        output_overrides = {
+            node.get("PartName")
+            for node in output_types.findall(f"{{{content_type_ns}}}Override")
+        }
+        output_defaults = {
+            (node.get("Extension") or "").lower()
+            for node in output_types.findall(f"{{{content_type_ns}}}Default")
+        }
+        source_overrides = {
+            node.get("PartName"): node
+            for node in source_types.findall(f"{{{content_type_ns}}}Override")
+        }
+        source_defaults = {
+            (node.get("Extension") or "").lower(): node
+            for node in source_types.findall(f"{{{content_type_ns}}}Default")
+        }
+        for name in missing:
+            part_name = f"/{name}"
+            override = source_overrides.get(part_name)
+            if override is not None:
+                if part_name not in output_overrides:
+                    output_types.append(deepcopy(override))
+                    output_overrides.add(part_name)
+                continue
+            extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            default = source_defaults.get(extension)
+            if default is not None and extension not in output_defaults:
+                output_types.append(deepcopy(default))
+                output_defaults.add(extension)
+        parts["[Content_Types].xml"] = etree.tostring(
+            output_types, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+
+        def owner_part(rels_name: str) -> str:
+            if rels_name == "_rels/.rels":
+                return ""
+            rels_path = PurePosixPath(rels_name)
+            return posixpath.join(
+                str(rels_path.parent.parent), rels_path.name.removesuffix(".rels")
+            )
+
+        def restore_relationship(owner_rels: str, target_part: str, rel_type: str | None) -> None:
+            source_rels_xml = source_parts.get(owner_rels)
+            if source_rels_xml is None:
+                return
+            source_root = etree.fromstring(source_rels_xml)
+            owner = owner_part(owner_rels)
+            source_node = next(
+                (
+                    node
+                    for node in source_root.findall(f"{{{relationship_ns}}}Relationship")
+                    if (rel_type is None or node.get("Type") == rel_type)
+                    and node.get("TargetMode") != "External"
+                    and posixpath.normpath(
+                        posixpath.join(posixpath.dirname(owner), node.get("Target") or "")
+                    ) == target_part
+                ),
+                None,
+            )
+            if source_node is None:
+                return
+            if owner_rels in parts:
+                output_root = etree.fromstring(parts[owner_rels])
+            else:
+                output_root = etree.Element(
+                    f"{{{relationship_ns}}}Relationships", nsmap={None: relationship_ns}
+                )
+            if any(
+                node.get("Type") == source_node.get("Type")
+                and node.get("TargetMode") != "External"
+                and posixpath.normpath(
+                    posixpath.join(posixpath.dirname(owner), node.get("Target") or "")
+                ) == target_part
+                for node in output_root.findall(f"{{{relationship_ns}}}Relationship")
+            ):
+                return
+            used_ids = {
+                node.get("Id")
+                for node in output_root.findall(f"{{{relationship_ns}}}Relationship")
+            }
+            index = 1
+            while f"rId{index}" in used_ids:
+                index += 1
+            restored_node = deepcopy(source_node)
+            restored_node.set("Id", f"rId{index}")
+            output_root.append(restored_node)
+            parts[owner_rels] = etree.tostring(
+                output_root, xml_declaration=True, encoding="UTF-8", standalone=True
+            )
+
+        for name, part in getattr(model, "preserved_parts", {}).items():
+            if str(name) not in missing or not getattr(part, "relationship_type", None):
+                continue
+            restore_relationship(part.owner_rels, str(name), part.relationship_type)
+        if "word/numbering.xml" in missing:
+            restore_relationship(
+                "word/_rels/document.xml.rels", "word/numbering.xml", None
+            )
+
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{output_path.name}.", suffix=".tmp", dir=output_path.parent
+        )
+        os.close(fd)
+        try:
+            with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
+                for name, data in parts.items():
+                    archive.writestr(name, data)
+            _replace_with_retry(Path(temporary_name), output_path)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return len(missing)
+
+    @staticmethod
     def _load_save_history(path: Path) -> list[dict]:
         if not path.exists():
             return []
@@ -1702,6 +2680,9 @@ class InteractiveRebuildService:
         restored_drawing_effect_extents = self._restore_explicit_drawing_effect_extents(
             output_path, Path(prepared.source_path)
         )
+        restored_run_segmentation = self._restore_source_run_segmentation(
+            output_path, Path(prepared.source_path)
+        )
         restored_empty_runs = self._restore_empty_runs(output_path, Path(prepared.source_path))
         restored_column_space = self._restore_explicit_column_space(
             output_path, Path(prepared.source_path)
@@ -1724,13 +2705,32 @@ class InteractiveRebuildService:
         restored_footer_stories = self._restore_source_footer_stories(
             output_path, Path(prepared.source_path), expected_footer_types
         )
+        restored_footer_topology = self._restore_source_footer_topology(
+            output_path, Path(prepared.source_path)
+        )
+        restored_cross_paragraph_field_shells = self._restore_source_cross_paragraph_field_shells(
+            output_path, Path(prepared.source_path)
+        )
         restored_field_instructions = self._restore_source_field_instructions(
             output_path, Path(prepared.source_path)
         )
         restored_table_layout = self._restore_source_table_layout(
             output_path, Path(prepared.source_path)
         )
-        if removed_header_shape_defaults or removed_bookmarks or removed_headers or restored_header_stories or removed_template_spacing or restored_alignment or restored_run_character_spacing or restored_run_font_names or restored_drawing_effect_extents or restored_empty_runs or restored_column_space or restored_page_number_start or restored_defaults or restored_theme_style_latin_fonts or restored_footer_stories or restored_field_instructions or restored_table_layout:
+        restored_numbering_definitions = self._restore_source_numbering_definitions(
+            output_path, Path(prepared.source_path)
+        )
+        restored_invisible_field_marker_runs = self._restore_invisible_field_marker_run_formatting(
+            output_path, Path(prepared.source_path)
+        )
+        removed_note_reference_spaces = self._remove_word_added_note_reference_space(output_path)
+        restored_compatibility_settings = self._restore_source_compatibility_settings(
+            output_path, Path(prepared.source_path)
+        )
+        restored_package_parts = self._restore_source_package_parts(
+            output_path, Path(prepared.source_path), prepared.model
+        )
+        if removed_header_shape_defaults or removed_bookmarks or removed_headers or restored_header_stories or removed_template_spacing or restored_alignment or restored_run_character_spacing or restored_run_font_names or restored_drawing_effect_extents or restored_run_segmentation or restored_empty_runs or restored_column_space or restored_page_number_start or restored_defaults or restored_theme_style_latin_fonts or restored_footer_stories or restored_footer_topology or restored_cross_paragraph_field_shells or restored_field_instructions or restored_table_layout or restored_numbering_definitions or restored_invisible_field_marker_runs or removed_note_reference_spaces or restored_compatibility_settings or restored_package_parts:
             final_checkpoint = replace(
                 final_checkpoint,
                 output_sha256=sha256_file(output_path),
@@ -1760,6 +2760,10 @@ class InteractiveRebuildService:
                 "EXPLICIT_DRAWING_EFFECT_EXTENTS_RESTORED",
                 {"count": restored_drawing_effect_extents},
             )
+        if restored_run_segmentation:
+            audit.append(
+                "SOURCE_RUN_SEGMENTATION_RESTORED", {"count": restored_run_segmentation}
+            )
         if restored_empty_runs:
             audit.append("EMPTY_RUNS_RESTORED", {"count": restored_empty_runs})
         if restored_column_space:
@@ -1775,10 +2779,36 @@ class InteractiveRebuildService:
             )
         if restored_footer_stories:
             audit.append("SOURCE_FOOTER_STORIES_RESTORED", {"count": restored_footer_stories})
+        if restored_footer_topology:
+            audit.append(
+                "SOURCE_FOOTER_TOPOLOGY_RESTORED", {"count": restored_footer_topology}
+            )
+        if restored_cross_paragraph_field_shells:
+            audit.append(
+                "SOURCE_CROSS_PARAGRAPH_FIELD_SHELLS_RESTORED",
+                {"count": restored_cross_paragraph_field_shells},
+            )
         if restored_field_instructions:
             audit.append("SOURCE_FIELD_INSTRUCTIONS_RESTORED", {"count": restored_field_instructions})
         if restored_table_layout:
             audit.append("SOURCE_TABLE_LAYOUT_RESTORED", {"count": restored_table_layout})
+        if restored_numbering_definitions:
+            audit.append("SOURCE_NUMBERING_DEFINITIONS_RESTORED", {"count": restored_numbering_definitions})
+        if restored_invisible_field_marker_runs:
+            audit.append(
+                "INVISIBLE_FIELD_MARKER_RUN_FORMATTING_RESTORED",
+                {"count": restored_invisible_field_marker_runs},
+            )
+        if removed_note_reference_spaces:
+            audit.append("WORD_ADDED_NOTE_REFERENCE_SPACE_REMOVED", {"count": removed_note_reference_spaces})
+        if restored_compatibility_settings:
+            audit.append(
+                "SOURCE_COMPATIBILITY_SETTINGS_RESTORED", {"count": restored_compatibility_settings}
+            )
+        if restored_package_parts:
+            audit.append(
+                "SOURCE_PACKAGE_PARTS_RESTORED", {"count": restored_package_parts}
+            )
         warnings: list[WarningItem] = []
         for item in prepared.preflight.capability_items:
             if item.classification.value != "RECONSTRUCTED":
@@ -1822,7 +2852,10 @@ class InteractiveRebuildService:
             output_sha256=final_checkpoint.output_sha256, renderer="interactive-word",
             fidelity=prepared.options.interactive.fidelity.value, metadata=prepared.options.metadata.value,
             saves=saves, levels=bundle.levels, warnings=warnings, render_result=bundle.render,
-            environment=capture_environment_fingerprint(),
+            # The owned interactive Word session has already been closed above.
+            # Starting a second DispatchEx instance only to read Version/Build
+            # can hang under Word contention and adds no document-fidelity data.
+            environment=capture_environment_fingerprint(include_word=False),
         )
         reasons: list[str] = []
         for level_name in ("L0", "L1"):
@@ -1894,6 +2927,11 @@ class InteractiveRebuildService:
                 renderer.restore_checkpoint_state(resume_checkpoint)
                 start_index = resume_checkpoint.last_completed_event_index + 1
             renderer.apply_metadata(prepared.model.extras.get("metadata_policy", {}))
+            if resume_checkpoint is None:
+                initial_checkpoint = coordinator.milestone(-1, "initial")
+                service_observer.tracker.checkpoint_saved(
+                    -1, initial_checkpoint.timestamp_utc
+                )
             if start_index > 0:
                 service_observer.prime_through(start_index - 1)
             audit.append("INTERACTIVE_EXECUTION_STARTED", {"start_index": start_index})

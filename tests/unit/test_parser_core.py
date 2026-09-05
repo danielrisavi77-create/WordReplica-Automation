@@ -55,6 +55,92 @@ def test_parser_ignores_word_system_goback_bookmark_but_keeps_real_bookmarks(tmp
     assert [bookmark.name for bookmark in model.bookmarks] == ['RealBookmark']
 
 
+def test_fldsimple_field_is_extracted_same_as_the_complex_form(tmp_path):
+    from tests.fixtures.build_fixtures import build_field_simple_form
+
+    source = build_field_simple_form(tmp_path / "field_simple.docx")
+    model = DocxParser().parse(source)
+
+    assert len(model.fields) == 1
+    field = model.fields[0]
+    assert field.instruction == "REF _Ref_tab1 \\h"
+    assert field.result_text == "1"
+    # The result text must still read normally as paragraph content -
+    # unwrapping the fldSimple shorthand must not lose the visible text.
+    assert "Table number: 1" in model.body[0].text()
+
+
+def test_bookmark_paths_are_stable_across_sdt_flattening(tmp_path):
+    # Regression: a source TOC wrapped in an <w:sdt> content control counts as
+    # ONE direct child of <w:body>, however many paragraphs it contains inside.
+    # A renderer that flattens the control's contents to plain paragraphs (as
+    # this one does) makes each of those paragraphs its own direct child of
+    # <w:body> instead - shifting the absolute w:p[N] position of every bookmark
+    # that follows even though nothing about the actual content changed.
+    # Confirmed live: this alone accounted for the bulk of a golden document's
+    # G7 fidelity mismatches. Bookmark paths must be anchored to the enclosing
+    # paragraph's position among ALL <w:p> elements (stable across sdt nesting),
+    # not its position among its immediate parent's children.
+    from zipfile import ZIP_DEFLATED, ZipFile
+    from lxml import etree
+    from word_replica.parser.parser import DocxParser
+
+    ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    def build(sdt_wrapped: bool) -> bytes:
+        toc_paragraphs = "".join(f"<w:p><w:r><w:t>TOC{i}</w:t></w:r></w:p>" for i in range(2))
+        toc_block = (
+            f"<w:sdt><w:sdtContent>{toc_paragraphs}</w:sdtContent></w:sdt>"
+            if sdt_wrapped else toc_paragraphs
+        )
+        return (
+            f"<w:document xmlns:w='{ns}'><w:body>"
+            f"<w:p><w:r><w:t>Before</w:t></w:r></w:p>"
+            f"{toc_block}"
+            f"<w:p><w:bookmarkStart w:id='1' w:name='Target'/>"
+            f"<w:r><w:t>Heading</w:t></w:r>"
+            f"<w:bookmarkEnd w:id='1'/></w:p>"
+            f"</w:body></w:document>"
+        ).encode("utf-8")
+
+    def make_docx(name: str, sdt_wrapped: bool):
+        path = tmp_path / name
+        with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+            archive.writestr("word/document.xml", build(sdt_wrapped))
+            archive.writestr(
+                "[Content_Types].xml",
+                b"<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'>"
+                b"<Default Extension='xml' ContentType='application/xml'/>"
+                b"<Override PartName='/word/document.xml' "
+                b"ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/>"
+                b"</Types>",
+            )
+            archive.writestr(
+                "_rels/.rels",
+                b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"
+                b"<Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument' "
+                b"Target='word/document.xml'/></Relationships>",
+            )
+            archive.writestr(
+                "word/_rels/document.xml.rels",
+                b"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'/>",
+            )
+        return path
+
+    sdt_source = make_docx("sdt.docx", sdt_wrapped=True)
+    flat_source = make_docx("flat.docx", sdt_wrapped=False)
+
+    sdt_model = DocxParser().parse(sdt_source)
+    flat_model = DocxParser().parse(flat_source)
+
+    assert len(sdt_model.bookmarks) == 1
+    assert len(flat_model.bookmarks) == 1
+    assert sdt_model.bookmarks[0].start_path == flat_model.bookmarks[0].start_path
+    assert sdt_model.bookmarks[0].end_path == flat_model.bookmarks[0].end_path
+    # Both should resolve to the 4th paragraph overall (Before, TOC0, TOC1, Target).
+    assert sdt_model.bookmarks[0].start_path == "//w:p[4]/w:bookmarkStart"
+
+
 def _save_with_document_xml_edit(tmp_path, filename, edit):
     from zipfile import ZIP_DEFLATED, ZipFile
     from lxml import etree

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from scripts.codex_automation import process as process_module
@@ -19,7 +20,17 @@ class FakeProcess:
         self.returncode = -9
 
 
+class CompletedProcess:
+    def __init__(self):
+        self.pid = 4321
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        return 0
+
+
 def test_timeout_kills_child_and_only_owned_word_records(tmp_path, monkeypatch):
+    monkeypatch.setattr(process_module.os, "getpid", lambda: 2468)
     fake = FakeProcess()
     calls = []
     monkeypatch.setattr("scripts.codex_automation.process.subprocess.Popen", lambda *a, **k: fake)
@@ -45,11 +56,13 @@ def test_timeout_kills_child_and_only_owned_word_records(tmp_path, monkeypatch):
     assert isinstance(result, ChildResult)
     assert result.timed_out is True
     assert fake.killed is True
-    assert calls == [(["owned"], {4321})]
+    assert result.owner_process_pids == [2468, 4321]
+    assert calls == [(["owned"], {2468, 4321})]
     assert result.terminated_word_pids == [9001]
 
 
 def test_timeout_accepts_verified_python_descendant_as_owned_word_owner(tmp_path, monkeypatch):
+    monkeypatch.setattr(process_module.os, "getpid", lambda: 2468)
     fake = FakeProcess()
     tree_kills = []
     word_kills = []
@@ -97,8 +110,51 @@ def test_timeout_accepts_verified_python_descendant_as_owned_word_owner(tmp_path
     )
 
     assert result.terminated_word_pids == [9001]
+    assert result.owner_process_pids == [2468, 4321, 8765]
     assert tree_kills == [4321]
     assert word_kills == [9001]
+
+
+def test_next_child_preserves_previous_word_ownership_evidence(tmp_path, monkeypatch):
+    monkeypatch.setattr(process_module.os, "getpid", lambda: 2468)
+    ownership_file = tmp_path / "owned.json"
+    ownership_file.write_text(
+        json.dumps({
+            "pid": 9001,
+            "hwnd": 0,
+            "owner_process_pid": 8765,
+            "role": "interactive",
+            "started_filetime": 123456789,
+            "schema_version": 2,
+            "processes": [{
+                "pid": 9001,
+                "hwnd": 0,
+                "owner_process_pid": 8765,
+                "role": "interactive",
+                "started_filetime": 123456789,
+            }],
+        }),
+        encoding="utf-8",
+    )
+    seen_records = []
+    monkeypatch.setattr(process_module.subprocess, "Popen", lambda *args, **kwargs: CompletedProcess())
+    monkeypatch.setattr(
+        process_module,
+        "terminate_owned_word_processes",
+        lambda records, expected_owner_pids: seen_records.extend(records) or [],
+    )
+
+    result = run_owned_child(
+        ["python", "next-child.py"],
+        timeout_seconds=5,
+        stdout_path=tmp_path / "out.log",
+        stderr_path=tmp_path / "err.log",
+        ownership_file=ownership_file,
+    )
+
+    assert [record.pid for record in seen_records] == [9001]
+    assert ownership_file.exists()
+    assert result.owner_process_pids == [2468, 4321]
 
 
 def test_descendant_process_ids_include_nested_children_but_not_unrelated_processes():
@@ -110,3 +166,32 @@ def test_descendant_process_ids_include_nested_children_but_not_unrelated_proces
     }
 
     assert process_module.descendant_process_pids(4321, parent_by_pid) == {4321, 8765, 9000}
+
+
+def test_child_binds_word_ownership_to_long_lived_orchestrator_pid(tmp_path, monkeypatch):
+    captured = {}
+    cleanup_calls = []
+    monkeypatch.setattr(process_module.os, "getpid", lambda: 2468)
+
+    def popen(*args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return CompletedProcess()
+
+    monkeypatch.setattr(process_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(process_module, "list_owned_word_processes", lambda path: [])
+    monkeypatch.setattr(
+        process_module,
+        "terminate_owned_word_processes",
+        lambda records, expected_owner_pids: cleanup_calls.append(set(expected_owner_pids)) or [],
+    )
+
+    result = run_owned_child(
+        ["python", "child.py"],
+        timeout_seconds=5,
+        stdout_path=tmp_path / "out.log",
+        stderr_path=tmp_path / "err.log",
+        ownership_file=tmp_path / "owned.json",
+    )
+
+    assert captured["env"]["WORD_REPLICA_WORD_OWNER_PID"] == "2468"
+    assert cleanup_calls == [{2468, 4321}]

@@ -21,6 +21,7 @@ class ChildResult:
     timed_out: bool
     elapsed_seconds: float
     terminated_word_pids: list[int] = field(default_factory=list)
+    owner_process_pids: list[int] = field(default_factory=list)
 
 
 def descendant_process_pids(root_pid: int, parent_by_pid: Mapping[int, int]) -> set[int]:
@@ -122,15 +123,12 @@ def run_owned_child(
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
     ownership_file.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        ownership_file.unlink()
-    except FileNotFoundError:
-        pass
-
     child_env = os.environ.copy()
     if env:
         child_env.update({str(key): str(value) for key, value in env.items()})
     child_env["WORD_REPLICA_WORD_OWNERSHIP_FILE"] = str(ownership_file.resolve())
+    orchestrator_pid = int(os.getpid())
+    child_env["WORD_REPLICA_WORD_OWNER_PID"] = str(orchestrator_pid)
 
     started = time.perf_counter()
     with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
@@ -158,6 +156,7 @@ def run_owned_child(
         else:
             expected_owner_pids = {int(process.pid)}
             records = list_owned_word_processes(ownership_file)
+        expected_owner_pids.add(orchestrator_pid)
         terminated = terminate_owned_word_processes(
             records, expected_owner_pids=expected_owner_pids
         )
@@ -167,4 +166,5 @@ def run_owned_child(
         timed_out=timed_out,
         elapsed_seconds=time.perf_counter() - started,
         terminated_word_pids=terminated,
+        owner_process_pids=sorted(expected_owner_pids),
     )

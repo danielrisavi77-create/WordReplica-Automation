@@ -60,6 +60,38 @@ def test_disabled_fast_path_keeps_legacy_table_events():
     assert "InsertTableBatch" not in event_types
 
 
+def test_column_with_no_declared_width_emits_no_set_column_width_event():
+    # Regression: a gridCol without a w:w attribute (autofit table, no explicit
+    # width declared) parses to None, not 0. Emitting SetColumnWidth with a
+    # fabricated 0-twips width crashes Word's COM Columns(n).Width setter with
+    # "Value out of range" - confirmed live against a real Word session.
+    from word_replica.domain.model import Table, TableCell, TableRow
+
+    model = DocumentModel(
+        source_sha256="a" * 64,
+        body=[
+            Table(
+                "t",
+                [TableRow("row", [
+                    TableCell("c1", [Paragraph("p1", [Run("r1", "A")])]),
+                    TableCell("c2", [Paragraph("p2", [Run("r2", "B")])]),
+                    TableCell("c3", [Paragraph("p3", [Run("r3", "C")])]),
+                ])],
+                properties={"grid_column_widths": [1000, None, 2000]},
+            )
+        ],
+    )
+
+    blueprint = BlueprintCompiler(enable_table_fast_path=False).compile(model)
+
+    width_events = [
+        event for event in blueprint.events if event.event_type == "SetColumnWidth"
+    ]
+    assert [(e.payload["column"], e.payload["width_twips"]) for e in width_events] == [
+        (1, 1000), (3, 2000),
+    ]
+
+
 def test_compiler_batches_contiguous_text_within_a_run_for_word_insertion():
     model = DocumentModel(
         source_sha256="a" * 64,
@@ -334,6 +366,67 @@ def test_field_result_is_not_typed_as_static_text_when_semantic_field_is_compile
     # Result text comes from Word field update, not a static character replay.
     chars = "".join(e.payload["text"] for e in events if e.event_type == "InsertText")
     assert "Chapter One .... 1" not in chars
+
+
+def test_nested_field_inside_a_toc_entry_does_not_swallow_its_visible_text():
+    # Regression: a real TOC's first entry opens the outer TOC field (begin +
+    # separate) in the SAME paragraph as its own visible text and a nested,
+    # self-closing PAGEREF field - but the outer TOC field's own field_end is
+    # many paragraphs later (TOC results span the whole entry list). The old
+    # single-variable field_state let the nested field_begin silently overwrite
+    # the still-open outer field state, discarding "1. Uvod" + tab entirely and
+    # leaving only the PAGEREF's "1". A field that cannot close within this
+    # paragraph must be left inert instead, so its contents type normally.
+    paragraph = Paragraph("p1", [
+        Run("r1", properties={"content_tokens": [{"kind": "field_begin"}]}),
+        Run("r2", properties={"content_tokens": [{"kind": "field_instruction", "value": ' TOC \\o "1-3" \\h \\z \\u '}]}),
+        Run("r3", properties={"content_tokens": [{"kind": "field_separate"}]}),
+        Run("r4", properties={"content_tokens": [{"kind": "text", "value": "1. Uvod"}]}),
+        Run("r5", properties={"content_tokens": [{"kind": "tab"}]}),
+        Run("r6", properties={"content_tokens": [{"kind": "field_begin"}]}),
+        Run("r7", properties={"content_tokens": [{"kind": "field_instruction", "value": " PAGEREF _Toc1 \\h "}]}),
+        Run("r8", properties={"content_tokens": [{"kind": "field_separate"}]}),
+        Run("r9", properties={"content_tokens": [{"kind": "text", "value": "1"}]}),
+        Run("r10", properties={"content_tokens": [{"kind": "field_end"}]}),
+        # No outer field_end here - it lives many paragraphs later, outside this test's scope.
+    ])
+    model = DocumentModel(source_sha256="a" * 64, body=[paragraph])
+
+    events = BlueprintCompiler().compile(model).events
+
+    text_events = [e for e in events if e.event_type == "InsertText"]
+    assert [e.payload["text"] for e in text_events] == ["1. Uvod"]
+    assert any(e.event_type == "InsertTab" for e in events)
+
+    fields = [e for e in events if e.event_type == "CreateField"]
+    assert len(fields) == 1
+    assert "PAGEREF" in fields[0].payload["instruction"]
+    assert fields[0].payload["cached_result"] == "1"
+
+
+def test_field_result_run_properties_survive_the_closing_marker_run():
+    # Regression: a REF field's result text can carry its own run formatting
+    # (e.g. a superscript-sized table number) distinct from the surrounding
+    # body text. The field's closing marker run (field_end) is always an
+    # empty, default-formatted run - it must not be what the renderer uses
+    # to format the field's inserted result text, or the formatting silently
+    # reverts to default. The blueprint must capture and carry the result
+    # run's own properties on the CreateField event itself.
+    paragraph = Paragraph("p1", [
+        Run("r1", properties={"content_tokens": [{"kind": "field_begin"}]}),
+        Run("r2", properties={"content_tokens": [{"kind": "field_instruction", "value": " REF _Ref_tab1 \\h "}]}),
+        Run("r3", properties={"content_tokens": [{"kind": "field_separate"}]}),
+        Run("r4", text="1", properties={"size_half_points": "22", "content_tokens": [{"kind": "text", "value": "1"}]}),
+        Run("r5", properties={"content_tokens": [{"kind": "field_end"}]}),
+    ])
+    model = DocumentModel(source_sha256="a" * 64, body=[paragraph])
+
+    events = BlueprintCompiler().compile(model).events
+
+    fields = [e for e in events if e.event_type == "CreateField"]
+    assert len(fields) == 1
+    assert fields[0].payload["cached_result"] == "1"
+    assert fields[0].payload["result_properties"]["size_half_points"] == "22"
 
 
 def test_bookmark_anchor_compiles_start_and_real_create_event(tmp_path):

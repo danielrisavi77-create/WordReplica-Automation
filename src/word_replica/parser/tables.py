@@ -38,7 +38,14 @@ def parse_table_properties(node) -> dict:
     cell_mar = tbl_pr.find("w:tblCellMar", namespaces=NS) if tbl_pr is not None else None
     grid_widths = []
     if tbl_grid is not None:
-        grid_widths = [int(_attr(col, "w") or 0) for col in tbl_grid.findall("w:gridCol", namespaces=NS)]
+        # A gridCol without a w:w attribute means no explicit width was declared
+        # (e.g. an autofit table) - keep that as None rather than defaulting to
+        # 0, which Word's COM Columns(n).Width setter rejects outright with a
+        # "Value out of range" automation error.
+        grid_widths = [
+            int(raw_width) if (raw_width := _attr(col, "w")) is not None else None
+            for col in tbl_grid.findall("w:gridCol", namespaces=NS)
+        ]
     margins = {}
     if cell_mar is not None:
         for child in cell_mar:

@@ -15,6 +15,7 @@ from lxml import etree
 
 from word_replica.domain.model import DocumentModel, Paragraph, Run, Section, Table
 from word_replica.domain.results import WarningItem
+from word_replica.parser.parser import _rels_owner
 from word_replica.renderers.base import RenderResult
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -67,7 +68,18 @@ _RUN_PR_KEYS = (
 HYPERLINK_REFERENCE_PREFIX = "wr-link:"
 
 
-def _append_runs_grouping_hyperlinks(node, runs) -> None:
+def _append_paragraph_extensions(node, fragments) -> None:
+    """Emit fragments a paragraph held beside its runs, at their own position."""
+    for fragment in fragments:
+        try:
+            node.append(etree.fromstring(fragment["value"]))
+        except (etree.XMLSyntaxError, KeyError, TypeError):
+            # A fragment that will not re-parse is dropped rather than allowed
+            # to corrupt the part; G10 reports the loss.
+            continue
+
+
+def _append_runs_grouping_hyperlinks(node, runs, extensions=None) -> None:
     """Emit runs, wrapping consecutive linked ones back in w:hyperlink.
 
     The parser flattens w:hyperlink to reach the runs inside, so the grouping
@@ -78,9 +90,14 @@ def _append_runs_grouping_hyperlinks(node, runs) -> None:
     once the whole body exists -- so it goes out as a placeholder and is
     resolved with the rest.
     """
+    by_position: dict[int, list] = {}
+    for fragment in extensions or ():
+        by_position.setdefault(int(fragment.get("after_run", 0)), []).append(fragment)
+
     current = None
     container = node
-    for run in runs:
+    _append_paragraph_extensions(node, by_position.pop(0, ()))
+    for emitted, run in enumerate(runs, start=1):
         link = run.properties.get("hyperlink") or None
         key = link.get("group") if link else None
         if link is None or key != current:
@@ -97,6 +114,17 @@ def _append_runs_grouping_hyperlinks(node, runs) -> None:
                         f"{{{R_NS}}}id", HYPERLINK_REFERENCE_PREFIX + link["target"]
                     )
         container.append(_run_element(run))
+        pending = by_position.pop(emitted, ())
+        if pending:
+            # A fragment lands on the paragraph, not inside a hyperlink, so any
+            # grouping in progress ends here.
+            _append_paragraph_extensions(node, pending)
+            current = None
+            container = node
+    # Anything recorded past the last run: a run the model dropped would
+    # otherwise take the fragment with it.
+    for position in sorted(by_position):
+        _append_paragraph_extensions(node, by_position[position])
 
 
 def _run_element(run: Run):
@@ -259,11 +287,30 @@ def _append_field_tokens(node, content_tokens) -> None:
 
 
 def _document_has_inline_field_tokens(model: DocumentModel) -> bool:
-    for paragraph in model.iter_paragraphs():
-        for run in paragraph.runs:
-            tokens = run.properties.get("content_tokens") or ()
-            if any(token.get("kind") in _FIELD_TOKEN_KINDS for token in tokens):
-                return True
+    def walk(blocks):
+        for block in blocks:
+            if isinstance(block, Paragraph):
+                yield block
+            elif isinstance(block, Table):
+                for row in block.rows:
+                    for cell in row.cells:
+                        yield from walk(cell.blocks)
+
+    story_blocks = [model.body]
+    for collection in (
+        model.headers,
+        model.footers,
+        model.footnotes,
+        model.endnotes,
+    ):
+        story_blocks.extend(collection.values())
+
+    for blocks in story_blocks:
+        for paragraph in walk(blocks):
+            for run in paragraph.runs:
+                tokens = run.properties.get("content_tokens") or ()
+                if any(token.get("kind") in _FIELD_TOKEN_KINDS for token in tokens):
+                    return True
     return False
 
 
@@ -296,10 +343,20 @@ def _section_element(section: Section):
     return sect
 
 
+_NON_PARAGRAPH_PROPERTY_KEYS = frozenset({"inline_markers", "paragraph_extensions"})
+
+
 def _paragraph_element(paragraph: Paragraph, sections: list[Section]):
     p = _w("p")
     props = paragraph.properties
-    need_ppr = paragraph.style_id is not None or bool(props)
+    # Not every entry in properties describes a w:pPr. Bookmarks and preserved
+    # paragraph-level fragments are carried there for want of anywhere else, and
+    # treating them as paragraph properties emits an empty w:pPr the source
+    # never had -- an addition, small but not nothing, in a tool whose claim is
+    # that it does not add.
+    need_ppr = paragraph.style_id is not None or bool(
+        set(props) - _NON_PARAGRAPH_PROPERTY_KEYS
+    )
     p_pr = etree.SubElement(p, f"{W}pPr") if need_ppr else None
     if p_pr is not None:
         if paragraph.style_id:
@@ -342,7 +399,9 @@ def _paragraph_element(paragraph: Paragraph, sections: list[Section]):
         section_index = props.get("section_index")
         if isinstance(section_index, int) and 0 <= section_index < len(sections):
             p_pr.append(_section_element(sections[section_index]))
-    _append_runs_grouping_hyperlinks(p, paragraph.runs)
+    _append_runs_grouping_hyperlinks(
+        p, paragraph.runs, paragraph.properties.get("paragraph_extensions")
+    )
     return p
 
 
@@ -621,7 +680,7 @@ def _inject_bookmarks_and_fields(body, model: DocumentModel) -> None:
     for host, _position, _declared, end in sorted(pending_ends, key=lambda item: item[1:3]):
         host.append(end)
 
-    if model.fields and not body.findall(f".//{W}fldChar"):
+    if model.fields and not _document_has_inline_field_tokens(model):
         # Real parsed documents already got their fields rendered in place by
         # _run_element (from each run's own content_tokens), so this branch
         # only fires for models that carry field definitions without any

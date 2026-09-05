@@ -39,6 +39,20 @@ def test_two_full_passes_on_same_commit_make_promotion_ready():
     assert second.promotion_ready is True
 
 
+def test_dirty_worktree_full_pass_never_counts_toward_promotion():
+    state = AutomationState()
+    full = {
+        "gates": _gates(*[f"G{i}" for i in range(10)]),
+        "full_pass": True,
+        "commit_sha": "abc",
+        "worktree_clean": False,
+    }
+
+    assert evaluate_run(state, full).promotion_ready is False
+    assert evaluate_run(state, full).promotion_ready is False
+    assert state.consecutive_full_pass_same_commit == 0
+
+
 def test_full_pass_on_different_word_build_does_not_count_as_consecutive():
     state = AutomationState()
     gates = _gates(*[f"G{i}" for i in range(10)])
