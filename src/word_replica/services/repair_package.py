@@ -37,6 +37,18 @@ from word_replica.repair_contract.report import RepairCompletionReport, build_co
 from word_replica.services.source_guard import assert_source_unchanged, sha256_file
 
 
+_RPC_E_CALL_REJECTED = "-2147418111"
+_CALL_REJECTED_MESSAGE = "Call was rejected by callee"
+
+
+def _is_retryable_word_call_rejection(result) -> bool:
+    reasons = tuple(str(reason) for reason in getattr(result, "reasons", ()))
+    return result.status is RunStatus.FAIL and result.project_id is not None and any(
+        _RPC_E_CALL_REJECTED in reason and _CALL_REJECTED_MESSAGE in reason
+        for reason in reasons
+    )
+
+
 def repair_contract_required_gates(*, signed_target: bool) -> tuple[str, ...]:
     if not signed_target:
         return GOLDEN_GATES
@@ -265,7 +277,16 @@ class RepairPackageService:
                 expected_source_snapshot=validated.target_snapshot,
             )
         elapsed = time.monotonic() - started
-        return self._finish(validated, result, timing_seconds={"rebuild": elapsed})
+        timing_seconds = {"rebuild": elapsed}
+        if self.preview_sink is None and _is_retryable_word_call_rejection(result):
+            resume_started = time.monotonic()
+            result = self.rebuild_service.resume_interactive(
+                result.project_id,
+                interactive_control=interactive_control,
+                interactive_observer=interactive_observer,
+            )
+            timing_seconds["automatic_resume"] = time.monotonic() - resume_started
+        return self._finish(validated, result, timing_seconds=timing_seconds)
 
     def retry_checkpoint_sha256(self, job_id: str) -> str | None:
         binding = self.binding_store.load(job_id)

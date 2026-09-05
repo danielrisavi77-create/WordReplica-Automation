@@ -182,6 +182,30 @@ def test_fail_status_is_failed_and_never_copies_an_output(tmp_path):
     assert fake_audit.calls == []
 
 
+def test_rejected_word_com_call_resumes_automatically_once(tmp_path):
+    request = _write_package(tmp_path)
+    rejected = RecordingRunResult(
+        status=RunStatus.FAIL,
+        output_path=None,
+        project_id="project-rejected-call",
+        reasons=("(-2147418111, 'Call was rejected by callee.', None, None)",),
+    )
+    service, fake_rebuild, _, _ = _service(tmp_path, rebuild_result=rejected)
+    reconstructed = tmp_path / "reconstructed_after_automatic_resume.docx"
+    reconstructed.write_bytes(b"reconstructed after automatic resume")
+    fake_rebuild.resume_result = RecordingRunResult(
+        status=RunStatus.PASS,
+        output_path=reconstructed,
+        project_id="project-rejected-call",
+    )
+
+    report = service.run(request)
+
+    assert fake_rebuild.resumed_project_ids == ["project-rejected-call"]
+    assert report.status == "FULL_PASS"
+    assert report.full_pass is True
+
+
 def test_a_failing_gate_prevents_full_pass_even_on_a_reconstruction_pass(tmp_path):
     request = _write_package(tmp_path)
     reconstructed = tmp_path / "reconstructed_project_output.docx"
