@@ -92,3 +92,40 @@ def test_record_owned_word_uses_inherited_orchestrator_owner_pid(tmp_path, monke
 
     payload = json.loads(record.read_text(encoding="utf-8"))
     assert payload["owner_process_pid"] == 2468
+
+
+def test_core_terminator_kills_only_identity_verified_word_owned_by_expected_process(tmp_path):
+    from word_replica.renderers.word_ownership import terminate_recorded_owned_words
+
+    record = tmp_path / "owned.json"
+    record.write_text(json.dumps({
+        "schema_version": 2,
+        "processes": [
+            {
+                "pid": 1001, "hwnd": 1, "owner_process_pid": 77,
+                "role": "interactive", "started_filetime": 111,
+            },
+            {
+                "pid": 1002, "hwnd": 2, "owner_process_pid": 88,
+                "role": "interactive", "started_filetime": 222,
+            },
+            {
+                "pid": 1003, "hwnd": 3, "owner_process_pid": 77,
+                "role": "interactive", "started_filetime": 333,
+            },
+        ],
+    }), encoding="utf-8")
+    killed = []
+
+    terminated = terminate_recorded_owned_words(
+        expected_owner_pid=77,
+        path=record,
+        word_process_pids_resolver=lambda: {1001, 1002, 1003},
+        process_identity_resolver=lambda pid: {1001: 111, 1002: 222, 1003: 999}[pid],
+        killer=lambda pid: killed.append(pid),
+    )
+
+    assert terminated == [1001]
+    assert killed == [1001]
+    remaining = json.loads(record.read_text(encoding="utf-8"))["processes"]
+    assert [item["pid"] for item in remaining] == [1002, 1003]

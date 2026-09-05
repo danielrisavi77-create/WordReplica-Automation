@@ -163,11 +163,30 @@ def _default_repair_package_service(renderer: str = "word"):
 
     from word_replica.qa.golden_audit import audit_docx_pair
     from word_replica.repair_contract.binding import RepairRunBindingStore
+    from word_replica.renderers.word_ownership import (
+        ENV_OWNER_PROCESS_PID,
+        ENV_OWNERSHIP_FILE,
+        terminate_recorded_owned_words,
+    )
     from word_replica.services.repair_package import RepairPackageService
 
     kwargs: dict = {}
     if renderer == "pure-docx":
         kwargs["preview_sink"] = _console_preview_sink
+    else:
+        raw_ownership_path = os.environ.get(ENV_OWNERSHIP_FILE)
+        if raw_ownership_path:
+            ownership_path = Path(raw_ownership_path).resolve()
+        else:
+            ownership_path = (
+                Path(tempfile.gettempdir()) / "WordReplica" / "repair-ownership"
+                / f"{os.getpid()}.json"
+            )
+            os.environ[ENV_OWNERSHIP_FILE] = str(ownership_path)
+        expected_owner_pid = int(os.environ.get(ENV_OWNER_PROCESS_PID, os.getpid()))
+        kwargs["owned_word_cleanup"] = lambda: terminate_recorded_owned_words(
+            expected_owner_pid=expected_owner_pid, path=ownership_path
+        )
 
     return RepairPackageService(
         rebuild_service=RebuildService.default(),

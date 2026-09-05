@@ -191,6 +191,10 @@ def test_rejected_word_com_call_resumes_automatically_once(tmp_path):
         reasons=("(-2147418111, 'Call was rejected by callee.', None, None)",),
     )
     service, fake_rebuild, _, _ = _service(tmp_path, rebuild_result=rejected)
+    cleanup_observations = []
+    service.owned_word_cleanup = lambda: cleanup_observations.append(
+        tuple(fake_rebuild.resumed_project_ids)
+    )
     reconstructed = tmp_path / "reconstructed_after_automatic_resume.docx"
     reconstructed.write_bytes(b"reconstructed after automatic resume")
     fake_rebuild.resume_result = RecordingRunResult(
@@ -202,6 +206,7 @@ def test_rejected_word_com_call_resumes_automatically_once(tmp_path):
     report = service.run(request)
 
     assert fake_rebuild.resumed_project_ids == ["project-rejected-call"]
+    assert cleanup_observations == [(), ("project-rejected-call",)]
     assert report.status == "FULL_PASS"
     assert report.full_pass is True
 
@@ -351,6 +356,24 @@ def _resumable_service_with_binding(tmp_path):
     working_output.parent.mkdir(parents=True, exist_ok=True)
     working_output.write_bytes(b"bound working output")
     return request, service, fake_rebuild, fake_audit, binding, working_output
+
+
+def test_resume_cleans_owned_word_after_the_attempt(tmp_path):
+    request, service, fake_rebuild, _, binding, working_output = (
+        _resumable_service_with_binding(tmp_path)
+    )
+    cleanup_calls = []
+    service.owned_word_cleanup = lambda: cleanup_calls.append(binding.project_id)
+    fake_rebuild.resume_result = RecordingRunResult(
+        status=RunStatus.PASS,
+        output_path=working_output,
+        project_id=binding.project_id,
+    )
+
+    report = service.resume(request, binding.job_id)
+
+    assert report.full_pass is True
+    assert cleanup_calls == [binding.project_id]
 
 
 @pytest.mark.parametrize(

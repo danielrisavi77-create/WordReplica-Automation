@@ -195,6 +195,7 @@ class RepairPackageService:
         preview_interactive_options: InteractiveOptions | None = None,
         open_and_repair_checker: Callable[[Path], bool | None] | None = None,
         fields_update_checker: Callable[[Path], bool | None] | None = None,
+        owned_word_cleanup: Callable[[], object] | None = None,
     ) -> None:
         self.rebuild_service = rebuild_service
         self.gate_auditor = gate_auditor
@@ -223,6 +224,12 @@ class RepairPackageService:
         # being treated as a pass.
         self.open_and_repair_checker = open_and_repair_checker or _default_open_and_repair_checker
         self.fields_update_checker = fields_update_checker or _default_fields_update_checker
+        self.owned_word_cleanup = owned_word_cleanup
+
+    def _cleanup_owned_word(self) -> None:
+        cleanup = self.owned_word_cleanup
+        if cleanup is not None:
+            cleanup()
 
     def _play_preview(self, validated: ValidatedRepairPackage, control) -> None:
         from word_replica.interactive.blueprint import compile_blueprint_from_source
@@ -278,15 +285,19 @@ class RepairPackageService:
             )
         elapsed = time.monotonic() - started
         timing_seconds = {"rebuild": elapsed}
-        if self.preview_sink is None and _is_retryable_word_call_rejection(result):
-            resume_started = time.monotonic()
-            result = self.rebuild_service.resume_interactive(
-                result.project_id,
-                interactive_control=interactive_control,
-                interactive_observer=interactive_observer,
-            )
-            timing_seconds["automatic_resume"] = time.monotonic() - resume_started
-        return self._finish(validated, result, timing_seconds=timing_seconds)
+        try:
+            if self.preview_sink is None and _is_retryable_word_call_rejection(result):
+                self._cleanup_owned_word()
+                resume_started = time.monotonic()
+                result = self.rebuild_service.resume_interactive(
+                    result.project_id,
+                    interactive_control=interactive_control,
+                    interactive_observer=interactive_observer,
+                )
+                timing_seconds["automatic_resume"] = time.monotonic() - resume_started
+            return self._finish(validated, result, timing_seconds=timing_seconds)
+        finally:
+            self._cleanup_owned_word()
 
     def retry_checkpoint_sha256(self, job_id: str) -> str | None:
         binding = self.binding_store.load(job_id)
@@ -296,6 +307,19 @@ class RepairPackageService:
         return self.rebuild_service.interactive_checkpoint_sha256(binding.project_id)
 
     def resume(
+        self, request: RepairPackageRequest, job_id: str, *, interactive_control=None, interactive_observer=None
+    ) -> RepairCompletionReport:
+        try:
+            return self._resume_without_cleanup(
+                request,
+                job_id,
+                interactive_control=interactive_control,
+                interactive_observer=interactive_observer,
+            )
+        finally:
+            self._cleanup_owned_word()
+
+    def _resume_without_cleanup(
         self, request: RepairPackageRequest, job_id: str, *, interactive_control=None, interactive_observer=None
     ) -> RepairCompletionReport:
         now = self.clock()

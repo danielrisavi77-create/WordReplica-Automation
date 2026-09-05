@@ -192,3 +192,66 @@ def clear_owned_word(pid: int | None) -> None:
         return
     processes = [item for item in _read_registry(path) if int(item.get("pid", -1)) != int(pid)]
     _write_registry(path, processes)
+
+
+def _default_word_pid_killer(pid: int) -> None:
+    result = subprocess.run(
+        ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0 and int(pid) in word_process_pids():
+        raise RuntimeError(f"Could not terminate verified WordReplica-owned PID {pid}")
+
+
+def terminate_recorded_owned_words(
+    *,
+    expected_owner_pid: int,
+    path: Path | None = None,
+    word_process_pids_resolver: Callable[[], set[int]] | None = None,
+    process_identity_resolver: Callable[[int], int] | None = None,
+    killer: Callable[[int], None] | None = None,
+) -> list[int]:
+    """Terminate only live interactive Word processes proven by the registry.
+
+    PID, owner PID, WINWORD membership and process creation FILETIME must all
+    match. A reused PID or another owner's Word process is preserved.
+    """
+    registry_path = Path(path).resolve() if path is not None else _record_path()
+    if registry_path is None:
+        return []
+    records = _read_registry(registry_path)
+    if not records:
+        return []
+    live_word_pids = set((word_process_pids_resolver or word_process_pids)())
+    identify = process_identity_resolver or process_creation_filetime
+    kill = killer or _default_word_pid_killer
+    terminated: list[int] = []
+    remaining: list[dict] = []
+    for record in records:
+        try:
+            pid = int(record["pid"])
+            owner_pid = int(record["owner_process_pid"])
+            started_filetime = int(record["started_filetime"])
+        except (KeyError, TypeError, ValueError):
+            remaining.append(record)
+            continue
+        if pid not in live_word_pids:
+            continue
+        if owner_pid != int(expected_owner_pid) or record.get("role") != "interactive":
+            remaining.append(record)
+            continue
+        try:
+            live_started_filetime = int(identify(pid))
+        except Exception:
+            remaining.append(record)
+            continue
+        if live_started_filetime != started_filetime:
+            remaining.append(record)
+            continue
+        kill(pid)
+        terminated.append(pid)
+    _write_registry(registry_path, remaining)
+    return terminated
