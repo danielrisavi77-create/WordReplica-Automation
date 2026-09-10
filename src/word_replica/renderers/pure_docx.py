@@ -986,18 +986,47 @@ class MutableDocxPackage:
         self._ensure_override(part_name, content_type)
         return self._ensure_relationship("word/_rels/document.xml.rels", rel_type, target)
 
-    def attach_default_header_footer(self, kind: str, rel_id: str) -> None:
+    def attach_header_footer_references(
+        self,
+        kind: str,
+        sections: list[Section],
+        installed: dict[str, tuple[str, str]],
+        relationships: dict,
+    ) -> list[str]:
+        """Map every section story slot to the part it referenced in source."""
         root = self._xml("word/document.xml")
         ref_tag = f"{W}{kind}Reference"
-        for sect in root.xpath("//w:sectPr", namespaces={"w": W_NS}):
+        section_nodes = root.xpath("//w:sectPr", namespaces={"w": W_NS})
+        unresolved: list[str] = []
+        for index, sect in enumerate(section_nodes):
             for existing in list(sect.findall(ref_tag)):
-                if existing.get(f"{W}type") == "default":
-                    sect.remove(existing)
-            ref = etree.Element(ref_tag)
-            _set_w(ref, "type", "default")
-            ref.set(f"{{{R_NS}}}id", rel_id)
-            sect.insert(0, ref)
+                sect.remove(existing)
+            if index >= len(sections):
+                continue
+            insert_at = 0
+            for source_ref in sections[index].properties.get(f"{kind}_refs") or ():
+                source_rel_id = source_ref.get("rel_id")
+                source_relationship = relationships.get(
+                    f"word/document.xml:{source_rel_id}"
+                )
+                source_part = getattr(source_relationship, "target", None)
+                installed_part = installed.get(source_part)
+                if installed_part is None:
+                    unresolved.append(
+                        f"section {index} {kind}:{source_ref.get('type') or 'default'}"
+                    )
+                    continue
+                ref = etree.Element(ref_tag)
+                _set_w(ref, "type", source_ref.get("type") or "default")
+                ref.set(f"{{{R_NS}}}id", installed_part[1])
+                sect.insert(insert_at, ref)
+                insert_at += 1
         self._write_xml("word/document.xml", root)
+        if len(section_nodes) != len(sections):
+            unresolved.append(
+                f"section count {len(section_nodes)} != {len(sections)}"
+            )
+        return unresolved
 
     def set_styles(self, raw: bytes | None) -> None:
         if raw is None:
@@ -1478,6 +1507,9 @@ class PureDocxRenderer:
             self._package.restore_external_relationship(rels_part, rel_type, target)
 
         origins = model.extras.get("source_part_relationships") or {}
+        source_unreachable_parts = set(
+            model.extras.get("source_unreachable_parts") or ()
+        )
         for orphan in self._package.unreferenced_parts(("word/media/", "word/embeddings/",
                                                        "word/charts/", "word/diagrams/")):
             # The source may have related this part and referenced it from
@@ -1486,6 +1518,8 @@ class PureDocxRenderer:
             # reporting a difference we introduced.
             origin = origins.get(orphan)
             if origin is not None and self._package.restore_part_relationship(orphan, *origin):
+                continue
+            if orphan in source_unreachable_parts:
                 continue
             self._package.warnings.append(WarningItem(
                 code="PURE_DOCX_ASSET_UNREFERENCED",
@@ -1499,19 +1533,27 @@ class PureDocxRenderer:
             ("header", model.headers, "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header"),
             ("footer", model.footers, "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer"),
         ):
-            installed: list[tuple[str, str]] = []
-            for index, (_source_name, blocks) in enumerate(sorted(collection.items()), start=1):
+            installed: dict[str, tuple[str, str]] = {}
+            for index, (source_name, blocks) in enumerate(sorted(collection.items()), start=1):
                 part_name = f"word/{kind}{index}.xml"
                 rel_id = self._package.install_structured_part(
                     part_name, content_type, rel_type, f"{kind}{index}.xml", self._blocks_part_xml("hdr" if kind == "header" else "ftr", blocks)
                 )
-                installed.append((part_name, rel_id))
+                installed[source_name] = (part_name, rel_id)
             if installed:
-                self._package.attach_default_header_footer(kind, installed[0][1])
-                if len(installed) > 1:
+                unresolved = self._package.attach_header_footer_references(
+                    kind,
+                    model.sections,
+                    installed,
+                    model.relationships,
+                )
+                for detail in unresolved:
                     self._package.warnings.append(WarningItem(
-                        code="PURE_DOCX_HEADER_FOOTER_MAPPING_APPROXIMATION",
-                        message=f"Multiple {kind} parts were reconstructed, but the pure fallback maps only the first as each section's default {kind}",
+                        code="PURE_DOCX_HEADER_FOOTER_REFERENCE_UNRESOLVED",
+                        message=(
+                            f"The pure fallback could not map {detail} to a reconstructed "
+                            f"{kind} part"
+                        ),
                         affects_status=True,
                     ))
 

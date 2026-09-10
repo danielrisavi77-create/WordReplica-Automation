@@ -1281,6 +1281,7 @@ class DocxParser:
             # for carrying it rather than against: tidying away bytes the source
             # shipped is a change to the package, just one whose harmlessness we
             # would be asserting instead of checking.
+            source_unreachable_parts: list[str] = []
             for part in sorted(package.parts):
                 if part.endswith((".rels", "/")) or part == "[Content_Types].xml":
                     continue
@@ -1290,7 +1291,9 @@ class DocxParser:
                 # would overwrite what it wrote.
                 if part in _RENDERER_AUTHORED_PARTS or part.startswith("docProps/"):
                     continue
+                source_unreachable_parts.append(part)
                 _preserve(part, None, sidecar=True)
+            model.extras["source_unreachable_parts"] = source_unreachable_parts
 
             for rel in package.relationships("word/document.xml").values():
                 if rel.target_mode == "External":

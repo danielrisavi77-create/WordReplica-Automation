@@ -8,8 +8,15 @@ import tempfile
 from pathlib import Path
 
 from word_replica import __version__
-from word_replica.config import RebuildOptions
-from word_replica.domain.enums import FidelityMode, MetadataMode, RendererChoice, RunStatus, VisibilityMode
+from word_replica.config import InteractiveOptions, RebuildOptions
+from word_replica.domain.enums import (
+    FidelityMode,
+    InteractiveSpeedMode,
+    MetadataMode,
+    RendererChoice,
+    RunStatus,
+    VisibilityMode,
+)
 from word_replica.domain.errors import RepairPackageError
 from word_replica.parser.parser import DocxParser
 from word_replica.qa.policy import classify_run, run_l0_l3
@@ -158,7 +165,11 @@ def _console_preview_sink(kind: str, payload: dict) -> None:
         print()
 
 
-def _default_repair_package_service(renderer: str = "word"):
+def _silent_preview_sink(_kind: str, _payload: dict) -> None:
+    pass
+
+
+def _default_repair_package_service(renderer: str = "word", *, visible_preview: bool = True):
     from datetime import datetime, timezone
 
     from word_replica.qa.golden_audit import audit_docx_pair
@@ -172,7 +183,13 @@ def _default_repair_package_service(renderer: str = "word"):
 
     kwargs: dict = {}
     if renderer == "pure-docx":
-        kwargs["preview_sink"] = _console_preview_sink
+        kwargs["preview_sink"] = (
+            _console_preview_sink if visible_preview else _silent_preview_sink
+        )
+        if not visible_preview:
+            kwargs["preview_interactive_options"] = InteractiveOptions(
+                speed_mode=InteractiveSpeedMode.MAXIMUM, object_step_delay_ms=0
+            )
     else:
         raw_ownership_path = os.environ.get(ENV_OWNERSHIP_FILE)
         if raw_ownership_path:
@@ -263,13 +280,12 @@ def _default_one_shot_runner():
     from word_replica.runner.one_shot import OneShotRunner
     from word_replica.runner.trust_store import load_trust_keys
     from word_replica.runner.secure_retry import SecureRetryStore
-    from word_replica.runner.word_preflight import run_word_preflight
 
     trust_path = Path(__file__).resolve().parent / "runner" / "trusted_keys.json"
     return OneShotRunner(
-        preflight=run_word_preflight,
+        preflight=lambda: None,
         transport=HttpsTransport(),
-        package_service=_default_repair_package_service("word"),
+        package_service=_default_repair_package_service("pure-docx", visible_preview=False),
         trust_keys=load_trust_keys(trust_path),
         retry_store=SecureRetryStore(),
     )

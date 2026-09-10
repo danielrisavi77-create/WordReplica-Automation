@@ -346,3 +346,55 @@ def test_header_part_uses_ooxml_hdr_root_not_truncated_hea(tmp_path):
     with ZipFile(output) as z:
         root = etree.fromstring(z.read("word/header1.xml"))
     assert root.tag == f"{W}hdr"
+
+
+def test_renderer_maps_each_section_to_its_referenced_footer(tmp_path):
+    """A second section must not silently inherit the first footer."""
+    from word_replica.domain.model import RelationshipRef, Section
+    from word_replica.parser.parser import DocxParser
+
+    model = DocumentModel(
+        source_sha256="abc",
+        body=[
+            Paragraph("section-boundary", properties={"section_index": 0}),
+            Paragraph("body", runs=[Run("body-run", text="Body")]),
+        ],
+        sections=[
+            Section(
+                "section-0",
+                {"footer_refs": [{"type": "default", "rel_id": "rIdFooterA"}]},
+            ),
+            Section(
+                "section-1",
+                {"footer_refs": [{"type": "default", "rel_id": "rIdFooterB"}]},
+            ),
+        ],
+        footers={
+            "word/footer-a.xml": [Paragraph("footer-a", [Run("footer-a-run", "A")])],
+            "word/footer-b.xml": [Paragraph("footer-b", [Run("footer-b-run", "B")])],
+        },
+        relationships={
+            "word/document.xml:rIdFooterA": RelationshipRef(
+                "rIdFooterA", "footer", "word/footer-a.xml"
+            ),
+            "word/document.xml:rIdFooterB": RelationshipRef(
+                "rIdFooterB", "footer", "word/footer-b.xml"
+            ),
+        },
+    )
+    output = tmp_path / "section-footers.docx"
+
+    result = PureDocxRenderer().render(model, output, context=None)
+    rebuilt = DocxParser().parse(output)
+    footer_text_by_section = []
+    for section in rebuilt.sections:
+        footer_ref = section.properties["footer_refs"][0]
+        relationship = rebuilt.relationships[
+            f"word/document.xml:{footer_ref['rel_id']}"
+        ]
+        footer_text_by_section.append(rebuilt.footers[relationship.target][0].text())
+
+    assert footer_text_by_section == ["A", "B"]
+    assert "PURE_DOCX_HEADER_FOOTER_MAPPING_APPROXIMATION" not in {
+        warning.code for warning in result.warnings
+    }
