@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import threading
@@ -194,6 +195,10 @@ def test_development_transport_ignores_environment_http_proxy(
 class _Result:
     def __init__(self, output_path: Path) -> None:
         self.output_path = output_path
+        self.report = self
+
+    def to_json(self) -> dict[str, object]:
+        return {"zeta": 2, "message": "točan izvještaj"}
 
 
 class _Runner:
@@ -304,3 +309,71 @@ def test_development_arguments_require_the_explicit_e2e_flag(tmp_path: Path) -> 
         runner=runner,
     ) == 0
     assert len(runner.run_calls) == 1
+
+
+def test_development_entry_writes_sanitized_failure_diagnostic(tmp_path: Path) -> None:
+    from word_replica.runner.development_entry import main
+
+    private_key = "-----BEGIN PRIVATE KEY-----\nprivate-key-material\n-----END PRIVATE KEY-----"
+    diagnostic_path = tmp_path / "development-error.json"
+    portable_name = EXE_NAME
+
+    class FailingRunner(_Runner):
+        def run(self, ticket, config, *, on_claimed=None):
+            raise RuntimeError(
+                f"failure for {portable_name} job={JOB_ID} token={TOKEN} {private_key}"
+            )
+
+    runner = FailingRunner(interrupted=False, output_path=tmp_path / "unused.docx")
+    exit_code = main(
+        [
+            "--development-e2e",
+            "--claim-endpoint", "https://127.0.0.1:8765/claim",
+            "--status-endpoint", "https://127.0.0.1:8765/status",
+            "--output-directory", str(tmp_path / "output"),
+            "--state-directory", str(tmp_path / "state"),
+            "--diagnostic-path", str(diagnostic_path),
+        ],
+        executable_path=Path(portable_name),
+        runner=runner,
+    )
+
+    assert exit_code == 2
+    diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+    assert diagnostic["error"]["type"] == "RuntimeError"
+    assert "failure for" in diagnostic["error"]["message"]
+    assert "RuntimeError" in diagnostic["error"]["traceback"]
+    rendered = json.dumps(diagnostic)
+    assert portable_name not in rendered
+    assert JOB_ID not in rendered
+    assert TOKEN not in rendered
+    assert private_key not in rendered
+
+
+def test_development_entry_persists_exact_canonical_signed_report(tmp_path: Path) -> None:
+    from word_replica.runner.development_entry import main
+    from word_replica.runner.one_shot import _report_sha256
+
+    report_path = tmp_path / "signed-report.json"
+    runner = _Runner(
+        interrupted=False, output_path=tmp_path / "output" / "fixed.docx"
+    )
+
+    exit_code = main(
+        [
+            "--development-e2e",
+            "--claim-endpoint", "https://127.0.0.1:8765/claim",
+            "--status-endpoint", "https://127.0.0.1:8765/status",
+            "--output-directory", str(tmp_path / "output"),
+            "--state-directory", str(tmp_path / "state"),
+            "--report-path", str(report_path),
+        ],
+        executable_path=Path(EXE_NAME),
+        runner=runner,
+    )
+
+    assert exit_code == 0
+    expected_report = _Result(tmp_path / "unused.docx")
+    report_bytes = report_path.read_bytes()
+    assert report_bytes == '{"message":"točan izvještaj","zeta":2}'.encode()
+    assert hashlib.sha256(report_bytes).hexdigest() == _report_sha256(expected_report)

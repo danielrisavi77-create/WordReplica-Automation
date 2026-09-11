@@ -77,3 +77,16 @@ def test_release_script_boot_smoke_tests_the_frozen_runner_before_signing() -> N
     assert "Start-Process" in script
     assert "-WindowStyle Hidden" in script
     assert self_test < signing
+
+
+def test_release_script_attests_clean_automation_dev_source_in_manifest() -> None:
+    script = (ROOT / "BUILD_LEKTA_REPAIR_RUNNER.ps1").read_text(encoding="utf-8")
+
+    assert "rev-parse --abbrev-ref HEAD" in script
+    assert "automation-dev" in script
+    assert "status --porcelain" in script
+    assert "rev-parse HEAD" in script
+    assert "sourceCommit" in script
+    assert "sourceBranch" in script
+    assert "sourceTreeClean" in script
+    assert "engineVersion" in script

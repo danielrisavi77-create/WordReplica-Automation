@@ -59,6 +59,46 @@ if ($PrepareOnly) {
     exit 0
 }
 
+$sourceBranch = (& git -C $PSScriptRoot rev-parse --abbrev-ref HEAD).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw 'WordReplica source branch nije moguce procitati.'
+}
+if ($sourceBranch -ne 'automation-dev') {
+    throw 'WordReplica release build dopusten je samo s automation-dev brancha.'
+}
+
+$sourceCommit = (& git -C $PSScriptRoot rev-parse HEAD).Trim().ToLowerInvariant()
+if ($LASTEXITCODE -ne 0) {
+    throw 'WordReplica source commit nije moguce procitati.'
+}
+if ($sourceCommit -notmatch '^[a-f0-9]{40}$') {
+    throw 'WordReplica source commit nije valjan puni Git SHA.'
+}
+
+$sourceStatus = @(& git -C $PSScriptRoot status --porcelain --untracked-files=normal)
+if ($LASTEXITCODE -ne 0) {
+    throw 'WordReplica source tree status nije moguce procitati.'
+}
+if ($sourceStatus.Count -ne 0) {
+    throw 'WordReplica source tree mora biti cist prije release builda.'
+}
+
+$engineVersionCode = @'
+from pathlib import Path
+import sys
+import tomllib
+project = tomllib.loads((Path(sys.argv[1]) / "pyproject.toml").read_text(encoding="utf-8"))
+print(project["project"]["version"])
+'@
+$engineVersion = (& $RunnerPythonPath -c $engineVersionCode $PSScriptRoot).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw 'WordReplica engine version nije moguce procitati.'
+}
+$expectedEngineVersion = '0.1.0'
+if ($engineVersion -ne $expectedEngineVersion) {
+    throw "WordReplica engine version mora biti $expectedEngineVersion."
+}
+
 if ([string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)) {
     throw 'SigningCertificateThumbprint je obvezan za release build.'
 }
@@ -150,6 +190,10 @@ $manifest = [ordered]@{
     contractKeyId = $KeyId
     signingCertificateThumbprint = $normalizedThumbprint
     timestampServer = $TimestampServer
+    engineVersion = $engineVersion
+    sourceCommit = $sourceCommit
+    sourceBranch = $sourceBranch
+    sourceTreeClean = $true
 }
 $manifest | ConvertTo-Json | Set-Content -LiteralPath $temporaryManifestPath -Encoding utf8
 Move-Item -LiteralPath $temporaryManifestPath -Destination $manifestPath -Force
