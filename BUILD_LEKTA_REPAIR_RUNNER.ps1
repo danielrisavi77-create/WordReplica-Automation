@@ -42,20 +42,25 @@ from pathlib import Path
 import sys
 from word_replica.runner.trust_store import prepare_release_trust_store
 
-prepare_release_trust_store(
+prepared = prepare_release_trust_store(
     public_key_path=Path(sys.argv[1]),
     key_id=sys.argv[2],
     destination=Path(sys.argv[3]),
 )
+print(prepared.contract_public_key_sha256)
 '@
 
-& $RunnerPythonPath -c $prepareCode $resolvedPublicKey $KeyId $resolvedTrustStore
+$contractPublicKeySha256 = (& $RunnerPythonPath -c $prepareCode $resolvedPublicKey $KeyId $resolvedTrustStore).Trim().ToLowerInvariant()
 if ($LASTEXITCODE -ne 0) {
     throw 'Priprema javnog runner trust storea nije uspjela.'
+}
+if ($contractPublicKeySha256 -notmatch '^[a-f0-9]{64}$') {
+    throw 'Otisak javnog Repair Contract kljuca nije valjan.'
 }
 
 if ($PrepareOnly) {
     Write-Host "Prepared: $resolvedTrustStore"
+    Write-Host "Public key SHA-256: $contractPublicKeySha256"
     exit 0
 }
 
@@ -183,11 +188,12 @@ $artifactHash = (Get-FileHash -LiteralPath $runnerPath -Algorithm SHA256).Hash.T
 $manifestPath = Join-Path $resolvedOutput 'lekta-repair-runner-manifest.json'
 $temporaryManifestPath = "$manifestPath.tmp"
 $manifest = [ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
     fileName = $runnerFile.Name
     sha256 = $artifactHash
     sizeBytes = $runnerFile.Length
     contractKeyId = $KeyId
+    contractPublicKeySha256 = $contractPublicKeySha256
     signingCertificateThumbprint = $normalizedThumbprint
     timestampServer = $TimestampServer
     engineVersion = $engineVersion

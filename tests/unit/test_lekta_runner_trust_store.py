@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+from hashlib import sha256
 import json
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    PublicFormat,
+    load_der_public_key,
+    load_pem_public_key,
+)
 
 from word_replica.repair_contract.signature import decode_spki
 from word_replica.runner import trust_store as trust_store_module
@@ -54,7 +62,8 @@ def test_release_build_prepares_a_public_only_trust_store(tmp_path: Path) -> Non
         destination=destination,
     )
 
-    assert result == destination
+    assert result.path == destination
+    assert result.contract_public_key_sha256 == sha256(decode_spki(spki)).hexdigest()
     assert json.loads(destination.read_text(encoding="utf-8")) == {
         "version": 1,
         "keys": [{"keyId": "lekta-prod-test", "spkiBase64Url": spki}],
@@ -62,3 +71,38 @@ def test_release_build_prepares_a_public_only_trust_store(tmp_path: Path) -> Non
     assert load_trust_keys(destination) == {
         "lekta-prod-test": decode_spki(spki),
     }
+
+
+def test_release_key_fingerprint_is_canonical_der_spki_sha256(tmp_path: Path) -> None:
+    spki_text = (FIXTURE_DIR / "public-key.spki.b64url").read_text(encoding="utf-8").strip()
+    der = decode_spki(spki_text)
+    prepared = trust_store_module.prepare_release_trust_store(
+        public_key_path=FIXTURE_DIR / "public-key.spki.b64url",
+        key_id="lekta-prod-test",
+        destination=tmp_path / "trusted_keys.json",
+    )
+
+    assert prepared.contract_public_key_sha256 == sha256(der).hexdigest()
+    assert prepared.path == tmp_path / "trusted_keys.json"
+
+
+def test_fingerprint_ignores_pem_text_format_but_changes_for_another_key() -> None:
+    fixture_der = decode_spki(
+        (FIXTURE_DIR / "public-key.spki.b64url").read_text(encoding="utf-8").strip()
+    )
+    fixture_key = load_der_public_key(fixture_der)
+    pem_lf = fixture_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+    pem_crlf = pem_lf.replace(b"\n", b"\r\n")
+    fingerprints = []
+    for pem in (pem_lf, pem_crlf):
+        parsed = load_pem_public_key(pem)
+        canonical_der = parsed.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        fingerprints.append(trust_store_module.canonical_p256_spki_sha256(canonical_der))
+
+    other_der = ec.generate_private_key(ec.SECP256R1()).public_key().public_bytes(
+        Encoding.DER,
+        PublicFormat.SubjectPublicKeyInfo,
+    )
+    assert fingerprints == [sha256(fixture_der).hexdigest()] * 2
+    assert trust_store_module.canonical_p256_spki_sha256(other_der) != fingerprints[0]
+    assert sha256(pem_lf).hexdigest() != fingerprints[0]

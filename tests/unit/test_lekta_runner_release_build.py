@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hashlib import sha256
 import subprocess
 import sys
 from pathlib import Path
@@ -33,6 +34,8 @@ def test_release_script_prepares_the_runtime_trust_asset(tmp_path: Path) -> None
     assert completed.returncode == 0, completed.stdout + completed.stderr
     spki = public_key.read_text(encoding="utf-8").strip()
     assert load_trust_keys(destination) == {"lekta-prod-test": decode_spki(spki)}
+    expected = sha256(decode_spki(spki)).hexdigest()
+    assert f"Public key SHA-256: {expected}" in completed.stdout
 
 
 
@@ -58,6 +61,15 @@ def test_release_script_emits_signed_artifact_sha256_manifest() -> None:
     assert "sizeBytes" in script
     assert "signingCertificateThumbprint" in script
     assert "ConvertTo-Json" in script
+
+
+def test_release_script_emits_contract_public_key_fingerprint_in_manifest_v2() -> None:
+    script = (ROOT / "BUILD_LEKTA_REPAIR_RUNNER.ps1").read_text(encoding="utf-8")
+
+    assert "schemaVersion = 2" in script
+    assert "contractPublicKeySha256 = $contractPublicKeySha256" in script
+    assert "prepared.contract_public_key_sha256" in script
+    assert "schemaVersion = 1" not in script
 
 
 def test_release_script_packages_repair_contract_fixer_ids() -> None:

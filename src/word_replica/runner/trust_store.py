@@ -1,14 +1,21 @@
 """Pinned public-key trust store for signed Lekta Repair Contracts."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 import tempfile
+from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.serialization import load_der_public_key
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    PublicFormat,
+    load_der_public_key,
+)
 
 from word_replica.repair_contract.signature import decode_spki
 
@@ -19,6 +26,28 @@ _MAX_TRUST_STORE_BYTES = 64 * 1024
 
 class RunnerTrustError(ValueError):
     """The executable's pinned contract trust store is absent or invalid."""
+
+
+@dataclass(frozen=True)
+class PreparedReleaseTrustStore:
+    path: Path
+    contract_public_key_sha256: str
+
+
+def _canonical_p256_spki(der: bytes) -> bytes:
+    try:
+        public_key = load_der_public_key(der)
+    except Exception as exc:
+        raise RunnerTrustError("invalid runner trust public key") from exc
+    if not isinstance(public_key, ec.EllipticCurvePublicKey) or not isinstance(
+        public_key.curve, ec.SECP256R1
+    ):
+        raise RunnerTrustError("runner trust key is not P-256")
+    return public_key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+
+
+def canonical_p256_spki_sha256(der: bytes) -> str:
+    return sha256(_canonical_p256_spki(der)).hexdigest()
 
 
 def load_trust_keys(path: Path) -> dict[str, bytes]:
@@ -49,12 +78,11 @@ def load_trust_keys(path: Path) -> dict[str, bytes]:
         if not isinstance(encoded, str):
             raise RunnerTrustError("invalid runner trust public key")
         try:
-            der = decode_spki(encoded)
-            public_key = load_der_public_key(der)
+            der = _canonical_p256_spki(decode_spki(encoded))
+        except RunnerTrustError:
+            raise
         except Exception as exc:
             raise RunnerTrustError("invalid runner trust public key") from exc
-        if not isinstance(public_key, ec.EllipticCurvePublicKey) or not isinstance(public_key.curve, ec.SECP256R1):
-            raise RunnerTrustError("runner trust key is not P-256")
         trusted[key_id] = der
     return trusted
 
@@ -64,7 +92,7 @@ def prepare_release_trust_store(
     public_key_path: Path,
     key_id: str,
     destination: Path,
-) -> Path:
+) -> PreparedReleaseTrustStore:
     """Atomically prepare the public-only trust asset for a portable release."""
     if not isinstance(key_id, str) or not _KEY_ID.fullmatch(key_id):
         raise RunnerTrustError("invalid runner trust key id")
@@ -72,13 +100,18 @@ def prepare_release_trust_store(
     destination = Path(destination)
     try:
         spki = public_key_path.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeDecodeError) as exc:
-        raise RunnerTrustError("runner trust public key is unavailable") from exc
+        canonical_der = _canonical_p256_spki(decode_spki(spki))
+    except RunnerTrustError:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise RunnerTrustError("runner trust public key is unavailable or invalid") from exc
 
+    canonical_spki = base64.urlsafe_b64encode(canonical_der).rstrip(b"=").decode("ascii")
+    fingerprint = sha256(canonical_der).hexdigest()
     payload = json.dumps(
         {
             "version": 1,
-            "keys": [{"keyId": key_id, "spkiBase64Url": spki}],
+            "keys": [{"keyId": key_id, "spkiBase64Url": canonical_spki}],
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -99,4 +132,7 @@ def prepare_release_trust_store(
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
-    return destination
+    return PreparedReleaseTrustStore(
+        path=destination,
+        contract_public_key_sha256=fingerprint,
+    )
