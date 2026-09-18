@@ -52,6 +52,19 @@ A production artifact must have:
 
 The desktop builder currently writes `dist/word-replica-build-manifest.json`. That manifest proves build identity fields; it does not by itself prove Authenticode validity.
 
+For a production desktop release, run `BUILD_WINDOWS_RELEASE.ps1` from an exact `release/**` branch. It always invokes the verified desktop builder with the real Microsoft Word gate enabled, validates the unsigned build manifest against the exact source commit and bytes, requires trusted code signing, re-verifies the signer, and writes `dist/word-replica-release-manifest.json`.
+
+Example with a local trusted code-signing certificate:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\BUILD_WINDOWS_RELEASE.ps1 \
+  -SigningMode CertificateStore \
+  -SigningCertificateThumbprint "<trusted-thumbprint>" \
+  -TimestampServer "<trusted-rfc3161-or-authenticode-timestamp-url>"
+```
+
+Artifact Signing is supported with `-SigningMode ArtifactSigning`, but additionally requires the exact SignTool, `Azure.CodeSigning.Dlib.dll`, metadata file, timestamp server and independently trusted publisher thumbprint. Missing signing material is a release blocker, never a reason to produce an unsigned production artifact.
+
 The Lekta production runner additionally uses `lekta-repair-runner-manifest.json` and the stricter signing checks in `BUILD_LEKTA_REPAIR_RUNNER.ps1`.
 
 ## Version rules
