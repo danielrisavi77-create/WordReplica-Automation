@@ -1,4 +1,7 @@
 from pathlib import Path
+import sys
+
+import pytest
 
 from scripts.codex_automation.config import CodexAutomationConfig
 from scripts.codex_automation.workspace import GoldenWorkspace, sha256_file
@@ -121,6 +124,7 @@ def _write_lock(path, record):
     path.write_text(json.dumps(record), encoding="utf-8")
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process creation FILETIME")
 def test_lock_records_the_holder_process_identity(tmp_path):
     # Staleness can only be decided if the lock says who holds it, by both pid
     # and process creation FILETIME -- pid alone is reusable.
