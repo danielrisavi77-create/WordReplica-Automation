@@ -51,6 +51,18 @@ def test_release_script_requires_and_verifies_authenticode_signature() -> None:
     assert "Signature status nije Valid" in script
 
 
+def test_release_script_supports_public_cloud_signing_without_local_private_key() -> None:
+    script = (ROOT / "BUILD_LEKTA_REPAIR_RUNNER.ps1").read_text(encoding="utf-8")
+
+    assert "ArtifactSigning" in script
+    assert "ArtifactSigningSignToolPath" in script
+    assert "ArtifactSigningDlibPath" in script
+    assert "ArtifactSigningMetadataPath" in script
+    assert "Azure.CodeSigning.Dlib.dll" in script
+    assert "/dmdf" in script
+    assert "Set-AuthenticodeSignature" in script
+
+
 def test_release_script_emits_signed_artifact_sha256_manifest() -> None:
     script = (ROOT / "BUILD_LEKTA_REPAIR_RUNNER.ps1").read_text(encoding="utf-8")
 

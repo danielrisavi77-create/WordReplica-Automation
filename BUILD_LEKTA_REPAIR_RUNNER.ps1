@@ -14,6 +14,11 @@ param(
     [string]$OutputDirectory = '',
     [string]$SigningCertificateThumbprint = '',
     [string]$TimestampServer = '',
+    [ValidateSet('CertificateStore', 'ArtifactSigning')]
+    [string]$SigningMode = 'CertificateStore',
+    [string]$ArtifactSigningSignToolPath = '',
+    [string]$ArtifactSigningDlibPath = '',
+    [string]$ArtifactSigningMetadataPath = '',
     [switch]$PrepareOnly
 )
 
@@ -104,18 +109,30 @@ if ($engineVersion -ne $expectedEngineVersion) {
     throw "WordReplica engine version mora biti $expectedEngineVersion."
 }
 
-if ([string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)) {
-    throw 'SigningCertificateThumbprint je obvezan za release build.'
-}
 if ([string]::IsNullOrWhiteSpace($TimestampServer)) {
     throw 'TimestampServer je obvezan za release build.'
 }
 
-$normalizedThumbprint = $SigningCertificateThumbprint.Replace(' ', '').ToUpperInvariant()
-$certificatePath = "Cert:\CurrentUser\My\$normalizedThumbprint"
-$signingCertificate = Get-Item -LiteralPath $certificatePath -ErrorAction Stop
-if (-not $signingCertificate.HasPrivateKey) {
-    throw 'Signing certifikat nema privatni kljuc.'
+$useArtifactSigning = $SigningMode -eq 'ArtifactSigning'
+$normalizedThumbprint = ''
+$signingCertificate = $null
+if ($useArtifactSigning) {
+    foreach ($requiredPath in @($ArtifactSigningSignToolPath, $ArtifactSigningDlibPath, $ArtifactSigningMetadataPath)) {
+        if ([string]::IsNullOrWhiteSpace($requiredPath) -or -not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+            throw 'Artifact Signing zahtijeva postojeci SignTool, Azure.CodeSigning.Dlib.dll i metadata.json.'
+        }
+    }
+    # Artifact Signing poziva Azure.CodeSigning.Dlib.dll kroz SignTool; privatni kljuc ostaje u servisu.
+} else {
+    if ([string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)) {
+        throw 'SigningCertificateThumbprint je obvezan za release build.'
+    }
+    $normalizedThumbprint = $SigningCertificateThumbprint.Replace(' ', '').ToUpperInvariant()
+    $certificatePath = "Cert:\CurrentUser\My\$normalizedThumbprint"
+    $signingCertificate = Get-Item -LiteralPath $certificatePath -ErrorAction Stop
+    if (-not $signingCertificate.HasPrivateKey) {
+        throw 'Signing certifikat nema privatni kljuc.'
+    }
 }
 
 & $RunnerPythonPath -m pytest -q `
@@ -171,15 +188,32 @@ if ($selfTest.ExitCode -ne 0) {
     throw 'LektaRepair.exe se nije mogao pokrenuti s ugradenim contract kljucem.'
 }
 
-$signature = Set-AuthenticodeSignature -FilePath $runnerPath -Certificate $signingCertificate `
-    -HashAlgorithm SHA256 -TimestampServer $TimestampServer
-if ($signature.Status -ne 'Valid') {
-    throw "Signature status nije Valid: $($signature.Status) $($signature.StatusMessage)"
+if ($useArtifactSigning) {
+    $signToolArguments = @(
+        'sign', '/v', '/debug', '/fd', 'SHA256', '/tr', $TimestampServer, '/td', 'SHA256',
+        '/dlib', $ArtifactSigningDlibPath, '/dmdf', $ArtifactSigningMetadataPath, $runnerPath
+    )
+    & $ArtifactSigningSignToolPath @signToolArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Artifact Signing nije potpisao LektaRepair.exe.'
+    }
+} else {
+    $signature = Set-AuthenticodeSignature -FilePath $runnerPath -Certificate $signingCertificate `
+        -HashAlgorithm SHA256 -TimestampServer $TimestampServer
+    if ($signature.Status -ne 'Valid') {
+        throw "Signature status nije Valid: $($signature.Status) $($signature.StatusMessage)"
+    }
 }
 
 $verifiedSignature = Get-AuthenticodeSignature -FilePath $runnerPath
 if ($verifiedSignature.Status -ne 'Valid') {
     throw "Signature status nije Valid nakon ponovne provjere: $($verifiedSignature.Status)"
+}
+if ($useArtifactSigning) {
+    $normalizedThumbprint = ([string]$verifiedSignature.SignerCertificate.Thumbprint).Replace(' ', '').ToUpperInvariant()
+}
+if ($normalizedThumbprint -notmatch '^[A-F0-9]{40}$') {
+    throw 'Potpisani runner nema valjan publisher thumbprint.'
 }
 
 

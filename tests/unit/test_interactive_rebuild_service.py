@@ -2429,6 +2429,48 @@ def test_restore_source_run_segmentation_keeps_fast_text_layout_fidelity(tmp_pat
     assert paragraph.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}rsidP") is None
 
 
+def test_restore_nested_sdt_section_break_after_flattening(tmp_path):
+    from lxml import etree
+
+    source = tmp_path / "source.docx"
+    output = tmp_path / "output.docx"
+    ns_decl = "xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'"
+    sect_pr = (
+        "<w:sectPr><w:headerReference w:type='default' w:id='rId9'/>"
+        "<w:footerReference w:type='default' w:id='rId10'/>"
+        "<w:pgNumType w:fmt='upperRoman' w:start='2'/><w:pgSz w:w='11906' w:h='16838'/>"
+        "</w:sectPr>"
+    )
+    source_xml = (
+        f"<w:document {ns_decl}><w:body>"
+        "<w:sdt><w:sdtContent>"
+        "<w:p><w:r><w:t>Contents</w:t></w:r></w:p>"
+        "<w:p><w:r><w:t>Last entry</w:t></w:r></w:p>"
+        f"<w:p><w:pPr>{sect_pr}</w:pPr></w:p>"
+        "</w:sdtContent></w:sdt>"
+        "<w:p><w:r><w:t>Introduction</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    ).encode()
+    output_xml = (
+        f"<w:document {ns_decl}><w:body>"
+        "<w:p><w:r><w:t>Contents</w:t></w:r></w:p>"
+        "<w:p><w:r><w:t>Last entry</w:t></w:r></w:p>"
+        "<w:p/>"
+        "<w:p><w:r><w:t>Introduction</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    ).encode()
+    for path, document_xml in ((source, source_xml), (output, output_xml)):
+        with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+            archive.writestr("word/document.xml", document_xml)
+
+    restored = InteractiveRebuildService._restore_source_section_breaks(output, source)
+
+    with ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    paragraphs = root.xpath("//w:body/w:p", namespaces=ns)
+    assert restored == 1
+    assert paragraphs[2].xpath("./w:pPr/w:sectPr/w:pgNumType/@w:start", namespaces=ns) == ["2"]
 def test_restore_declared_source_package_parts_and_relationships(tmp_path):
     from types import SimpleNamespace
 

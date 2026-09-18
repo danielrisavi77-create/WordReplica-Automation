@@ -1075,6 +1075,189 @@ class InteractiveRebuildService:
         return restored
 
     @staticmethod
+    def _restore_source_section_breaks(output_path: Path, source_path: Path) -> int:
+        """Restore section breaks nested inside flattened content controls.
+
+        A block-level ``w:sdt`` is flattened into ordinary paragraphs by the
+        parser and interactive renderer. Word stores section properties on a
+        paragraph inside that control, so flattening otherwise drops the
+        section boundary (and its headers, footers, and page numbering).
+        Restore only the missing paragraph-level ``sectPr`` from the signed
+        source package; the reconstructed paragraph content remains owned by
+        the replay.
+        """
+        from lxml import etree
+
+        namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        ns = {"w": namespace}
+        with ZipFile(source_path) as source_archive:
+            source_parts = {name: source_archive.read(name) for name in source_archive.namelist()}
+            source_root = etree.fromstring(source_parts["word/document.xml"])
+        with ZipFile(output_path) as output_archive:
+            parts = {name: output_archive.read(name) for name in output_archive.namelist()}
+        output_root = etree.fromstring(parts["word/document.xml"])
+        relationship_namespace = "http://schemas.openxmlformats.org/package/2006/relationships"
+        relationship_id = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+        story_relationships = {"header": set(), "footer": set()}
+        if "word/_rels/document.xml.rels" in parts:
+            relationships = etree.fromstring(parts["word/_rels/document.xml.rels"])
+            for relationship in relationships:
+                kind = (relationship.get("Type") or "").rsplit("/", 1)[-1]
+                if kind in story_relationships:
+                    story_relationships[kind].add(relationship.get("Id"))
+        source_relationships = {}
+        if "word/_rels/document.xml.rels" in source_parts:
+            source_relationship_root = etree.fromstring(source_parts["word/_rels/document.xml.rels"])
+            source_relationships = {
+                relationship.get("Id"): relationship for relationship in source_relationship_root
+            }
+        output_relationship_root = (
+            etree.fromstring(parts["word/_rels/document.xml.rels"])
+            if "word/_rels/document.xml.rels" in parts
+            else None
+        )
+        used_relationship_ids = set(story_relationships["header"]) | set(story_relationships["footer"])
+        content_types_changed = False
+
+        def ensure_story_reference(reference, kind):
+            nonlocal content_types_changed
+            reference_id = reference.get(relationship_id)
+            if reference_id in story_relationships[kind]:
+                return reference_id
+            if kind == "header":
+                return None
+            source_relationship = source_relationships.get(reference_id)
+            if source_relationship is None or not (source_relationship.get("Type") or "").endswith(f"/{kind}"):
+                return None
+            target = source_relationship.get("Target") or ""
+            target_part = target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join("word", target))
+            if target_part not in source_parts or output_relationship_root is None:
+                return None
+            for existing in output_relationship_root:
+                if existing.get("Type") == source_relationship.get("Type") and existing.get("Target") == source_relationship.get("Target"):
+                    mapped_id = existing.get("Id")
+                    story_relationships[kind].add(mapped_id)
+                    return mapped_id
+            mapped_id = reference_id
+            if mapped_id in used_relationship_ids:
+                suffix = 1
+                while f"rId{suffix}" in used_relationship_ids:
+                    suffix += 1
+                mapped_id = f"rId{suffix}"
+            copied_relationship = deepcopy(source_relationship)
+            copied_relationship.set("Id", mapped_id)
+            output_relationship_root.append(copied_relationship)
+            used_relationship_ids.add(mapped_id)
+            story_relationships[kind].add(mapped_id)
+            parts[target_part] = source_parts[target_part]
+            source_part_rels = f"{target_part.rsplit('/', 1)[0]}/_rels/{target_part.rsplit('/', 1)[1]}.rels"
+            if source_part_rels in source_parts and source_part_rels not in parts:
+                parts[source_part_rels] = source_parts[source_part_rels]
+            if "[Content_Types].xml" in parts and "[Content_Types].xml" in source_parts:
+                content_types = etree.fromstring(parts["[Content_Types].xml"])
+                source_content_types = etree.fromstring(source_parts["[Content_Types].xml"])
+                part_name = f"/{target_part}"
+                if not any(node.get("PartName") == part_name for node in content_types):
+                    for node in source_content_types:
+                        if node.get("PartName") == part_name:
+                            content_types.append(deepcopy(node))
+                            parts["[Content_Types].xml"] = etree.tostring(content_types, xml_declaration=True, encoding="UTF-8", standalone=True)
+                            content_types_changed = True
+                            break
+            return mapped_id
+
+        source_paragraphs = source_root.xpath("//w:body//w:p", namespaces=ns)
+        output_paragraphs = output_root.xpath("//w:body//w:p", namespaces=ns)
+        paragraph_text = lambda paragraph: "".join(
+            paragraph.xpath(".//w:t/text()", namespaces=ns)
+        )
+        output_text = [paragraph_text(paragraph) for paragraph in output_paragraphs]
+        restored = 0
+        search_start = 0
+
+        for source_index, source_paragraph in enumerate(source_paragraphs):
+            source_sect = source_paragraph.find("./w:pPr/w:sectPr", namespaces=ns)
+            if source_sect is None:
+                continue
+            text = paragraph_text(source_paragraph)
+            output_index = None
+            if (
+                source_index < len(output_paragraphs)
+                and output_text[source_index] == text
+            ):
+                output_index = source_index
+            else:
+                for index in range(search_start, len(output_paragraphs)):
+                    if output_text[index] == text:
+                        output_index = index
+                        break
+            if output_index is None:
+                continue
+            search_start = output_index + 1
+            output_paragraph = output_paragraphs[output_index]
+            output_properties = output_paragraph.find("w:pPr", namespaces=ns)
+            if output_properties is None:
+                output_properties = etree.Element(f"{{{namespace}}}pPr")
+                output_paragraph.insert(0, output_properties)
+            output_sect = output_properties.find("./w:sectPr", namespaces=ns)
+            replacement = etree.fromstring(etree.tostring(source_sect))
+            for reference in list(replacement):
+                kind = etree.QName(reference).localname
+                if kind not in {"headerReference", "footerReference"}:
+                    continue
+                story_kind = kind.removesuffix("Reference")
+                mapped_id = ensure_story_reference(reference, story_kind)
+                if mapped_id is None:
+                    replacement.remove(reference)
+                else:
+                    reference.set(relationship_id, mapped_id)
+            if output_sect is not None:
+                if etree.tostring(output_sect) == etree.tostring(replacement):
+                    continue
+                output_properties.replace(output_sect, replacement)
+            else:
+                output_properties.append(replacement)
+            restored += 1
+
+        source_body_sect = source_root.find("./w:body/w:sectPr", namespaces=ns)
+        output_body_sect = output_root.find("./w:body/w:sectPr", namespaces=ns)
+        if source_body_sect is not None and output_body_sect is not None:
+            replacement = etree.fromstring(etree.tostring(source_body_sect))
+            for reference in list(replacement):
+                kind = etree.QName(reference).localname
+                if kind not in {"headerReference", "footerReference"}:
+                    continue
+                story_kind = kind.removesuffix("Reference")
+                mapped_id = ensure_story_reference(reference, story_kind)
+                if mapped_id is None:
+                    replacement.remove(reference)
+                else:
+                    reference.set(relationship_id, mapped_id)
+            if etree.tostring(output_body_sect) != etree.tostring(replacement):
+                output_body_sect.getparent().replace(output_body_sect, replacement)
+                restored += 1
+
+        if not restored:
+            return 0
+        if output_relationship_root is not None:
+            parts["word/_rels/document.xml.rels"] = etree.tostring(output_relationship_root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        parts["word/document.xml"] = etree.tostring(
+            output_root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{output_path.name}.", suffix=".tmp", dir=output_path.parent
+        )
+        os.close(fd)
+        try:
+            with ZipFile(temporary_name, "w", ZIP_DEFLATED) as archive:
+                for name, data in parts.items():
+                    archive.writestr(name, data)
+            _replace_with_retry(Path(temporary_name), output_path)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return restored
+
+    @staticmethod
     def _restore_explicit_column_space(output_path: Path, source_path: Path) -> int:
         from lxml import etree
 
@@ -2684,6 +2867,9 @@ class InteractiveRebuildService:
             output_path, Path(prepared.source_path)
         )
         restored_empty_runs = self._restore_empty_runs(output_path, Path(prepared.source_path))
+        restored_section_breaks = self._restore_source_section_breaks(
+            output_path, Path(prepared.source_path)
+        )
         restored_column_space = self._restore_explicit_column_space(
             output_path, Path(prepared.source_path)
         )
@@ -2730,7 +2916,7 @@ class InteractiveRebuildService:
         restored_package_parts = self._restore_source_package_parts(
             output_path, Path(prepared.source_path), prepared.model
         )
-        if removed_header_shape_defaults or removed_bookmarks or removed_headers or restored_header_stories or removed_template_spacing or restored_alignment or restored_run_character_spacing or restored_run_font_names or restored_drawing_effect_extents or restored_run_segmentation or restored_empty_runs or restored_column_space or restored_page_number_start or restored_defaults or restored_theme_style_latin_fonts or restored_footer_stories or restored_footer_topology or restored_cross_paragraph_field_shells or restored_field_instructions or restored_table_layout or restored_numbering_definitions or restored_invisible_field_marker_runs or removed_note_reference_spaces or restored_compatibility_settings or restored_package_parts:
+        if removed_header_shape_defaults or removed_bookmarks or removed_headers or restored_header_stories or removed_template_spacing or restored_alignment or restored_run_character_spacing or restored_run_font_names or restored_drawing_effect_extents or restored_run_segmentation or restored_empty_runs or restored_section_breaks or restored_column_space or restored_page_number_start or restored_defaults or restored_theme_style_latin_fonts or restored_footer_stories or restored_footer_topology or restored_cross_paragraph_field_shells or restored_field_instructions or restored_table_layout or restored_numbering_definitions or restored_invisible_field_marker_runs or removed_note_reference_spaces or restored_compatibility_settings or restored_package_parts:
             final_checkpoint = replace(
                 final_checkpoint,
                 output_sha256=sha256_file(output_path),
@@ -2766,6 +2952,8 @@ class InteractiveRebuildService:
             )
         if restored_empty_runs:
             audit.append("EMPTY_RUNS_RESTORED", {"count": restored_empty_runs})
+        if restored_section_breaks:
+            audit.append("SOURCE_SECTION_BREAKS_RESTORED", {"count": restored_section_breaks})
         if restored_column_space:
             audit.append("EXPLICIT_COLUMN_SPACE_RESTORED", {"count": restored_column_space})
         if restored_page_number_start:
