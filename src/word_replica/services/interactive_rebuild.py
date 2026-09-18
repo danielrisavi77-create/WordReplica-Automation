@@ -1116,7 +1116,11 @@ class InteractiveRebuildService:
             if "word/_rels/document.xml.rels" in parts
             else None
         )
-        used_relationship_ids = set(story_relationships["header"]) | set(story_relationships["footer"])
+        used_relationship_ids = (
+            {relationship.get("Id") for relationship in output_relationship_root}
+            if output_relationship_root is not None
+            else set()
+        )
         content_types_changed = False
 
         def ensure_story_reference(reference, kind):
