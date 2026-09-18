@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.request import Request
@@ -31,6 +32,7 @@ def test_redirect_handler_rejects_https_to_http_before_following() -> None:
         )
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows one-shot runner uses DPAPI")
 def test_one_shot_surfaces_signature_mismatch_before_any_download(tmp_path: Path) -> None:
     contract = json.loads((FIXTURE_DIR / "valid-contract.json").read_text(encoding="utf-8"))
     contract["sourceSize"] += 1
