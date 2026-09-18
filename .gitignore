@@ -5,6 +5,10 @@ __pycache__/
 .venv/
 .venv_harness/
 .venv_appbuild/
+.venv_gate/
+*.egg-info/
+.coverage
+htmlcov/
 
 # Local Codex/Golden data must never enter Git.
 golden/
