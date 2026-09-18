@@ -17,7 +17,7 @@ The builder:
 3. installs core/test/build dependencies with pip cache disabled;
 4. runs the complete Windows + Microsoft Word release gate;
 5. builds a single-file, windowed `WordReplica.exe` with PyInstaller;
-6. prints the EXE SHA-256;
+6. prints the EXE SHA-256 and writes `dist\\word-replica-build-manifest.json` with version, exact size, hash and source commit when Git metadata is available;
 7. removes the temporary build environment and build folder by default.
 
 The finished executable is:
