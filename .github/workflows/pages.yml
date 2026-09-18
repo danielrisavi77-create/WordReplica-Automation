@@ -41,13 +41,16 @@ jobs:
               raise SystemExit("Landing must remain documentation/download only; generic DOCX upload UI is not allowed.")
           PY
 
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-
       - name: Upload static site
         uses: actions/upload-pages-artifact@v3
         with:
           path: landing
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          token: ${{ secrets.WORDREPLICA_PAGES_TOKEN != '' && secrets.WORDREPLICA_PAGES_TOKEN || github.token }}
+          enablement: ${{ secrets.WORDREPLICA_PAGES_TOKEN != '' }}
 
   deploy:
     environment:
