@@ -17,7 +17,7 @@ The builder:
 3. installs core/test/build dependencies with pip cache disabled;
 4. runs the complete Windows + Microsoft Word release gate;
 5. builds a single-file, windowed `WordReplica.exe` with PyInstaller;
-6. prints the EXE SHA-256;
+6. prints the EXE SHA-256 and writes `dist\\word-replica-build-manifest.json` with version, exact size, hash and source commit when Git metadata is available;
 7. removes the temporary build environment and build folder by default.
 
 The finished executable is:
@@ -33,10 +33,11 @@ Use `-SkipReleaseGate` only if the identical source tree has already passed the 
 1. Click **Odaberi DOCX**.
 2. Choose **Automatski**, **Microsoft Word**, or **Pure DOCX**.
 3. Choose **U pozadini** or **Vidljivo** for Word runs.
-4. Choose **Čista replika** or **Puna vjernost**.
-5. Choose **Novi metapodaci** or **Sačuvaj legitimne**.
-6. Click **Pokreni rekonstrukciju**.
-7. After completion, use the buttons to open the reconstructed DOCX, QA report, or project folder.
+4. For Interactive Reconstruction, optionally enable **Slovo po slovo** so each character is inserted as its own keystroke instead of a whole sentence popping in at once — the total pacing still follows the chosen Speed, only the on-screen granularity changes.
+5. Choose **Čista replika** or **Puna vjernost**.
+6. Choose **Novi metapodaci** or **Sačuvaj legitimne**.
+7. Click **Pokreni rekonstrukciju**.
+8. After completion, use the buttons to open the reconstructed DOCX, QA report, or project folder.
 
 The source stays read-only by default. The advanced overwrite checkbox requires an explicit confirmation and the engine creates and verifies a backup first.
 

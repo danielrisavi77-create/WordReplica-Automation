@@ -43,6 +43,7 @@ class DesktopState:
     interactive_speed_mode: str = "fast"
     interactive_characters_per_second: float = 25.0
     interactive_object_step_delay_ms: int = 150
+    interactive_letter_by_letter: bool = False
     interactive_fidelity: str = "maximum"
     checkpoint_after_tables: bool = True
     checkpoint_after_images: bool = True
@@ -53,14 +54,27 @@ class DesktopState:
     allow_preserved_objects: bool = False
 
 
+def is_pure_docx_preview_state(state: DesktopState) -> bool:
+    """Interactive mode with the Pure DOCX renderer is a local, licence-free
+    typing preview: the real file is produced by the ordinary Instant Pure
+    DOCX path, not by driving Microsoft Word."""
+    return state.reconstruction_mode == "interactive" and state.renderer == "docx"
+
+
 def options_from_desktop_state(state: DesktopState) -> RebuildOptions:
-    mode = ReconstructionMode(state.reconstruction_mode)
-    renderer = RendererChoice.WORD if mode is ReconstructionMode.INTERACTIVE else RendererChoice(state.renderer)
-    visibility = VisibilityMode.VISIBLE if mode is ReconstructionMode.INTERACTIVE else VisibilityMode(state.visibility)
+    preview_only = is_pure_docx_preview_state(state)
+    mode = ReconstructionMode.INSTANT if preview_only else ReconstructionMode(state.reconstruction_mode)
+    if preview_only:
+        renderer = RendererChoice.DOCX
+        visibility = VisibilityMode.BACKGROUND
+    else:
+        renderer = RendererChoice.WORD if mode is ReconstructionMode.INTERACTIVE else RendererChoice(state.renderer)
+        visibility = VisibilityMode.VISIBLE if mode is ReconstructionMode.INTERACTIVE else VisibilityMode(state.visibility)
     interactive = InteractiveOptions(
         speed_mode=InteractiveSpeedMode(state.interactive_speed_mode),
         characters_per_second=float(state.interactive_characters_per_second),
         object_step_delay_ms=int(state.interactive_object_step_delay_ms),
+        letter_by_letter=bool(state.interactive_letter_by_letter),
         fidelity=InteractiveFidelity(state.interactive_fidelity),
         checkpoint_after_tables=bool(state.checkpoint_after_tables),
         checkpoint_after_images=bool(state.checkpoint_after_images),
@@ -183,6 +197,7 @@ class WordReplicaDesktop:
         self.speed_var = tk.StringVar(value="Fast")
         self.custom_speed_var = tk.DoubleVar(value=25.0)
         self.object_delay_var = tk.IntVar(value=150)
+        self.letter_by_letter_var = tk.BooleanVar(value=False)
         self.interactive_fidelity_var = tk.StringVar(value="Maximum Fidelity")
         self.cp_tables_var = tk.BooleanVar(value=True)
         self.cp_images_var = tk.BooleanVar(value=True)
@@ -271,6 +286,15 @@ class WordReplicaDesktop:
         ttk.Checkbutton(cp_frame, text="Live verify", variable=self.verify_live_var).pack(side="left", padx=(14, 0))
         ttk.Checkbutton(cp_frame, text="Dopusti PRESERVED uz upozorenje", variable=self.allow_preserved_var).pack(side="left", padx=(14, 0))
 
+        letter_frame = ttk.Frame(self.interactive_box)
+        letter_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        ttk.Checkbutton(letter_frame, text="Slovo po slovo (svaki znak zaseban potez u Wordu)", variable=self.letter_by_letter_var).pack(side="left")
+        ttk.Label(
+            letter_frame,
+            text="Isti ukupni tempo iz polja Brzina, samo prikazan znak-po-znak umjesto po cijeloj rečenici.",
+            foreground="#666666",
+        ).pack(side="left", padx=(10, 0))
+
         technical = ttk.LabelFrame(outer, text="4. Fidelity, metapodaci i Instant Advanced", padding=12)
         technical.pack(fill="x", pady=(12, 0))
         for c in range(4):
@@ -292,6 +316,16 @@ class WordReplicaDesktop:
         ttk.Label(technical, text="Custom properties za očuvanje (odvojene zarezom)").grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 2))
         self.custom_entry = ttk.Entry(technical, textvariable=self.custom_properties_var)
         self.custom_entry.grid(row=4, column=0, columnspan=4, sticky="ew")
+
+        self.preview_box = ttk.LabelFrame(outer, text="Live pregled (bez licenciranog Worda)", padding=10)
+        self.preview_text = tk.Text(self.preview_box, height=10, wrap="word", state="disabled", font=("Georgia", 11))
+        self.preview_text.pack(fill="both", expand=True)
+        self.preview_text.tag_configure("bold", font=("Georgia", 11, "bold"))
+        self.preview_text.tag_configure("italic", font=("Georgia", 11, "italic"))
+        self.preview_text.tag_configure("bolditalic", font=("Georgia", 11, "bold italic"))
+        self.preview_text.tag_configure("underline", underline=True)
+        self.preview_text.tag_configure("strike", overstrike=True)
+        self.preview_text.tag_configure("placeholder", foreground="#767676", font=("Georgia", 10, "italic"))
 
         run_box = ttk.LabelFrame(outer, text="5. Rekonstrukcija", padding=12)
         run_box.pack(fill="both", expand=True, pady=(12, 0))
@@ -358,29 +392,39 @@ class WordReplicaDesktop:
         if interactive:
             if not self.interactive_box.winfo_ismapped():
                 self.interactive_box.pack(fill="x", pady=(12, 0), before=self.renderer_combo.master)
-            self.renderer_var.set("Microsoft Word")
-            self.visibility_var.set("Vidljivo")
-            self.renderer_combo.configure(state="disabled")
-            self.visibility_combo.configure(state="disabled")
+            if self.renderer_var.get() not in ("Microsoft Word", "Pure DOCX"):
+                self.renderer_var.set("Microsoft Word")
+            self.renderer_combo.configure(state="readonly", values=("Microsoft Word", "Pure DOCX"))
             self.overwrite_var.set(False)
             self.overwrite_check.configure(state="disabled")
         else:
             if self.interactive_box.winfo_ismapped():
                 self.interactive_box.pack_forget()
-            self.renderer_combo.configure(state="readonly")
+            self.renderer_combo.configure(state="readonly", values=("Automatski", "Microsoft Word", "Pure DOCX"))
             self.overwrite_check.configure(state="normal")
-            self._sync_visibility_state()
+        self._sync_visibility_state()
         self._sync_speed_state()
 
     def _sync_visibility_state(self) -> None:
         if self.mode_var.get() == "Interactive Reconstruction":
-            self.visibility_var.set("Vidljivo")
+            if self.renderer_var.get() == "Pure DOCX":
+                self.visibility_var.set("U pozadini")
+            else:
+                self.visibility_var.set("Vidljivo")
             self.visibility_combo.configure(state="disabled")
         elif self.renderer_var.get() == "Pure DOCX":
             self.visibility_var.set("U pozadini")
             self.visibility_combo.configure(state="disabled")
         else:
             self.visibility_combo.configure(state="readonly")
+        if self._is_pure_docx_preview():
+            if not self.preview_box.winfo_ismapped():
+                self.preview_box.pack(fill="both", pady=(12, 0), before=self.log.master)
+        elif self.preview_box.winfo_ismapped():
+            self.preview_box.pack_forget()
+
+    def _is_pure_docx_preview(self) -> bool:
+        return self.mode_var.get() == "Interactive Reconstruction" and self.renderer_var.get() == "Pure DOCX"
 
     def _sync_metadata_state(self) -> None:
         preserve = self.metadata_var.get() == "Sačuvaj legitimne"
@@ -416,6 +460,7 @@ class WordReplicaDesktop:
         self.state.interactive_speed_mode = {"Slow":"slow", "Fast":"fast", "Custom":"custom", "Maximum":"maximum"}[self.speed_var.get()]
         self.state.interactive_characters_per_second = float(self.custom_speed_var.get())
         self.state.interactive_object_step_delay_ms = int(self.object_delay_var.get())
+        self.state.interactive_letter_by_letter = bool(self.letter_by_letter_var.get())
         self.state.interactive_fidelity = "maximum" if self.interactive_fidelity_var.get() == "Maximum Fidelity" else "standard"
         self.state.checkpoint_after_tables = bool(self.cp_tables_var.get())
         self.state.checkpoint_after_images = bool(self.cp_images_var.get())
@@ -469,15 +514,23 @@ class WordReplicaDesktop:
         self.semantic_var.set("")
         self.verification_var.set("Verifikacija: čeka")
         source = Path(self.state.source_path)
+        preview_only = is_pure_docx_preview_state(self.state)
         options = options_from_desktop_state(self.state)
         self._interactive_control = None
-        if options.reconstruction_mode is ReconstructionMode.INTERACTIVE:
+        if options.reconstruction_mode is ReconstructionMode.INTERACTIVE or preview_only:
             from word_replica.interactive.control import InteractiveRunControl
             self._interactive_control = InteractiveRunControl()
             self._interactive_control.set_speed(options.interactive.speed_mode, options.interactive.characters_per_second)
-        self._set_running(True, interactive=options.reconstruction_mode is ReconstructionMode.INTERACTIVE)
-        self._append_log(f"Pokrenuta {options.reconstruction_mode.value} rekonstrukcija.")
-        threading.Thread(target=self._worker, args=(source, options), daemon=True).start()
+        self._set_running(True, interactive=options.reconstruction_mode is ReconstructionMode.INTERACTIVE or preview_only)
+        if preview_only:
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(12)
+            self._reset_preview()
+            self._append_log("Pokrenut live pregled (Pure DOCX, bez Worda).")
+            threading.Thread(target=self._preview_worker, args=(source, options), daemon=True).start()
+        else:
+            self._append_log(f"Pokrenuta {options.reconstruction_mode.value} rekonstrukcija.")
+            threading.Thread(target=self._worker, args=(source, options), daemon=True).start()
 
     def _worker(self, source: Path, options: RebuildOptions) -> None:
         try:
@@ -487,6 +540,29 @@ class WordReplicaDesktop:
                 interactive_control=self._interactive_control,
                 interactive_observer=self._interactive_observer if options.reconstruction_mode is ReconstructionMode.INTERACTIVE else None,
             )
+            self._events.put(("result", result))
+        except Exception as exc:
+            self._events.put(("error", f"{type(exc).__name__}: {exc}"))
+
+    def _reset_preview(self) -> None:
+        self.preview_text.configure(state="normal")
+        self.preview_text.delete("1.0", "end")
+        self.preview_text.configure(state="disabled")
+
+    def _preview_sink(self, kind: str, payload: dict) -> None:
+        self._events.put(("preview", (kind, payload)))
+
+    def _preview_worker(self, source: Path, options: RebuildOptions) -> None:
+        from word_replica.interactive.blueprint import compile_blueprint_from_source
+        from word_replica.interactive.text_preview import TextPreviewPlayer
+        try:
+            blueprint = compile_blueprint_from_source(
+                source, enable_table_fast_path=options.interactive.enable_table_fast_path
+            )
+            player = TextPreviewPlayer(options.interactive, self._preview_sink)
+            outcome = player.play(blueprint, self._interactive_control)
+            self._events.put(("preview_done", outcome.status))
+            result = self.service.rebuild(source, options)
             self._events.put(("result", result))
         except Exception as exc:
             self._events.put(("error", f"{type(exc).__name__}: {exc}"))
@@ -518,9 +594,40 @@ class WordReplicaDesktop:
                 elif kind == "warning": self._append_log(f"UPOZORENJE: {payload}")
                 elif kind == "checkpoint": self._append_log(f"Checkpoint: {payload}")
                 elif kind == "verification": self.verification_var.set(f"Verifikacija: {payload}")
+                elif kind == "preview": self._handle_preview(*payload)
+                elif kind == "preview_done": self._handle_preview_done(str(payload))
         except queue.Empty:
             pass
         self.root.after(self.POLL_MS, self._poll_events)
+
+    def _handle_preview(self, kind: str, payload: dict) -> None:
+        self.preview_text.configure(state="normal")
+        if kind == "text":
+            tags = []
+            if payload.get("bold") and payload.get("italic"):
+                tags.append("bolditalic")
+            elif payload.get("bold"):
+                tags.append("bold")
+            elif payload.get("italic"):
+                tags.append("italic")
+            if payload.get("underline"):
+                tags.append("underline")
+            if payload.get("strike"):
+                tags.append("strike")
+            self.preview_text.insert("end", str(payload.get("text", "")), tuple(tags))
+        elif kind == "newline":
+            self.preview_text.insert("end", "\n")
+        elif kind == "pagebreak":
+            self.preview_text.insert("end", "\n— — —\n")
+        elif kind == "sectionbreak":
+            self.preview_text.insert("end", "\n═══════════\n")
+        elif kind == "placeholder":
+            self.preview_text.insert("end", str(payload.get("label", "")) + " ", ("placeholder",))
+        self.preview_text.see("end")
+        self.preview_text.configure(state="disabled")
+
+    def _handle_preview_done(self, status: str) -> None:
+        self._append_log(f"Live pregled završen: {status}. Snimam stvarni Pure DOCX fajl…")
 
     def _handle_preflight(self, report) -> None:
         if report.can_proceed:

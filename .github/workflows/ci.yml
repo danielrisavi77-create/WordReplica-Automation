@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [automation-dev, main]
+  push:
+    branches: [automation-dev, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: word-replica-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  non-word:
+    name: Non-Word / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+          python -m pip check
+
+      - name: Compile
+        run: python -m compileall -q src tests scripts
+
+      - name: Parse PowerShell scripts
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $failed = $false
+          Get-ChildItem -Path . -Recurse -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              Write-Host "PowerShell parse failed: $($_.FullName)"
+              Write-Host "::error file=$($_.FullName)::PowerShell parse failed"
+              $errors | ForEach-Object { Write-Host $_.Message }
+            }
+          }
+          if ($failed) { throw "One or more PowerShell scripts failed to parse." }
+
+      - name: Test without Microsoft Word
+        run: python -m pytest -q -m "not word"

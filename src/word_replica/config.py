@@ -15,6 +15,7 @@ class InteractiveOptions:
     speed_mode: InteractiveSpeedMode = InteractiveSpeedMode.FAST
     characters_per_second: float = 25.0
     object_step_delay_ms: int = 150
+    letter_by_letter: bool = False
     fidelity: InteractiveFidelity = InteractiveFidelity.MAXIMUM
     checkpoint_after_tables: bool = True
     checkpoint_after_images: bool = True

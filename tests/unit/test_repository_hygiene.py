@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -12,3 +13,71 @@ def test_gitignore_allows_versioned_docx_test_fixtures_only():
     text = (ROOT / ".gitignore").read_text(encoding="utf-8")
     assert "*.docx" in text
     assert "!tests/fixtures/**/*.docx" in text
+
+
+def test_gitignore_excludes_local_build_and_generated_golden_artifacts():
+    local_only_paths = (
+        ".venv_appbuild/Scripts/python.exe",
+        ".venv_gate/Scripts/python.exe",
+        "src/word_replica.egg-info/PKG-INFO",
+        "_g0_dump.txt",
+        "_golden2_run.log",
+        "_p46_events.pkl",
+        "_toc_repro_rebuild/example/logs/audit.jsonl",
+        "tests/fixtures/corpus/07_headers_footers_numbers_rebuild/example/output/rebuilt.docx",
+        "tests/unit/test_interactive_word_bookmark_names.py.orig",
+    )
+
+    for relative_path in local_only_paths:
+        result = subprocess.run(
+            ["git", "check-ignore", "--no-index", "-q", relative_path],
+            cwd=ROOT,
+            check=False,
+        )
+        assert result.returncode == 0, f"local artifact is not ignored: {relative_path}"
+
+
+def test_generated_environments_and_package_metadata_are_not_tracked():
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout.decode("utf-8").split("\0")
+
+    forbidden_prefixes = (
+        ".venv/",
+        ".venv_harness/",
+        ".venv_appbuild/",
+        ".venv_gate/",
+        "build/",
+        "dist/",
+        "src/word_replica.egg-info/",
+    )
+    offenders = [
+        path
+        for path in tracked
+        if path and any(path.startswith(prefix) for prefix in forbidden_prefixes)
+    ]
+    assert offenders == [], f"generated files are tracked: {offenders[:20]}"
+
+
+def test_package_and_project_versions_match():
+    import tomllib
+    from word_replica import __version__
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert project["project"]["version"] == __version__
+
+
+def test_release_build_has_no_hard_coded_expected_engine_version():
+    script = (ROOT / "BUILD_LEKTA_REPAIR_RUNNER.ps1").read_text(encoding="utf-8")
+    assert "$expectedEngineVersion" not in script
+    assert "WordReplica version drift" in script
+    assert "from word_replica import __version__" in script
+
+
+def test_landing_does_not_claim_an_unpublished_numeric_release():
+    landing = (ROOT / "landing" / "index.html").read_text(encoding="utf-8")
+    assert ">2.0.4<" not in landing
+    assert "još nije objavljena" in landing

@@ -15,14 +15,70 @@ def test_renderer_creates_new_docx_with_document_xml(tmp_path):
         assert b"Hello" in z.read("word/document.xml")
 
 
-def test_renderer_warns_when_preserved_part_cannot_be_safely_related(tmp_path):
+def test_renderer_writes_run_font_color_size_and_language_not_only_bold_italic(tmp_path):
+    model = DocumentModel(
+        source_sha256="abc",
+        body=[Paragraph("p1", runs=[Run("r1", text="Naslov", properties={
+            "font_ascii": "Times New Roman",
+            "font_hansi": "Times New Roman",
+            "font_cs": "Times New Roman",
+            "color": "000000",
+            "size_half_points": "28",
+            "strike": True,
+            "highlight": "yellow",
+            "vert_align": "superscript",
+            "language": "en-US",
+            "language_east_asia": "en-US",
+            "language_bidi": "ar-SA",
+            "character_spacing": "10",
+            "character_position": "4",
+        })])],
+    )
+    output = tmp_path / "out.docx"
+    PureDocxRenderer().render(model, output, context=None)
+    with ZipFile(output) as z:
+        xml = z.read("word/document.xml").decode("utf-8")
+    assert 'w:ascii="Times New Roman"' in xml
+    assert 'w:val="000000"' in xml
+    assert '<w:sz w:val="28"/>' in xml
+    assert '<w:szCs w:val="28"/>' in xml
+    assert "<w:strike/>" in xml
+    assert 'w:highlight w:val="yellow"' in xml
+    assert 'w:vertAlign w:val="superscript"' in xml
+    assert 'w:lang w:val="en-US" w:eastAsia="en-US" w:bidi="ar-SA"' in xml
+    assert '<w:spacing w:val="10"/>' in xml
+    assert '<w:position w:val="4"/>' in xml
+
+
+def test_renderer_prefers_theme_font_over_literal_name_when_both_present(tmp_path):
+    model = DocumentModel(
+        source_sha256="abc",
+        body=[Paragraph("p1", runs=[Run("r1", text="x", properties={
+            "font_ascii_theme": "majorHAnsi",
+        })])],
+    )
+    output = tmp_path / "out.docx"
+    PureDocxRenderer().render(model, output, context=None)
+    with ZipFile(output) as z:
+        xml = z.read("word/document.xml").decode("utf-8")
+    assert 'w:asciiTheme="majorHAnsi"' in xml
+
+
+def test_renderer_warns_when_a_preserved_part_ends_up_unreferenced(tmp_path):
+    """Successor to the transfer-refused warning.
+
+    A body-referenced part is now restored rather than dropped, because the
+    fragment that refers to it survives verbatim. This model has the part and
+    no fragment, so nothing points at it -- which is the case still worth
+    reporting: the bytes ship while nothing displays them.
+    """
     model = DocumentModel(source_sha256="abc")
     model.preserved_parts["word/embeddings/object.bin"] = PreservedPart(
         "word/embeddings/object.bin", "application/octet-stream", None, "deadbeef", b"x"
     )
     output = tmp_path / "out.docx"
     result = PureDocxRenderer().render(model, output, context=None)
-    assert [warning.code for warning in result.warnings] == ["UNSUPPORTED_TRANSFER_PART"]
+    assert [warning.code for warning in result.warnings] == ["PURE_DOCX_ASSET_UNREFERENCED"]
 
 
 def test_renderer_roundtrips_headers_footers_and_notes(tmp_path):
@@ -44,6 +100,23 @@ def test_renderer_roundtrips_headers_footers_and_notes(tmp_path):
     assert text_map(actual.endnotes) == text_map(expected.endnotes)
 
 
+def test_footer_field_is_not_duplicated_into_document_body(tmp_path):
+    from tests.fixtures.build_fixtures import build_headers_footers_numbers
+    from word_replica.parser.parser import DocxParser
+
+    source = build_headers_footers_numbers(tmp_path / "source.docx")
+    model = DocxParser().parse(source)
+    output = tmp_path / "rebuilt.docx"
+
+    PureDocxRenderer().render(model, output, context=None)
+
+    with ZipFile(output) as archive:
+        document_xml = archive.read("word/document.xml")
+        footer_xml = archive.read("word/footer1.xml")
+    assert b"instrText" not in document_xml
+    assert footer_xml.count(b"instrText") == 2
+
+
 def test_fresh_shell_uses_current_reconstruction_timestamp(tmp_path):
     from datetime import datetime, timezone
     from word_replica.opc.package_reader import DocxPackage
@@ -62,7 +135,15 @@ def test_fresh_shell_uses_current_reconstruction_timestamp(tmp_path):
     assert props.total_editing_time == '0'
 
 
-def test_renderer_warns_when_image_bytes_exist_without_reconstructed_position(tmp_path):
+def test_renderer_warns_when_image_bytes_have_nothing_referring_to_them(tmp_path):
+    """Successor to the position-unavailable warning.
+
+    Picture positions are now reconstructed, so the old blanket warning no
+    longer describes reality. What still deserves reporting is the case this
+    test actually builds: media that arrived with the model while nothing in
+    the body refers to it. Those bytes would travel with the document as litter
+    while the picture itself is gone.
+    """
     from word_replica.domain.model import BinaryAsset
     model = DocumentModel(source_sha256='abc')
     model.assets['image-sha'] = BinaryAsset(
@@ -74,8 +155,8 @@ def test_renderer_warns_when_image_bytes_exist_without_reconstructed_position(tm
     )
     result = PureDocxRenderer().render(model, tmp_path / 'with-image.docx', context=None)
     codes = [warning.code for warning in result.warnings]
-    assert 'PURE_DOCX_ASSET_POSITION_UNAVAILABLE' in codes
-    assert any(w.affects_status for w in result.warnings if w.code == 'PURE_DOCX_ASSET_POSITION_UNAVAILABLE')
+    assert 'PURE_DOCX_ASSET_UNREFERENCED' in codes
+    assert any(w.affects_status for w in result.warnings if w.code == 'PURE_DOCX_ASSET_UNREFERENCED')
 
 
 def test_atomic_writer_closes_mkstemp_descriptor_before_unlink(monkeypatch, tmp_path):
@@ -137,6 +218,55 @@ def test_renderer_roundtrips_bookmarks_and_fields_without_adding_visible_paragra
     assert 'REF TargetBookmark' in rebuilt.fields[0].instruction
 
 
+def test_renderer_warns_that_field_codes_move_to_end_of_body(tmp_path):
+    from word_replica.domain.model import DocumentModel, Field, Paragraph, Run
+    from word_replica.renderers.pure_docx import PureDocxRenderer
+
+    model = DocumentModel('abc')
+    model.body = [Paragraph('p1', [Run('r1', 'Sadržaj')])]
+    model.fields = [Field('f1', 'TOC \\o "1-3" \\h \\z \\u', '', False)]
+    output = tmp_path / 'field-warning.docx'
+
+    result = PureDocxRenderer().render(model, output, context=None)
+    assert "PURE_DOCX_FIELD_POSITION_UNAVAILABLE" in [w.code for w in result.warnings]
+
+
+def test_renderer_keeps_field_at_its_original_paragraph_when_content_tokens_are_present(tmp_path):
+    from word_replica.domain.model import DocumentModel, Field, Paragraph, Run
+    from word_replica.renderers.pure_docx import PureDocxRenderer
+
+    model = DocumentModel('abc')
+    model.body = [
+        Paragraph('p1', [Run('r1', text='Naslov')]),
+        Paragraph('toc', [
+            Run('r2', properties={'content_tokens': [{'kind': 'field_begin'}]}),
+            Run('r3', properties={'content_tokens': [{'kind': 'field_instruction', 'value': ' TOC \\o "1-3" \\h \\z \\u '}]}),
+            Run('r4', properties={'content_tokens': [{'kind': 'field_separate'}]}),
+            Run('r5', text='1. Uvod\t1'),
+            Run('r6', properties={'content_tokens': [{'kind': 'field_end'}]}),
+        ]),
+        Paragraph('p3', [Run('r7', text='1. Uvod')]),
+        Paragraph('p4', [Run('r8', text='Zaključak')]),
+    ]
+    model.fields = [Field('f1', 'TOC \\o "1-3" \\h \\z \\u', '1. Uvod\t1', False)]
+    output = tmp_path / 'field-inline.docx'
+
+    result = PureDocxRenderer().render(model, output, context=None)
+    assert "PURE_DOCX_FIELD_POSITION_UNAVAILABLE" not in [w.code for w in result.warnings]
+
+    with ZipFile(output) as z:
+        xml = z.read('word/document.xml').decode('utf-8')
+    from lxml import etree
+    root = etree.fromstring(xml.encode('utf-8'))
+    ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+    paragraphs = root.findall('.//w:body/w:p', ns)
+    assert len(paragraphs) == 4
+    # The field markers stay in the second paragraph, not glued onto the last one.
+    assert paragraphs[1].find('.//w:fldChar', ns) is not None
+    assert paragraphs[-1].find('.//w:fldChar', ns) is None
+    assert 'Zaključak' in ''.join(t.text or '' for t in paragraphs[-1].findall('.//w:t', ns))
+
+
 def test_renderer_registers_content_type_for_installed_png_asset(tmp_path):
     from lxml import etree
     from word_replica.domain.model import BinaryAsset
@@ -167,6 +297,43 @@ def test_renderer_registers_content_type_for_installed_png_asset(tmp_path):
     assert defaults.get('png') == 'image/png' or overrides.get('word/media/image1.png') == 'image/png'
 
 
+def test_restore_part_relationship_recreates_the_missing_relationship():
+    # Regression: this called a bare `_rels_owner(...)` name that pure_docx.py
+    # never imported (it's a module-level helper in parser.py) - a NameError
+    # on every real invocation, caught only by whatever code path actually
+    # exercises this method, which nothing in the test suite did until now.
+    from word_replica.renderers.pure_docx import MutableDocxPackage
+
+    package = MutableDocxPackage({
+        "word/document.xml": b"<w:document/>",
+        "word/embeddings/oleObject1.bin": b"binary-data",
+    })
+
+    restored = package.restore_part_relationship(
+        "word/embeddings/oleObject1.bin",
+        "word/_rels/document.xml.rels",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject",
+    )
+
+    assert restored is True
+    assert b"oleObject1.bin" in package.parts["word/_rels/document.xml.rels"]
+
+
+def test_restore_part_relationship_refused_when_part_is_absent():
+    from word_replica.renderers.pure_docx import MutableDocxPackage
+
+    package = MutableDocxPackage({"word/document.xml": b"<w:document/>"})
+
+    restored = package.restore_part_relationship(
+        "word/embeddings/oleObject1.bin",
+        "word/_rels/document.xml.rels",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject",
+    )
+
+    assert restored is False
+    assert "word/_rels/document.xml.rels" not in package.parts
+
+
 def test_header_part_uses_ooxml_hdr_root_not_truncated_hea(tmp_path):
     from lxml import etree
     from word_replica.domain.model import Paragraph, Run
@@ -179,3 +346,55 @@ def test_header_part_uses_ooxml_hdr_root_not_truncated_hea(tmp_path):
     with ZipFile(output) as z:
         root = etree.fromstring(z.read("word/header1.xml"))
     assert root.tag == f"{W}hdr"
+
+
+def test_renderer_maps_each_section_to_its_referenced_footer(tmp_path):
+    """A second section must not silently inherit the first footer."""
+    from word_replica.domain.model import RelationshipRef, Section
+    from word_replica.parser.parser import DocxParser
+
+    model = DocumentModel(
+        source_sha256="abc",
+        body=[
+            Paragraph("section-boundary", properties={"section_index": 0}),
+            Paragraph("body", runs=[Run("body-run", text="Body")]),
+        ],
+        sections=[
+            Section(
+                "section-0",
+                {"footer_refs": [{"type": "default", "rel_id": "rIdFooterA"}]},
+            ),
+            Section(
+                "section-1",
+                {"footer_refs": [{"type": "default", "rel_id": "rIdFooterB"}]},
+            ),
+        ],
+        footers={
+            "word/footer-a.xml": [Paragraph("footer-a", [Run("footer-a-run", "A")])],
+            "word/footer-b.xml": [Paragraph("footer-b", [Run("footer-b-run", "B")])],
+        },
+        relationships={
+            "word/document.xml:rIdFooterA": RelationshipRef(
+                "rIdFooterA", "footer", "word/footer-a.xml"
+            ),
+            "word/document.xml:rIdFooterB": RelationshipRef(
+                "rIdFooterB", "footer", "word/footer-b.xml"
+            ),
+        },
+    )
+    output = tmp_path / "section-footers.docx"
+
+    result = PureDocxRenderer().render(model, output, context=None)
+    rebuilt = DocxParser().parse(output)
+    footer_text_by_section = []
+    for section in rebuilt.sections:
+        footer_ref = section.properties["footer_refs"][0]
+        relationship = rebuilt.relationships[
+            f"word/document.xml:{footer_ref['rel_id']}"
+        ]
+        footer_text_by_section.append(rebuilt.footers[relationship.target][0].text())
+
+    assert footer_text_by_section == ["A", "B"]
+    assert "PURE_DOCX_HEADER_FOOTER_MAPPING_APPROXIMATION" not in {
+        warning.code for warning in result.warnings
+    }

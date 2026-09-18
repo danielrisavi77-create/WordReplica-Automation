@@ -209,6 +209,37 @@ def test_repeated_paragraph_style_definition_is_configured_once():
     assert [name for name, _ in log if name == "style.ReplicaBody.font.Name"] == ["style.ReplicaBody.font.Name"]
 
 
+def test_paragraph_styles_collection_is_loaded_only_once_per_word_session():
+    from types import SimpleNamespace
+
+    style_a = SimpleNamespace(Font=SimpleNamespace(), ParagraphFormat=SimpleNamespace())
+    style_b = SimpleNamespace(Font=SimpleNamespace(), ParagraphFormat=SimpleNamespace())
+
+    class Styles:
+        def __call__(self, key):
+            return {"StyleA": style_a, "StyleB": style_b}[key]
+
+    class Document:
+        def __init__(self):
+            self.styles_lookups = 0
+
+        @property
+        def Styles(self):
+            self.styles_lookups += 1
+            if self.styles_lookups > 1:
+                raise AssertionError("document.Styles must be cached for the Word session")
+            return Styles()
+
+    document = Document()
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = document
+
+    controller._ensure_paragraph_style({"name": "StyleA"}, "StyleA")
+    controller._ensure_paragraph_style({"name": "StyleB"}, "StyleB")
+
+    assert document.styles_lookups == 1
+
+
 def test_paragraph_style_definition_applies_complex_script_font():
     from types import SimpleNamespace
 
@@ -492,10 +523,11 @@ class NativeBatchCellRange(NativeBatchFormattingRange):
 
 
 class NativeBatchTableRange:
-    def __init__(self, after_range):
+    def __init__(self, after_range, cells=()):
         self.after_range = after_range
         self.duplicates = []
         self._returned_after_range = False
+        self.Cells = list(cells)
 
     @property
     def Duplicate(self):
@@ -513,7 +545,7 @@ class NativeBatchTable(FakeTable):
         for index, cell in enumerate(self._cells.values()):
             cell.Range = NativeBatchCellRange(start=index * 2, end=index * 2 + 2)
         self.after_range = FormattingRange()
-        self.Range = NativeBatchTableRange(self.after_range)
+        self.Range = NativeBatchTableRange(self.after_range, self._cells.values())
 
 
 class NativeBatchDocument(FakeDocument):
@@ -562,6 +594,34 @@ def _native_batch_payload():
     }
 
 
+def test_set_column_width_below_word_com_minimum_is_clamped_and_recorded_for_fixup():
+    from word_replica.renderers.interactive_word import _WORD_MIN_COM_COLUMN_WIDTH_POINTS
+
+    log = []
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = FakeDocument(log)
+    controller.execute_event(ReconstructionEvent("BeginTable", "t", {"rows": 1, "columns": 2}))
+    controller.execute_event(
+        ReconstructionEvent("SetColumnWidth", "t", {"column": 1, "width_twips": 96})
+    )
+
+    assert ("column1.Width", _WORD_MIN_COM_COLUMN_WIDTH_POINTS) in log
+    assert controller._narrow_column_fixups == [(0, 1, 96)]
+
+
+def test_set_column_width_above_word_com_minimum_is_untouched():
+    log = []
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = FakeDocument(log)
+    controller.execute_event(ReconstructionEvent("BeginTable", "t", {"rows": 1, "columns": 2}))
+    controller.execute_event(
+        ReconstructionEvent("SetColumnWidth", "t", {"column": 1, "width_twips": 1440})
+    )
+
+    assert ("column1.Width", 72.0) in log
+    assert controller._narrow_column_fixups == []
+
+
 def test_native_table_batch_inserts_once_and_converts_without_tables_add():
     log = []
     root = NativeBatchRootRange(start=7)
@@ -579,6 +639,43 @@ def test_native_table_batch_inserts_once_and_converts_without_tables_add():
     ]
     assert all(record[0] != "create_table" for record in log)
     assert controller.active_range is table.after_range
+    # Table.Cell(row, column) re-resolves from the table root on every call
+    # and gets dramatically slower as the table/document grows; geometry
+    # must come from a single Range.Cells enumeration instead.
+    assert all(record[0] != "lookup" for record in log)
+
+
+def test_native_table_batch_reacquires_cell_when_enumerated_dispatch_rejects_vertical_alignment():
+    class EnumeratedCellDispatch:
+        def __init__(self, canonical):
+            object.__setattr__(self, "canonical", canonical)
+
+        def __getattr__(self, name):
+            return getattr(self.canonical, name)
+
+        def __setattr__(self, name, value):
+            if name == "VerticalAlignment":
+                raise AttributeError("Property '<unknown>.VerticalAlignment' can not be set.")
+            setattr(self.canonical, name, value)
+
+    log = []
+    root = NativeBatchRootRange(start=7)
+    table = NativeBatchTable(2, 2, log)
+    table.Range.Cells = [EnumeratedCellDispatch(cell) for cell in table._cells.values()]
+    document = NativeBatchDocument(log, table)
+    controller = InteractiveWordController.for_testing(active_range=root)
+    controller.document = document
+    payload = _native_batch_payload()
+    for cell in payload["cells"]:
+        cell["properties"]["vertical_alignment"] = "center"
+
+    controller.execute_event(ReconstructionEvent("InsertTableBatch", "t", payload))
+
+    assert [cell.VerticalAlignment for cell in table._cells.values()] == [1, 1, 1, 1]
+    assert [record for record in log if record[0] == "lookup"] == [
+        ("lookup", 1, 1), ("lookup", 1, 2),
+        ("lookup", 2, 1), ("lookup", 2, 2),
+    ]
 
 
 def test_native_table_batch_formats_exact_cell_and_run_ranges():
@@ -965,6 +1062,49 @@ def test_renderer_can_resume_from_first_uncompleted_event():
     assert outcome.last_completed_index == 2
 
 
+def test_letter_by_letter_option_replays_insert_text_as_individual_characters():
+    from word_replica.config import InteractiveOptions
+    from word_replica.interactive.control import InteractiveRunControl
+    from word_replica.renderers.interactive_word import InteractiveWordRenderer
+
+    class RecordingController:
+        def __init__(self): self.events = []
+        def execute_event(self, event): self.events.append((event.event_type, event.payload.get("character")))
+
+    controller = RecordingController()
+    renderer = InteractiveWordRenderer(controller=controller, options=InteractiveOptions(letter_by_letter=True))
+    delays = []
+    renderer.speed._sleep = lambda seconds: delays.append(seconds)
+    bp = ReconstructionBlueprint.build(source_sha256="a" * 64, source_model_fingerprint="m", events=(
+        ReconstructionEvent("InsertText", "r", {"text": "AB"}),
+    ))
+    control = InteractiveRunControl(); control.start()
+    outcome = renderer.execute_blueprint(bp, control)
+    assert controller.events == [("InsertCharacter", "A"), ("InsertCharacter", "B")]
+    assert len(delays) == 2
+    assert outcome.status == "COMPLETED"
+
+
+def test_letter_by_letter_is_off_by_default_and_keeps_one_word_call_per_run():
+    from word_replica.config import InteractiveOptions
+    from word_replica.interactive.control import InteractiveRunControl
+    from word_replica.renderers.interactive_word import InteractiveWordRenderer
+
+    class RecordingController:
+        def __init__(self): self.events = []
+        def execute_event(self, event): self.events.append((event.event_type, event.payload.get("text")))
+
+    controller = RecordingController()
+    renderer = InteractiveWordRenderer(controller=controller, options=InteractiveOptions())
+    renderer.speed._sleep = lambda seconds: None
+    bp = ReconstructionBlueprint.build(source_sha256="a" * 64, source_model_fingerprint="m", events=(
+        ReconstructionEvent("InsertText", "r", {"text": "AB"}),
+    ))
+    control = InteractiveRunControl(); control.start()
+    renderer.execute_blueprint(bp, control)
+    assert controller.events == [("InsertText", "AB")]
+
+
 def test_restore_checkpoint_state_reanchors_body_append_boundary_to_reopened_document_end():
     from types import SimpleNamespace
     calls=[]
@@ -983,6 +1123,57 @@ def test_restore_checkpoint_state_reanchors_body_append_boundary_to_reopened_doc
     assert calls == [(100,100)]
     assert controller.active_range.Start == 100
     assert controller._paragraph_started is True
+
+
+def test_restore_checkpoint_state_retries_rejected_sections_com_lookup(monkeypatch):
+    from types import SimpleNamespace
+    import word_replica.renderers.interactive_word as interactive_word_module
+
+    monkeypatch.setattr(interactive_word_module.time, "sleep", lambda _seconds: None)
+
+    class RejectedCall(RuntimeError):
+        hresult = -2147418111
+
+    section = object()
+
+    class Sections:
+        def __call__(self, index):
+            assert index == 1
+            return section
+
+    class Doc:
+        Content = SimpleNamespace(Start=0, End=2)
+
+        def __init__(self):
+            self.sections_lookups = 0
+
+        @property
+        def Sections(self):
+            self.sections_lookups += 1
+            if self.sections_lookups < 3:
+                raise RejectedCall("Call was rejected by callee.")
+            return Sections()
+
+        def Range(self, start, end):
+            return SimpleNamespace(Start=start, End=end)
+
+    document = Doc()
+    checkpoint = SimpleNamespace(
+        story="body",
+        range_start=1,
+        range_end=1,
+        paragraph_started=True,
+        table_element_id=None,
+        cell_element_id=None,
+        resume_state={"section_index": 0, "section_started": True},
+    )
+    controller = InteractiveWordController()
+    controller.document = document
+
+    controller.restore_checkpoint_state(checkpoint)
+
+    assert document.sections_lookups == 3
+    assert controller._active_section is section
 
 
 def test_restore_checkpoint_state_rehydrates_header_story_and_body_return_range():
@@ -1236,6 +1427,196 @@ def test_create_field_seeds_cached_result_and_reapplies_active_run_formatting_wi
     assert fields.created.Result.Font.Bold == 0
     assert fields.created.Result.Font.NameBi == "Cambria"
     assert controller.active_range is fields.created.Result
+
+
+def test_create_field_uses_result_properties_from_payload_over_stale_active_run_properties():
+    # Regression: the field's closing marker run (field_end) is always empty and
+    # default-formatted - its own ApplyRunProperties event fires right after the
+    # result run's, so by the time CreateField runs, _active_run_properties holds
+    # the closing marker's defaults, not the result's real formatting (e.g. a
+    # REF field's table-number result carrying its own font size). The blueprint
+    # now captures and carries the result run's own properties on the CreateField
+    # event itself; the renderer must prefer those over the stale active state.
+    from types import SimpleNamespace
+
+    class ResultRange:
+        def __init__(self):
+            self.Text = ""; self.Start = 4; self.End = 4; self.collapse = []; self.move = []
+            self.Font = SimpleNamespace(Bold=0, Size=None)
+
+        @property
+        def Duplicate(self): return self
+        def Collapse(self, direction): self.collapse.append(direction)
+        def Move(self, unit, count): self.move.append((unit, count)); return count
+
+    class Field:
+        def __init__(self): self.Result = ResultRange()
+
+    class Fields:
+        def __init__(self): self.created = None
+        def Add(self, Range, Type, Text, PreserveFormatting):
+            self.created = Field(); return self.created
+
+    fields = Fields()
+    document = SimpleNamespace(Fields=fields)
+    active = FormattingRange(); active.Start = 4; active.End = 4
+    controller = InteractiveWordController.for_testing(active_range=active)
+    controller.document = document
+    # The closing marker run's own ApplyRunProperties event - the stale state
+    # result_properties on the CreateField event must NOT fall back to.
+    controller.execute_event(ReconstructionEvent("ApplyRunProperties", "marker", {
+        "bold": False,
+    }))
+    controller.execute_event(ReconstructionEvent("CreateField", "f1", {
+        "instruction": "REF _Ref_tab1 \\h", "cached_result": "1",
+        "result_properties": {"bold": True, "size_half_points": "22"},
+    }))
+    assert fields.created.Result.Font.Bold == -1
+    assert fields.created.Result.Font.Size == 11.0
+
+
+def test_create_field_does_not_propagate_a_font_subscript_com_rejection():
+    # Regression: live run crashed the whole reconstruction with "Property
+    # '<unknown>.Subscript' can not be set" - a genuine, occasional COM
+    # rejection when setting Subscript/Superscript on a field's Result range.
+    # Every other optional font property in _apply_post_insert_run_properties
+    # is already defensively wrapped in suppress(Exception); Subscript/
+    # Superscript were the one exception. A rejection here must not abort the
+    # whole reconstruction, and properties set after it must still apply.
+    from types import SimpleNamespace
+
+    class RejectingFont:
+        def __setattr__(self, name, value):
+            if name == "Subscript":
+                raise RuntimeError("Property '<unknown>.Subscript' can not be set.")
+            object.__setattr__(self, name, value)
+
+    class ResultRange:
+        def __init__(self):
+            self.Text = ""; self.Start = 4; self.End = 4; self.collapse = []; self.move = []
+            self.Font = RejectingFont()
+
+        @property
+        def Duplicate(self): return self
+        def Collapse(self, direction): self.collapse.append(direction)
+        def Move(self, unit, count): self.move.append((unit, count)); return count
+
+    class Field:
+        def __init__(self): self.Result = ResultRange()
+
+    class Fields:
+        def __init__(self): self.created = None
+        def Add(self, Range, Type, Text, PreserveFormatting):
+            self.created = Field(); return self.created
+
+    fields = Fields()
+    document = SimpleNamespace(Fields=fields)
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = document
+
+    controller.execute_event(ReconstructionEvent("CreateField", "f1", {
+        "instruction": "PAGEREF _Toc1 \\h", "cached_result": "1",
+        "result_properties": {"vert_align": "superscript", "character_spacing": "20"},
+    }))
+
+    # A property applied after the rejected Subscript/Superscript call still
+    # goes through - the exception did not abort the rest of the function.
+    assert fields.created.Result.Font.Spacing == 1.0
+
+
+def test_create_field_does_not_propagate_a_font_bold_com_rejection():
+    # Regression: a live run crashed the whole reconstruction with "Property
+    # '<unknown>.Bold' can not be set." on a field's Result range - the same
+    # class of transient COM rejection as the Subscript case above, just a
+    # different property tripping it that run. Confirms the fix is general
+    # (every font property in the function is now suppressed), not a
+    # one-property patch for whichever property happened to fail last.
+    from types import SimpleNamespace
+
+    class RejectingFont:
+        def __setattr__(self, name, value):
+            if name == "Bold":
+                raise RuntimeError("Property '<unknown>.Bold' can not be set.")
+            object.__setattr__(self, name, value)
+
+    class ResultRange:
+        def __init__(self):
+            self.Text = ""; self.Start = 4; self.End = 4; self.collapse = []; self.move = []
+            self.Font = RejectingFont()
+
+        @property
+        def Duplicate(self): return self
+        def Collapse(self, direction): self.collapse.append(direction)
+        def Move(self, unit, count): self.move.append((unit, count)); return count
+
+    class Field:
+        def __init__(self): self.Result = ResultRange()
+
+    class Fields:
+        def __init__(self): self.created = None
+        def Add(self, Range, Type, Text, PreserveFormatting):
+            self.created = Field(); return self.created
+
+    fields = Fields()
+    document = SimpleNamespace(Fields=fields)
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = document
+
+    controller.execute_event(ReconstructionEvent("CreateField", "f1", {
+        "instruction": "REF _Ref_tab2 \\h", "cached_result": "2",
+        "result_properties": {"bold": True, "size_half_points": "22"},
+    }))
+
+    # A property applied after the rejected Bold call still goes through.
+    assert fields.created.Result.Font.Size == 11.0
+
+
+def test_create_field_locks_before_seeding_cached_result():
+    # Regression: Word recalculates position-dependent fields (e.g. PAGE) the next
+    # time it repaginates, which happens automatically and repeatedly while the
+    # rest of the document is still being built - permanently overwriting the
+    # source cached result. Confirmed live: setting Locked AFTER Result.Text is
+    # already too late (the field silently recalculates the moment Locked is
+    # touched); Locked must be set first.
+    from types import SimpleNamespace
+
+    class ResultRange:
+        def __init__(self):
+            self.Text = ""
+        @property
+        def Duplicate(self): return self
+        def Collapse(self, direction): pass
+        def Move(self, unit, count): return count
+
+    class Field:
+        def __init__(self):
+            self.calls = []
+            self.Result = ResultRange()
+
+        def __setattr__(self, name, value):
+            if name == "Locked":
+                self.__dict__.setdefault("calls", []).append("Locked")
+            self.__dict__[name] = value
+
+    class Fields:
+        def __init__(self): self.created = None
+        def Add(self, Range, Type, Text, PreserveFormatting):
+            self.created = Field()
+            return self.created
+
+    fields = Fields()
+    document = SimpleNamespace(Fields=fields)
+    controller = InteractiveWordController.for_testing(active_range=FormattingRange())
+    controller.document = document
+
+    controller.execute_event(ReconstructionEvent("CreateField", "f1", {
+        "instruction": "PAGE", "cached_result": "63",
+    }))
+
+    assert fields.created.calls == ["Locked"]
+    assert fields.created.Locked is True
+    assert fields.created.Result.Text == "63"
+
 
 class CallableComRange(FakeWordRange):
     """Mimics pywin32 COM dispatch: Range.Duplicate is itself callable via a default property."""
@@ -1601,6 +1982,31 @@ def test_default_word2010_retry_budget_survives_more_than_thirty_second_busy_bur
     assert attempts["count"] == 302
 
 
+def test_table_batch_uses_short_retry_budget_before_checkpoint_recovery(monkeypatch):
+    from word_replica.renderers import interactive_word as module
+
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    attempts = {"count": 0}
+
+    class RejectedTableController(InteractiveWordController):
+        def _execute_table_batch(self, event, metrics):
+            def operation():
+                attempts["count"] += 1
+                raise RejectedCall("Word table formatting stayed busy")
+
+            module._retry_rejected_com_call(operation)
+
+    controller = RejectedTableController()
+    with pytest.raises(RejectedCall, match="stayed busy"):
+        controller.execute_event(ReconstructionEvent(
+            "InsertTableBatch",
+            "large-table",
+            {"rows": 37, "columns": 4, "cells": []},
+        ))
+
+    assert attempts["count"] == 100
+
+
 def test_visible_word_is_shown_only_after_blank_document_is_ready(monkeypatch):
     import sys
     from types import SimpleNamespace
@@ -1674,6 +2080,66 @@ def test_begin_first_section_retries_rejected_sections_collection_call():
     controller.execute_event(ReconstructionEvent("BeginSection", "s1", {"section_index": 0}))
     assert sections.attempts == 2
     assert controller._active_section is sections.section
+
+
+class RejectOnceSectionsAdd:
+    def __init__(self, section):
+        self.attempts = 0
+        self._section = section
+
+    def Add(self, Range, Start):
+        self.attempts += 1
+        if self.attempts == 1:
+            raise RejectedCall("Word is busy")
+        return self._section
+
+
+def test_begin_next_section_retries_rejected_sections_add_and_reanchors_active_range():
+    from types import SimpleNamespace
+
+    new_range = object()
+    section = SimpleNamespace(Range=SimpleNamespace(Start=500))
+    sections = RejectOnceSectionsAdd(section)
+    range_calls = []
+
+    def document_range(start, end):
+        range_calls.append((start, end))
+        return new_range
+
+    controller = InteractiveWordController.for_testing(active_range=FakeWordRange())
+    controller.document = SimpleNamespace(Sections=sections, Range=document_range)
+    controller._section_started = True
+
+    controller.execute_event(ReconstructionEvent("BeginSection", "s2", {"section_index": 1, "break_type": "nextPage"}))
+
+    assert sections.attempts == 2
+    assert controller._active_section is section
+    assert controller.active_range is new_range
+    assert range_calls == [(500, 500)]
+
+
+def test_begin_next_section_raises_instead_of_silently_keeping_a_stale_active_range():
+    from types import SimpleNamespace
+
+    class BrokenRange:
+        @property
+        def Start(self):
+            raise RuntimeError("Object has been deleted.")
+
+    section = SimpleNamespace(Range=BrokenRange())
+    sections = SimpleNamespace(Add=lambda Range, Start: section)
+
+    def document_range(start, end):
+        raise AssertionError("Range() must not be reached when re-anchoring fails")
+
+    stale_range = FakeWordRange()
+    controller = InteractiveWordController.for_testing(active_range=stale_range)
+    controller.document = SimpleNamespace(Sections=sections, Range=document_range)
+    controller._section_started = True
+
+    with pytest.raises(RuntimeError, match="Object has been deleted"):
+        controller.execute_event(ReconstructionEvent("BeginSection", "s2", {"section_index": 1, "break_type": "nextPage"}))
+    assert controller.active_range is stale_range
 
 class ResettableRecordingObject(RecordingObject):
     def Reset(self):

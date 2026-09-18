@@ -1,0 +1,249 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$PublicKeyPath,
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[A-Za-z0-9._-]{1,80}$')]
+    [string]$KeyId,
+
+    [Parameter(Mandatory = $true)]
+    [string]$GeneratedTrustStorePath,
+
+    [string]$RunnerPythonPath = '',
+    [string]$OutputDirectory = '',
+    [string]$SigningCertificateThumbprint = '',
+    [string]$TimestampServer = '',
+    [ValidateSet('CertificateStore', 'ArtifactSigning')]
+    [string]$SigningMode = 'CertificateStore',
+    [string]$ArtifactSigningSignToolPath = '',
+    [string]$ArtifactSigningDlibPath = '',
+    [string]$ArtifactSigningMetadataPath = '',
+    [switch]$PrepareOnly
+)
+
+$ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($RunnerPythonPath)) {
+    $automationRoot = Split-Path -Parent $PSScriptRoot
+    $RunnerPythonPath = Join-Path $automationRoot '.venv\Scripts\python.exe'
+}
+
+if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+    $OutputDirectory = Join-Path $PSScriptRoot 'dist\lekta-runner'
+}
+
+if (-not (Test-Path -LiteralPath $RunnerPythonPath -PathType Leaf)) {
+    throw 'Runner Python nije dostupan.'
+}
+
+$resolvedPublicKey = (Resolve-Path -LiteralPath $PublicKeyPath -ErrorAction Stop).Path
+$resolvedTrustStore = [IO.Path]::GetFullPath($GeneratedTrustStorePath)
+$trustStoreParent = [IO.Path]::GetDirectoryName($resolvedTrustStore)
+[void](New-Item -ItemType Directory -Force -Path $trustStoreParent)
+
+$prepareCode = @'
+from pathlib import Path
+import sys
+from word_replica.runner.trust_store import prepare_release_trust_store
+
+prepared = prepare_release_trust_store(
+    public_key_path=Path(sys.argv[1]),
+    key_id=sys.argv[2],
+    destination=Path(sys.argv[3]),
+)
+print(prepared.contract_public_key_sha256)
+'@
+
+$contractPublicKeySha256 = (& $RunnerPythonPath -c $prepareCode $resolvedPublicKey $KeyId $resolvedTrustStore).Trim().ToLowerInvariant()
+if ($LASTEXITCODE -ne 0) {
+    throw 'Priprema javnog runner trust storea nije uspjela.'
+}
+if ($contractPublicKeySha256 -notmatch '^[a-f0-9]{64}$') {
+    throw 'Otisak javnog Repair Contract kljuca nije valjan.'
+}
+
+if ($PrepareOnly) {
+    Write-Host "Prepared: $resolvedTrustStore"
+    Write-Host "Public key SHA-256: $contractPublicKeySha256"
+    exit 0
+}
+
+$sourceBranch = (& git -C $PSScriptRoot rev-parse --abbrev-ref HEAD).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw 'WordReplica source branch nije moguce procitati.'
+}
+if ($sourceBranch -ne 'automation-dev') {
+    throw 'WordReplica release build dopusten je samo s automation-dev brancha.'
+}
+
+$sourceCommit = (& git -C $PSScriptRoot rev-parse HEAD).Trim().ToLowerInvariant()
+if ($LASTEXITCODE -ne 0) {
+    throw 'WordReplica source commit nije moguce procitati.'
+}
+if ($sourceCommit -notmatch '^[a-f0-9]{40}$') {
+    throw 'WordReplica source commit nije valjan puni Git SHA.'
+}
+
+$sourceStatus = @(& git -C $PSScriptRoot status --porcelain --untracked-files=normal)
+if ($LASTEXITCODE -ne 0) {
+    throw 'WordReplica source tree status nije moguce procitati.'
+}
+if ($sourceStatus.Count -ne 0) {
+    throw 'WordReplica source tree mora biti cist prije release builda.'
+}
+
+$engineVersionCode = @'
+from pathlib import Path
+import sys
+import tomllib
+project = tomllib.loads((Path(sys.argv[1]) / "pyproject.toml").read_text(encoding="utf-8"))
+print(project["project"]["version"])
+'@
+$engineVersion = (& $RunnerPythonPath -c $engineVersionCode $PSScriptRoot).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw 'WordReplica engine version nije moguce procitati.'
+}
+$packageVersionCode = @'
+from word_replica import __version__
+print(__version__)
+'@
+$packageVersion = (& $RunnerPythonPath -c $packageVersionCode).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw 'WordReplica package version nije moguce procitati.'
+}
+if ($engineVersion -ne $packageVersion) {
+    throw "WordReplica version drift: pyproject=$engineVersion package=$packageVersion"
+}
+
+if ([string]::IsNullOrWhiteSpace($TimestampServer)) {
+    throw 'TimestampServer je obvezan za release build.'
+}
+
+$useArtifactSigning = $SigningMode -eq 'ArtifactSigning'
+$normalizedThumbprint = ''
+$signingCertificate = $null
+if ($useArtifactSigning) {
+    foreach ($requiredPath in @($ArtifactSigningSignToolPath, $ArtifactSigningDlibPath, $ArtifactSigningMetadataPath)) {
+        if ([string]::IsNullOrWhiteSpace($requiredPath) -or -not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+            throw 'Artifact Signing zahtijeva postojeci SignTool, Azure.CodeSigning.Dlib.dll i metadata.json.'
+        }
+    }
+    # Artifact Signing poziva Azure.CodeSigning.Dlib.dll kroz SignTool; privatni kljuc ostaje u servisu.
+} else {
+    if ([string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)) {
+        throw 'SigningCertificateThumbprint je obvezan za release build.'
+    }
+    $normalizedThumbprint = $SigningCertificateThumbprint.Replace(' ', '').ToUpperInvariant()
+    $certificatePath = "Cert:\CurrentUser\My\$normalizedThumbprint"
+    $signingCertificate = Get-Item -LiteralPath $certificatePath -ErrorAction Stop
+    if (-not $signingCertificate.HasPrivateKey) {
+        throw 'Signing certifikat nema privatni kljuc.'
+    }
+}
+
+& $RunnerPythonPath -m pytest -q `
+    tests/unit/test_lekta_one_shot_runner.py `
+    tests/unit/test_lekta_one_shot_status_reporting.py `
+    tests/unit/test_lekta_portable_entry.py `
+    tests/unit/test_lekta_runner_claim.py `
+    tests/unit/test_lekta_runner_http.py `
+    tests/unit/test_lekta_runner_review_regressions.py `
+    tests/unit/test_lekta_runner_status.py `
+    tests/unit/test_lekta_runner_trust_store.py `
+    tests/unit/test_lekta_secure_retry_store.py `
+    tests/unit/test_lekta_word_preflight.py `
+    tests/unit/test_repair_package_service.py
+if ($LASTEXITCODE -ne 0) {
+    throw 'Lekta runner regresijski gate nije prosao.'
+}
+
+$resolvedOutput = [IO.Path]::GetFullPath($OutputDirectory)
+$buildRoot = Join-Path $PSScriptRoot 'build\lekta-runner'
+$trustData = "$resolvedTrustStore;word_replica/runner"
+$fixerIdsPath = Join-Path $PSScriptRoot 'src\word_replica\repair_contract\fixer_ids.json'
+if (-not (Test-Path -LiteralPath $fixerIdsPath -PathType Leaf)) {
+    throw 'fixer_ids.json nije dostupan za release build.'
+}
+$fixerIdsData = "$fixerIdsPath;word_replica/repair_contract"
+
+& $RunnerPythonPath -m PyInstaller `
+    --noconfirm `
+    --clean `
+    --onefile `
+    --windowed `
+    --name LektaRepair `
+    --paths (Join-Path $PSScriptRoot 'src') `
+    --add-data $trustData `
+    --add-data $fixerIdsData `
+    --distpath $resolvedOutput `
+    --workpath (Join-Path $buildRoot 'work') `
+    --specpath (Join-Path $buildRoot 'spec') `
+    (Join-Path $PSScriptRoot 'scripts\lekta_repair_runner_entry.py')
+if ($LASTEXITCODE -ne 0) {
+    throw 'Lekta runner PyInstaller build nije uspio.'
+}
+
+$runnerPath = Join-Path $resolvedOutput 'LektaRepair.exe'
+if (-not (Test-Path -LiteralPath $runnerPath -PathType Leaf)) {
+    throw 'LektaRepair.exe nije proizveden.'
+}
+
+$selfTest = Start-Process -FilePath $runnerPath `
+    -ArgumentList @('--self-test', $KeyId) -Wait -PassThru -WindowStyle Hidden
+if ($selfTest.ExitCode -ne 0) {
+    throw 'LektaRepair.exe se nije mogao pokrenuti s ugradenim contract kljucem.'
+}
+
+if ($useArtifactSigning) {
+    $signToolArguments = @(
+        'sign', '/v', '/debug', '/fd', 'SHA256', '/tr', $TimestampServer, '/td', 'SHA256',
+        '/dlib', $ArtifactSigningDlibPath, '/dmdf', $ArtifactSigningMetadataPath, $runnerPath
+    )
+    & $ArtifactSigningSignToolPath @signToolArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Artifact Signing nije potpisao LektaRepair.exe.'
+    }
+} else {
+    $signature = Set-AuthenticodeSignature -FilePath $runnerPath -Certificate $signingCertificate `
+        -HashAlgorithm SHA256 -TimestampServer $TimestampServer
+    if ($signature.Status -ne 'Valid') {
+        throw "Signature status nije Valid: $($signature.Status) $($signature.StatusMessage)"
+    }
+}
+
+$verifiedSignature = Get-AuthenticodeSignature -FilePath $runnerPath
+if ($verifiedSignature.Status -ne 'Valid') {
+    throw "Signature status nije Valid nakon ponovne provjere: $($verifiedSignature.Status)"
+}
+if ($useArtifactSigning) {
+    $normalizedThumbprint = ([string]$verifiedSignature.SignerCertificate.Thumbprint).Replace(' ', '').ToUpperInvariant()
+}
+if ($normalizedThumbprint -notmatch '^[A-F0-9]{40}$') {
+    throw 'Potpisani runner nema valjan publisher thumbprint.'
+}
+
+
+$runnerFile = Get-Item -LiteralPath $runnerPath
+$artifactHash = (Get-FileHash -LiteralPath $runnerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$manifestPath = Join-Path $resolvedOutput 'lekta-repair-runner-manifest.json'
+$temporaryManifestPath = "$manifestPath.tmp"
+$manifest = [ordered]@{
+    schemaVersion = 2
+    fileName = $runnerFile.Name
+    sha256 = $artifactHash
+    sizeBytes = $runnerFile.Length
+    contractKeyId = $KeyId
+    contractPublicKeySha256 = $contractPublicKeySha256
+    signingCertificateThumbprint = $normalizedThumbprint
+    timestampServer = $TimestampServer
+    engineVersion = $engineVersion
+    sourceCommit = $sourceCommit
+    sourceBranch = $sourceBranch
+    sourceTreeClean = $true
+}
+$manifest | ConvertTo-Json | Set-Content -LiteralPath $temporaryManifestPath -Encoding utf8
+Move-Item -LiteralPath $temporaryManifestPath -Destination $manifestPath -Force
+
+Write-Host "Built and signed: $runnerPath"
+Write-Host "Manifest: $manifestPath"

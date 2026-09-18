@@ -11,8 +11,20 @@ def test_child_serializes_run_result_and_normalizes_com_failure(tmp_path):
     result=RunResult(RunStatus.FAIL, None, None, project_id="p1", reasons=["Call was rejected by callee."])
     payload=serialize_run_result("x.docx","interactive_maximum",result,1.5)
     assert classify_run_result(payload) is HarnessStatus.COM_FAIL
-    assert payload["project_id"] == "p1"
     assert payload["elapsed_seconds"] == 1.5
+    assert payload["project_id"] == "p1"
+
+
+def test_child_classifies_rpc_call_failed_as_resumable_com_failure():
+    result = RunResult(
+        RunStatus.FAIL,
+        None,
+        None,
+        project_id="p1",
+        reasons=["(-2147023170, 'The remote procedure call failed.', None, None)"],
+    )
+    payload = serialize_run_result("x.docx", "interactive_maximum", result, 1.5)
+    assert classify_run_result(payload) is HarnessStatus.COM_FAIL
 
 
 def test_expected_block_is_detectable_from_static_preflight():

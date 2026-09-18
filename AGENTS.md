@@ -42,6 +42,15 @@ Do not commit failed hypotheses.
 - GitHub is version control/backup, not the normal diagnostic artifact store.
 - Local retention keeps the latest successful run, latest two failed runs, and any explicitly pinned baseline.
 
+## Multiple Golden documents
+The pipeline can run against more than one pinned Golden document (`CodexAutomationConfig.golden_documents`: Golden #1 from `golden_filename`, plus any `additional_golden_filenames`, each addressable as `golden_2`, `golden_3`, ... by position). This exists to broaden regression coverage beyond the single Golden #1 document, not to change what gates promotion.
+
+- Golden #1 (`golden_1`) is the only document whose `automation_decision.promotion_ready` gates promotion to `main`. Every `golden_report.json` carries `gates_main_promotion: true|false` so this never has to be inferred from the id string.
+- Additional golden documents are a regression-only layer: an unexplained regression on any of them still triggers the stop-immediately rule below, but reaching FULL PASS x2 on them does not by itself make a commit promotable.
+- Each golden document has its own state file (`state/automation_state_<golden_id>.json`) and its own diagnostics retention (`diagnostics/<golden_id>/`), so gate history and retention on one document never interacts with another.
+- Run a specific document with `RUN_GOLDEN_CODEX.ps1 -Golden <golden_id>` (default `golden_1`); see `scripts/codex_automation/cli.py --golden`.
+- Add a document by dropping the `.docx` into `golden/` and listing its filename in `additional_golden_filenames` in `codex_automation.json` — never by editing Golden #1's file or its promotion semantics.
+
 ## Golden #1 gates
 - G0 Content
 - G1 Structure

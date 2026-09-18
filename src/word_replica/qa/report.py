@@ -16,6 +16,7 @@ table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:.35rem .55rem
 {% if source_sha256 %}<p>Source SHA-256: <code>{{ source_sha256 }}</code></p>{% endif %}
 {% if output_sha256 %}<p>Output SHA-256: <code>{{ output_sha256 }}</code></p>{% endif %}
 {% if renderer or fidelity or metadata %}<p>Renderer: {{ renderer or '-' }} | Fidelity: {{ fidelity or '-' }} | Metadata: {{ metadata or '-' }}</p>{% endif %}
+{% if environment %}<h2>Environment</h2><pre>{{ environment | tojson(indent=2) }}</pre>{% endif %}
 <h2>Actual saves ({{ saves|length }})</h2><ol>{% for save in saves %}<li>#{{ value(save, 'sequence') }} — {{ value(save, 'reason') }} — {{ value(save, 'timestamp_local') }}</li>{% endfor %}</ol>
 <h2>QA</h2>{% for level, result in levels.items() %}<section><h3>{{ level }} — {{ 'PASS' if value(result, 'passed') else 'DIFF' }}</h3>{% for f in value(result, 'findings', []) %}<div class='finding'>{{ value(f, 'code', 'FINDING') }} @ {{ value(f, 'path', '-') }}</div>{% endfor %}</section>{% endfor %}
 <h2>L4 visual comparison</h2>{% if render_result %}<p>{{ 'Within tolerance' if value(render_result, 'within_tolerance') else 'Outside tolerance' }}; pages {{ value(render_result, 'source_page_count', 0) }}/{{ value(render_result, 'rebuilt_page_count', 0) }}.</p>{% else %}<p>Not verified in this run.</p>{% endif %}
@@ -44,6 +45,7 @@ def write_qa_report(path: Path, **context: Any) -> Path:
         "levels": {},
         "warnings": [],
         "render_result": None,
+        "environment": None,
     }
     defaults.update(context)
     path.parent.mkdir(parents=True, exist_ok=True)

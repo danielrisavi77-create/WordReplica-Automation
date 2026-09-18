@@ -1,0 +1,92 @@
+name: Windows Word Release Gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "release/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: word-replica-real-word-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  real-word:
+    name: Real Microsoft Word gate
+    runs-on: [self-hosted, windows, word-replica]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify clean source
+        shell: powershell
+        run: |
+          if (git status --porcelain) {
+            throw "Repository is not clean before the Word release gate."
+          }
+
+      - name: Collect release identity
+        id: identity
+        shell: powershell
+        run: |
+          $sha = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          $branch = (git rev-parse --abbrev-ref HEAD).Trim()
+          $pythonVersion = (python --version 2>&1 | Out-String).Trim()
+          $wordVersion = $null
+          try {
+            $configuration = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction Stop
+            $wordVersion = [string]$configuration.VersionToReport
+          } catch {
+            $wordVersion = $null
+          }
+          "release_sha=$sha" >> $env:GITHUB_OUTPUT
+          "release_branch=$branch" >> $env:GITHUB_OUTPUT
+          "python_version=$pythonVersion" >> $env:GITHUB_OUTPUT
+          "word_version=$wordVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Run Windows + Microsoft Word gate
+        id: word_gate
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\RUN_WINDOWS_RELEASE_GATE.ps1
+
+      - name: Write release evidence
+        if: always()
+        shell: powershell
+        env:
+          RELEASE_SHA: ${{ steps.identity.outputs.release_sha }}
+          RELEASE_BRANCH: ${{ steps.identity.outputs.release_branch }}
+          PYTHON_VERSION: ${{ steps.identity.outputs.python_version }}
+          WORD_VERSION: ${{ steps.identity.outputs.word_version }}
+          WORD_GATE_OUTCOME: ${{ steps.word_gate.outcome }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          $evidenceRoot = Join-Path $PWD 'release-evidence'
+          New-Item -ItemType Directory -Force -Path $evidenceRoot | Out-Null
+          $payload = [ordered]@{
+            schemaVersion = 1
+            sourceCommit = $env:RELEASE_SHA
+            sourceBranch = $env:RELEASE_BRANCH
+            pythonVersion = $env:PYTHON_VERSION
+            wordVersion = $env:WORD_VERSION
+            wordGateOutcome = $env:WORD_GATE_OUTCOME
+            workflowRunId = $env:RUN_ID
+            workflowRunAttempt = $env:RUN_ATTEMPT
+            generatedAtUtc = [DateTime]::UtcNow.ToString('o')
+          }
+          $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $evidenceRoot 'windows-word-release-evidence.json') -Encoding utf8
+
+      - name: Upload release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-word-release-evidence-${{ github.sha }}
+          path: release-evidence/windows-word-release-evidence.json
+          if-no-files-found: error
+          retention-days: 30

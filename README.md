@@ -2,6 +2,37 @@
 
 Local `.docx` reconstruction and QA for Windows. Word Replica rebuilds a document into a new DOCX through a canonical document model, using Microsoft Word COM when available and a Pure DOCX fallback otherwise.
 
+
+## Product role
+
+Word Replica is the **local document execution and fidelity layer** of the Academic Suite. It is intentionally narrower than Lekta, Katedra, or Academic Completion:
+
+- **Lekta** decides which verified document repairs are allowed and can issue a signed Repair Contract.
+- **Word Replica** executes a verified target locally, preserves the original, and proves the output against explicit fidelity gates.
+- **Katedra** owns writing/process assistance and should not import Word/COM reconstruction logic.
+- **Academic Completion** may consume structured verification state, but should not receive raw document content from Word Replica.
+
+The core rule is: **cross-product integration happens through versioned contracts and structured status, not cross-repository imports.**
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for boundaries, release gates and integration flows.
+
+## Repository and release branches
+
+`automation-dev` is the active integration/release-candidate branch. `main` is promoted only after explicit release gates; it may therefore lag active development and must not be treated as proof that the latest engine is release-ready.
+
+Normal changes should go through a short-lived branch and pull request into `automation-dev`. Renderer, fidelity, runner or packaging changes additionally require the real Windows + Microsoft Word release gate before promotion.
+
+## Product surfaces
+
+The repository contains several surfaces over the same engine:
+
+- **Core engine** — parser, canonical model, renderers, rebuild service and QA.
+- **Desktop/CLI** — local interactive use.
+- **Lekta one-shot runner** — signed local execution for a narrow Repair Contract.
+- **Fidelity Lab / Golden harness** — engineering and regression evidence, not an end-user product.
+- **Landing site** — documentation, download and integration information only; document processing remains local.
+
+
 ## Install
 
 ```powershell

@@ -315,6 +315,31 @@ def _append_field_to_paragraph(p_node, instruction: str, result: str) -> None:
     r = etree.SubElement(p_node, f"{{{_W_NS}}}r"); fld = etree.SubElement(r, f"{{{_W_NS}}}fldChar"); fld.set(f"{{{_W_NS}}}fldCharType", "end")
 
 
+def _append_simple_field_to_paragraph(p_node, instruction: str, result: str) -> None:
+    fld_simple = etree.SubElement(p_node, f"{{{_W_NS}}}fldSimple")
+    fld_simple.set(f"{{{_W_NS}}}instr", instruction)
+    r = etree.SubElement(fld_simple, f"{{{_W_NS}}}r")
+    t = etree.SubElement(r, f"{{{_W_NS}}}t")
+    t.text = result
+
+
+def build_field_simple_form(path: Path) -> Path:
+    # fldSimple is OOXML's alternate, non-nesting shorthand for a field -
+    # equivalent to the fldChar-begin/instrText/fldChar-separate/.../fldChar-
+    # end sequence _append_field_to_paragraph builds, just spelled as one
+    # wrapping element with the instruction on an attribute. Word chooses
+    # freely between the two forms when it saves (confirmed live: a field
+    # this renderer creates via Fields.Add comes back from SaveAs2 as
+    # fldSimple even though source used the complex form), so the parser
+    # must recognize both.
+    doc = Document(); doc.add_paragraph("Table number: "); doc.save(path)
+    def mutate(members):
+        root = etree.fromstring(members["word/document.xml"]); p = root.xpath("//w:p", namespaces={"w": _W_NS})[0]
+        _append_simple_field_to_paragraph(p, "REF _Ref_tab1 \\h", "1")
+        members["word/document.xml"] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
+    _atomic_patch(path, mutate); return path
+
+
 def build_headers_footers_numbers(path: Path) -> Path:
     doc = Document(); doc.add_paragraph("Body with header/footer")
     sec = doc.sections[0]; sec.header.paragraphs[0].text = "Institution Header"; sec.footer.paragraphs[0].text = "Page "
@@ -444,6 +469,39 @@ def build_academic_supported(path: Path) -> Path:
     return path
 
 
+def build_academic_citations(path: Path) -> Path:
+    doc = Document()
+    doc.add_heading("Contents", 1)
+    doc.add_paragraph("TOC placeholder")
+    doc.add_heading("Introduction", 1)
+    doc.add_paragraph("This work builds on prior findings ")
+    doc.add_heading("Related Work", 2)
+    doc.add_paragraph("Earlier results established the baseline ")
+    doc.add_heading("Conclusion", 1)
+    doc.add_paragraph("In summary, the evidence supports the hypothesis ")
+    doc.add_heading("References", 1)
+    doc.add_paragraph("Target bibliography entry.")
+    doc.save(path)
+
+    def mutate(members):
+        root = etree.fromstring(members["word/document.xml"])
+        ps = root.xpath("//w:body/w:p", namespaces={"w": _W_NS})
+        _append_field_to_paragraph(ps[1], 'TOC \\o "1-3" \\h \\z \\u', "Introduction .... 1")
+        target = ps[-1]
+        start = etree.Element(f"{{{_W_NS}}}bookmarkStart")
+        start.set(f"{{{_W_NS}}}id", "9")
+        start.set(f"{{{_W_NS}}}name", "Ref1")
+        target.insert(0, start)
+        end = etree.SubElement(target, f"{{{_W_NS}}}bookmarkEnd")
+        end.set(f"{{{_W_NS}}}id", "9")
+        _append_field_to_paragraph(ps[3], "REF Ref1 \\h", "[1]")
+        members["word/document.xml"] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
+
+    _atomic_patch(path, mutate)
+    patch_notes(path, "Citation footnote", "Citation endnote")
+    return path
+
+
 BUILDERS = [
     ("01_plain_text.docx", build_plain_text),
     ("02_headings_styles.docx", build_headings_styles),
@@ -462,6 +520,7 @@ BUILDERS = [
     ("15_nested_table.docx", build_nested_table),
     ("16_table_shading_borders.docx", build_table_shading_borders),
     ("17_academic_supported.docx", build_academic_supported),
+    ("18_academic_citations.docx", build_academic_citations),
 ]
 
 

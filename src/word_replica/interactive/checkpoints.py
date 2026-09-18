@@ -173,19 +173,28 @@ class InteractiveCheckpointCoordinator:
         return self.checkpoint(last_completed_index, status="RUNNING", reason=reason)
 
     def checkpoint(self, last_completed_index: int, *, status: str, reason: str) -> InteractiveCheckpoint:
+        # Every renderer call here (current_state_snapshot / resume_state_snapshot) is a
+        # Word COM round-trip and can fail (RPC errors, Word crashes). They must complete
+        # BEFORE save_manager.save() below, which is the point of no return: it overwrites
+        # the output file in place and logs the new hash to save_history.jsonl. If a COM
+        # call raised after that point instead, the checkpoint file would never get
+        # written for this save, leaving it permanently behind the on-disk output (whose
+        # prior hash can never recur) and poisoning every future resume attempt.
+        raw_snapshot = self.renderer.current_state_snapshot()
+        snapshot = asdict(raw_snapshot) if is_dataclass(raw_snapshot) else dict(raw_snapshot)
+        resume_snapshot_fn = getattr(self.renderer, "resume_state_snapshot", None)
+        resume_state = dict(resume_snapshot_fn()) if callable(resume_snapshot_fn) else dict(snapshot)
+        source_sha256 = sha256_file(self.source_path)
+
         save_event = self.save_manager.save(
             reason=reason,
             stage="interactive",
             save_callable=lambda: self.renderer.save(self.output_path),
             document_path=self.output_path,
         )
-        raw_snapshot = self.renderer.current_state_snapshot()
-        snapshot = asdict(raw_snapshot) if is_dataclass(raw_snapshot) else dict(raw_snapshot)
-        resume_snapshot_fn = getattr(self.renderer, "resume_state_snapshot", None)
-        resume_state = dict(resume_snapshot_fn()) if callable(resume_snapshot_fn) else dict(snapshot)
         checkpoint = InteractiveCheckpoint.now(
             project_id=self.project_id,
-            source_sha256=sha256_file(self.source_path),
+            source_sha256=source_sha256,
             source_model_fingerprint=self.blueprint.source_model_fingerprint,
             blueprint_fingerprint=self.blueprint.fingerprint,
             blueprint_schema_version=self.blueprint.schema_version,
