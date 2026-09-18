@@ -77,16 +77,7 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($version)) {
 $sourceCommit = $null
 if (Get-Command git -ErrorAction SilentlyContinue) {
     $candidateCommit = (& git -C $PSScriptRoot rev-parse HEAD 2>$null).Trim()
-    if ($LASTEXITCODE -eq 0 -and $candidateCommit -match '^[a-fA-F0-9]{40}
-if (-not $KeepBuildEnvironment) {
-    Write-Host "Cleaning temporary build files to save disk space..."
-    Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
-    Remove-Item -Recurse -Force $venv -ErrorAction SilentlyContinue
-}
-
-Write-Host ""
-Write-Host "You can now launch: dist\WordReplica.exe" -ForegroundColor Green
-) {
+    if ($LASTEXITCODE -eq 0 -and $candidateCommit -match '^[a-fA-F0-9]{40}$') {
         $sourceCommit = $candidateCommit.ToLowerInvariant()
     }
 }
