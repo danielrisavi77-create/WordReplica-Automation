@@ -27,10 +27,17 @@ jobs:
         run: |
           test -f landing/index.html
           grep -q '<title>Word Replica</title>' landing/index.html
-          if grep -Eq '<form[^>]+(upload|file)|type=["'\'' ]file' landing/index.html; then
-            echo "Landing must remain documentation/download only; generic DOCX upload UI is not allowed." >&2
-            exit 1
-          fi
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          html = Path("landing/index.html").read_text(encoding="utf-8")
+          lowered = html.lower()
+          has_file_input = any(token in lowered for token in ('type="file"', "type='file'", 'type=file'))
+          has_upload_form = bool(re.search(r"<form\b[^>]*(?:upload|file)", lowered))
+          if has_file_input or has_upload_form:
+              raise SystemExit("Landing must remain documentation/download only; generic DOCX upload UI is not allowed.")
+          PY
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
