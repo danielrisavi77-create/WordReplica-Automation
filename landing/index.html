@@ -637,14 +637,14 @@
             <li>Administratorska prava nisu potrebna</li>
           </ul>
           <div class="download-cta">
-            <a class="btn btn-primary" aria-disabled="true" href="https://github.com/danielrisavi77-create/WordReplica-Automation/releases" target="_blank" rel="noopener" title="Verzija se priprema — pratite GitHub izdanja">Preuzmi WordReplica.exe</a>
+            <a class="btn btn-primary" id="releaseDownload" aria-disabled="true" href="https://github.com/danielrisavi77-create/WordReplica-Automation/releases" target="_blank" rel="noopener" title="Verzija se priprema — pratite GitHub izdanja">Preuzmi WordReplica.exe</a>
             <span class="cta-note">verzija se priprema — pratite GitHub izdanja za obavijest</span>
           </div>
         </div>
         <div class="release-box">
-          <div class="row"><span class="k">verzija</span><span class="v pending">još nije objavljena</span></div>
-          <div class="row"><span class="k">veličina</span><span class="v pending">u pripremi</span></div>
-          <div class="row"><span class="k">sha-256</span><span class="v pending">u pripremi</span></div>
+          <div class="row"><span class="k">verzija</span><span class="v pending" id="releaseVersion">još nije objavljena</span></div>
+          <div class="row"><span class="k">veličina</span><span class="v pending" id="releaseSize">u pripremi</span></div>
+          <div class="row"><span class="k">sha-256</span><span class="v pending" id="releaseSha">u pripremi</span></div>
           <div class="row"><span class="k">renderer</span><span class="v">word · pure-docx</span></div>
           <div class="row"><span class="k">licenca</span><span class="v">vidi repozitorij</span></div>
         </div>
@@ -664,6 +664,34 @@
 </footer>
 
 <script>
+  (function () {
+    fetch('./release.json', { cache: 'no-store' })
+      .then(function (response) { return response.ok ? response.json() : null; })
+      .then(function (release) {
+        if (!release) return;
+        if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(String(release.version || ''))) return;
+        if (!/^[a-f0-9]{64}$/.test(String(release.sha256 || ''))) return;
+        if (!/^https:\/\//.test(String(release.downloadUrl || ''))) return;
+        var version = document.getElementById('releaseVersion');
+        var size = document.getElementById('releaseSize');
+        var sha = document.getElementById('releaseSha');
+        var download = document.getElementById('releaseDownload');
+        if (version) { version.textContent = release.version; version.classList.remove('pending'); }
+        if (size && Number.isFinite(Number(release.sizeBytes))) {
+          size.textContent = (Number(release.sizeBytes) / 1048576).toFixed(1) + ' MB';
+          size.classList.remove('pending');
+        }
+        if (sha) { sha.textContent = release.sha256.slice(0, 12) + '…' + release.sha256.slice(-8); sha.title = release.sha256; sha.classList.remove('pending'); }
+        if (download) {
+          download.href = release.downloadUrl;
+          download.removeAttribute('aria-disabled');
+          download.removeAttribute('title');
+          download.textContent = 'Preuzmi WordReplica ' + release.version;
+        }
+      })
+      .catch(function () { /* No verified release metadata yet: keep fail-closed placeholder. */ });
+  })();
+
   if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches && 'IntersectionObserver' in window) {
     var io = new IntersectionObserver(function (entries) {
       entries.forEach(function (e) {
