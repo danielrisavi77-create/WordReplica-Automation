@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: word-replica-real-word-release
-  cancel-in-progress: false
+  group: word-replica-real-word-release-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   real-word:
