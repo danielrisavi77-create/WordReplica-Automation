@@ -39,3 +39,35 @@ def test_compare_pdfs_fails_tolerance_when_page_counts_differ(monkeypatch, tmp_p
     result=render.compare_pdfs(tmp_path/"source.pdf",tmp_path/"rebuilt.pdf",tmp_path/"qa")
     assert result.page_count_match is False
     assert result.within_tolerance is False
+
+
+def test_compare_pdfs_uses_golden_antialiasing_policy(monkeypatch, tmp_path):
+    from word_replica.qa import render
+
+    page = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(page)
+
+    monkeypatch.setattr(
+        render,
+        "rasterize_pdf",
+        lambda pdf, out_dir, dpi=144: [page],
+    )
+    monkeypatch.setattr(
+        render,
+        "compare_page_images",
+        lambda source, rebuilt: render.VisualMetric(
+            True,
+            0.014253,
+            0.748336,
+            (100, 100),
+            (100, 100),
+            blurred_mean_absolute_error=0.42523,
+        ),
+    )
+    monkeypatch.setattr(render, "_write_diff_image", lambda *args: None)
+
+    result = render.compare_pdfs(
+        tmp_path / "source.pdf", tmp_path / "rebuilt.pdf", tmp_path / "qa"
+    )
+
+    assert result.within_tolerance is True

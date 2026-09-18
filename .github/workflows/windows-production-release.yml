@@ -1,0 +1,117 @@
+name: Windows Production Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: word-replica-production-release
+  cancel-in-progress: false
+
+jobs:
+  signed-release:
+    name: Signed Windows release
+    runs-on: [self-hosted, windows, word-replica]
+    timeout-minutes: 120
+    environment: production-release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify release ref
+        shell: powershell
+        run: |
+          $branch = (git rev-parse --abbrev-ref HEAD).Trim()
+          if (-not $branch.StartsWith('release/')) {
+            throw "Production release is allowed only from release/**; got $branch"
+          }
+          if (git status --porcelain) {
+            throw "Production release checkout is not clean."
+          }
+
+      - name: Build, gate and sign
+        shell: powershell
+        env:
+          SIGNING_MODE: ${{ vars.WORDREPLICA_SIGNING_MODE }}
+          SIGNING_CERT_THUMBPRINT: ${{ secrets.WORDREPLICA_SIGNING_CERT_THUMBPRINT }}
+          EXPECTED_PUBLISHER_THUMBPRINT: ${{ vars.WORDREPLICA_EXPECTED_PUBLISHER_THUMBPRINT }}
+          TIMESTAMP_SERVER: ${{ vars.WORDREPLICA_TIMESTAMP_SERVER }}
+          ARTIFACT_SIGNING_SIGNTOOL: ${{ vars.WORDREPLICA_ARTIFACT_SIGNING_SIGNTOOL }}
+          ARTIFACT_SIGNING_DLIB: ${{ vars.WORDREPLICA_ARTIFACT_SIGNING_DLIB }}
+          ARTIFACT_SIGNING_METADATA: ${{ vars.WORDREPLICA_ARTIFACT_SIGNING_METADATA }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_MODE)) {
+            throw "WORDREPLICA_SIGNING_MODE is not configured."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TIMESTAMP_SERVER)) {
+            throw "WORDREPLICA_TIMESTAMP_SERVER is not configured."
+          }
+
+          $args = @(
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', '.\BUILD_WINDOWS_RELEASE.ps1',
+            '-SigningMode', $env:SIGNING_MODE,
+            '-TimestampServer', $env:TIMESTAMP_SERVER
+          )
+
+          if ($env:SIGNING_MODE -eq 'CertificateStore') {
+            if ([string]::IsNullOrWhiteSpace($env:SIGNING_CERT_THUMBPRINT)) {
+              throw "WORDREPLICA_SIGNING_CERT_THUMBPRINT is not configured."
+            }
+            $args += @('-SigningCertificateThumbprint', $env:SIGNING_CERT_THUMBPRINT)
+            if (-not [string]::IsNullOrWhiteSpace($env:EXPECTED_PUBLISHER_THUMBPRINT)) {
+              $args += @('-ExpectedPublisherThumbprint', $env:EXPECTED_PUBLISHER_THUMBPRINT)
+            }
+          } elseif ($env:SIGNING_MODE -eq 'ArtifactSigning') {
+            foreach ($value in @(
+              $env:EXPECTED_PUBLISHER_THUMBPRINT,
+              $env:ARTIFACT_SIGNING_SIGNTOOL,
+              $env:ARTIFACT_SIGNING_DLIB,
+              $env:ARTIFACT_SIGNING_METADATA
+            )) {
+              if ([string]::IsNullOrWhiteSpace($value)) {
+                throw "Artifact Signing production variables are incomplete."
+              }
+            }
+            $args += @(
+              '-ExpectedPublisherThumbprint', $env:EXPECTED_PUBLISHER_THUMBPRINT,
+              '-ArtifactSigningSignToolPath', $env:ARTIFACT_SIGNING_SIGNTOOL,
+              '-ArtifactSigningDlibPath', $env:ARTIFACT_SIGNING_DLIB,
+              '-ArtifactSigningMetadataPath', $env:ARTIFACT_SIGNING_METADATA
+            )
+          } else {
+            throw "Unsupported WORDREPLICA_SIGNING_MODE: $($env:SIGNING_MODE)"
+          }
+
+          & powershell @args
+          if ($LASTEXITCODE -ne 0) {
+            throw "Production release build/signing failed."
+          }
+
+      - name: Verify release files
+        shell: powershell
+        run: |
+          foreach ($path in @(
+            '.\dist\WordReplica.exe',
+            '.\dist\word-replica-build-manifest.json',
+            '.\dist\word-replica-release-manifest.json'
+          )) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Missing release file: $path"
+            }
+          }
+
+      - name: Upload signed release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: word-replica-signed-${{ github.sha }}
+          path: |
+            dist/WordReplica.exe
+            dist/word-replica-build-manifest.json
+            dist/word-replica-release-manifest.json
+          if-no-files-found: error
+          retention-days: 30

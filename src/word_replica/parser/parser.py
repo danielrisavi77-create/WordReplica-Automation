@@ -1,7 +1,10 @@
+from contextvars import ContextVar
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from word_replica.parser.nodes import local_name
 from word_replica.domain.errors import PackageReadError
 from word_replica.domain.model import (
     Bookmark,
@@ -15,6 +18,7 @@ from word_replica.domain.model import (
     RevisionSpan,
     Run,
     Section,
+    Table,
 )
 from word_replica.opc.package_reader import DocxPackage
 from word_replica.opc.properties import read_properties
@@ -27,17 +31,36 @@ def sha256_file_bytes(data: bytes) -> str:
     return sha256(data).hexdigest()
 
 
+def _rels_owner(rels_part: str) -> str:
+    """The part a .rels file belongs to; "" for the package root."""
+    import posixpath
+
+    directory, _, name = rels_part.rpartition("/")
+    owner_name = name[: -len(".rels")]
+    parent = posixpath.dirname(directory)  # strip the trailing "_rels"
+    return posixpath.join(parent, owner_name) if parent else owner_name
+
+
 def _parse_theme_font_scheme(theme_parts: dict[str, bytes]) -> dict[str, str]:
     if not theme_parts:
         return {}
     from lxml import etree
 
-    data = next(iter(theme_parts.values()), None)
-    if not data:
-        return {}
-    root = etree.fromstring(data)
+    # The first theme part is not necessarily the one that declares fonts: a
+    # themeOverride sorts ahead of theme1.xml and may carry no fontScheme at
+    # all. Take the first that actually has one.
     a_ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
-    scheme = root.find(".//a:fontScheme", namespaces=a_ns)
+    scheme = None
+    for data in theme_parts.values():
+        if not data:
+            continue
+        try:
+            candidate = etree.fromstring(data).find(".//a:fontScheme", namespaces=a_ns)
+        except etree.XMLSyntaxError:
+            continue
+        if candidate is not None:
+            scheme = candidate
+            break
     if scheme is None:
         return {}
 
@@ -193,7 +216,119 @@ def _compact(values: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in values.items() if value is not None}
 
 
-def parse_run(node, ids: ElementIdFactory, path: str) -> Run:
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_PRESERVABLE_INLINE = {"AlternateContent", "pict", "object"}
+_IMAGE_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+
+
+def _is_preservable_inline(child, local: str) -> bool:
+    """Inline content that must be carried verbatim rather than rebuilt.
+
+    A picture is modelled as a DrawingRef, but only its *bytes* and a few
+    measurements; the authored anchor geometry, wrapping, crop and effects live
+    only in the original XML. Rebuilding that by hand would keep whatever the
+    model happens to represent and drop the rest, so the fragment is preserved
+    and re-emitted. Shapes, VML and embedded objects are not modelled at all.
+    """
+    return local in _PRESERVABLE_INLINE
+
+
+# Which OPC part the blocks currently being parsed came from. A relationship id
+# only means something relative to the part that declares it: in a real corpus
+# document rId1 addressed word/styles.xml from the document and
+# word/media/image1.png from the comments.
+_OWNER_PART: ContextVar[str] = ContextVar("owner_part", default="word/document.xml")
+
+
+def _reference_targets(
+    package: DocxPackage | None, owner_part: str
+) -> dict[str, tuple[str, str, bool]]:
+    """Relationship id -> (target, type, is_external), for one owning part.
+
+    A relationship id is only meaningful relative to the part that declares it.
+    In a real corpus document rId1 addressed word/styles.xml from the document
+    and word/media/image1.png from the comments, so resolving an id without
+    knowing whose it is can only guess.
+    """
+    if package is None:
+        return {}
+    try:
+        relationships = package.relationships(owner_part)
+    except Exception:
+        return {}
+    # The relationship *type* travels with the target. An OLE object reached
+    # through an image relationship is not the same document: Word uses the
+    # type to decide what a reference is for.
+    #
+    # External relationships are included. They resolve to a URL rather than a
+    # part, and excluding them meant any fragment containing one -- a shape with
+    # a hyperlink on it -- had an id that resolved to nothing and was refused
+    # whole, taking the shape and its geometry with it. The refusal looked like
+    # the safety rule working.
+    resolved: dict[str, tuple[str, str, bool]] = {}
+    for rel_id, rel in relationships.items():
+        external = rel.target_mode == "External"
+        target = rel.target if external else _resolve_relative_target(owner_part, rel.target)
+        resolved[rel_id] = (target, rel.rel_type, external)
+    return resolved
+
+
+def _resolve_relative_target(owner_part: str, target: str) -> str:
+    from pathlib import PurePosixPath
+
+    if target.startswith("/"):
+        candidate = target.lstrip("/")
+    else:
+        candidate = str(PurePosixPath(owner_part).parent / target)
+    resolved: list[str] = []
+    for piece in PurePosixPath(candidate).parts:
+        if piece == "..":
+            if resolved:
+                resolved.pop()
+        elif piece not in (".", ""):
+            resolved.append(piece)
+    return "/".join(resolved)
+
+
+def _capture_inline(child, package: DocxPackage | None) -> dict:
+    """Serialize an inline fragment, resolving the parts its references address.
+
+    A fragment carrying an ``r:`` attribute cannot simply be re-emitted:
+    relationship ids are renumbered by any writer, so a stale one points at the
+    wrong part or none at all, and Word repairs such a document on open.
+
+    Where the id *can* be resolved -- the parser knows which part it addressed,
+    and the renderer owns the new package -- the target is recorded so the id
+    can be rewritten on the way out. Where it cannot, the fragment is refused;
+    a missing shape is a visible loss, a corrupted package is not.
+    """
+    from lxml import etree
+
+    known = _reference_targets(package, _OWNER_PART.get())
+    targets: dict[str, str] = {}
+    for element in child.iter():
+        if not isinstance(element.tag, str):
+            continue
+        for name, value in element.attrib.items():
+            if not name.startswith(f"{{{_R_NS}}}"):
+                continue
+            resolved = known.get(value)
+            if resolved is None:
+                return {
+                    "kind": "unsupported_inline",
+                    "reason": "fragment carries a relationship reference that cannot be resolved",
+                    "tag": local_name(child),
+                }
+            targets[value] = resolved
+    return {
+        "kind": "preserved_xml",
+        "value": etree.tostring(child, encoding="unicode"),
+        "tag": local_name(child),
+        "rel_targets": targets,
+    }
+
+
+def parse_run(node, ids: ElementIdFactory, path: str, package: DocxPackage | None = None) -> Run:
     r_pr = node.find("w:rPr", namespaces=NS)
     r_fonts = r_pr.find("w:rFonts", namespaces=NS) if r_pr is not None else None
     size = r_pr.find("w:sz", namespaces=NS) if r_pr is not None else None
@@ -230,9 +365,29 @@ def parse_run(node, ids: ElementIdFactory, path: str) -> Run:
         }
     )
     break_types: list[str] = []
+    # Run properties from outside the main namespace -- Word's own typography
+    # extensions, w14:textFill and the rest. The model does not represent them
+    # and the renderer builds a fresh w:rPr, so ignoring them meant losing them:
+    # a run that was a gradient came back flat.
+    #
+    # Only non-w: children are carried. An unmodelled w: property is a different
+    # question, because the renderer writes that namespace itself in a required
+    # order and copying elements into the middle of it is how a document starts
+    # needing repair.
+    if r_pr is not None:
+        from lxml import etree as _etree
+
+        extensions = [
+            _etree.tostring(child, encoding="unicode")
+            for child in r_pr
+            if isinstance(child.tag, str) and not child.tag.startswith(f"{{{W_NS}}}")
+        ]
+        if extensions:
+            properties["extension_run_properties"] = extensions
+
     content_tokens: list[dict[str, str]] = []
     for child in node:
-        local = child.tag.rsplit("}", 1)[-1]
+        local = local_name(child)
         if local in {"t", "delText"}:
             content_tokens.append({"kind": "text", "value": child.text or ""})
         elif local == "tab":
@@ -245,11 +400,19 @@ def parse_run(node, ids: ElementIdFactory, path: str) -> Run:
             break_types.append("line")
             content_tokens.append({"kind": "line_break"})
         elif local == "drawing":
+            # The kind stays "drawing" because the interactive executor
+            # dispatches on it and inserts the picture through Word's own
+            # object model. The verbatim fragment is added alongside, for the
+            # pure-docx renderer, which has to write the markup itself.
+            token = _capture_inline(child, package)
             blips = child.xpath(".//*[local-name()='blip']")
-            if blips:
-                relationship_id = blips[0].get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
-                if relationship_id:
-                    content_tokens.append({"kind": "drawing", "relationship_id": relationship_id})
+            relationship_id = (
+                blips[0].get(f"{{{_R_NS}}}embed") if blips else None
+            )
+            if relationship_id:
+                content_tokens.append({**token, "kind": "drawing", "relationship_id": relationship_id})
+            elif token["kind"] == "preserved_xml":
+                content_tokens.append(token)
         elif local == "footnoteReference":
             note_id = _attr(child, "id")
             if note_id is not None:
@@ -258,12 +421,20 @@ def parse_run(node, ids: ElementIdFactory, path: str) -> Run:
             note_id = _attr(child, "id")
             if note_id is not None:
                 content_tokens.append({"kind": "endnote_ref", "note_id": note_id})
+        elif local == "commentReference":
+            # Without this the comment part can be restored but nothing points
+            # at it, and a comment no reader anchors is invisible in Word.
+            comment_id = _attr(child, "id")
+            if comment_id is not None:
+                content_tokens.append({"kind": "comment_ref", "comment_id": comment_id})
         elif local == "fldChar":
             field_type = _attr(child, "fldCharType")
             if field_type in {"begin", "separate", "end"}:
                 content_tokens.append({"kind": f"field_{field_type}"})
         elif local == "instrText":
             content_tokens.append({"kind": "field_instruction", "value": child.text or ""})
+        elif _is_preservable_inline(child, local):
+            content_tokens.append(_capture_inline(child, package))
     if break_types:
         properties["break_types"] = break_types
     if content_tokens:
@@ -274,6 +445,96 @@ def parse_run(node, ids: ElementIdFactory, path: str) -> Run:
         properties=properties,
         hidden=properties.get("hidden", False) is True,
     )
+
+
+def _extract_fields(model: "DocumentModel", ids: ElementIdFactory) -> list[Field]:
+    """Bracket-match every field_begin/field_end pair carried on run content_tokens
+    (already tokenized by _parse_run for every story) into its own Field entry.
+
+    Previously this collected every //w:instrText node in word/document.xml and
+    concatenated them into a single Field - so a document with a multi-paragraph
+    TOC field containing dozens of nested PAGEREF fields ended up with model.fields
+    holding exactly one entry whose instruction was the whole lot glued together.
+    Walking each story's own paragraphs with a stack (instead of a single global
+    XPath) also lets a field's begin/end span multiple paragraphs, which single-
+    paragraph bracket matching (used by the interactive renderer, which cannot
+    replay a field it can't fully reconstruct) deliberately does not attempt.
+    """
+    fields: list[Field] = []
+    stack: list[dict[str, Any]] = []
+
+    def walk_paragraph(paragraph: Paragraph) -> None:
+        for run in paragraph.runs:
+            for token in run.properties.get("content_tokens") or ():
+                kind = token.get("kind")
+                if kind == "field_begin":
+                    stack.append({"instruction": [], "result": [], "separated": False, "run_id": run.element_id})
+                elif kind == "field_instruction":
+                    if stack:
+                        stack[-1]["instruction"].append(str(token.get("value", "")))
+                elif kind == "field_separate":
+                    if stack:
+                        stack[-1]["separated"] = True
+                elif kind == "field_end":
+                    if stack:
+                        finished = stack.pop()
+                        fields.append(Field(
+                            ids.make("field", finished["run_id"]),
+                            "".join(finished["instruction"]).strip(),
+                            "".join(finished["result"]),
+                            False,
+                        ))
+                elif stack and stack[-1]["separated"]:
+                    if kind == "text":
+                        stack[-1]["result"].append(str(token.get("value", "")))
+                    elif kind == "tab":
+                        stack[-1]["result"].append("\t")
+                    elif kind in {"line_break", "page_break"}:
+                        stack[-1]["result"].append("\n")
+
+    def walk_blocks(blocks) -> None:
+        for block in blocks:
+            if isinstance(block, Paragraph):
+                walk_paragraph(block)
+            elif isinstance(block, Table):
+                for row in block.rows:
+                    for cell in row.cells:
+                        walk_blocks(cell.blocks)
+
+    walk_blocks(model.body)
+    for blocks in model.headers.values():
+        walk_blocks(blocks)
+    for blocks in model.footers.values():
+        walk_blocks(blocks)
+    for blocks in model.footnotes.values():
+        walk_blocks(blocks)
+    for blocks in model.endnotes.values():
+        walk_blocks(blocks)
+    return fields
+
+
+def _hyperlink_properties(node, package: DocxPackage | None) -> dict[str, Any]:
+    """Where a hyperlink points, in whichever of the two ways it can.
+
+    An external link carries an r:id resolved through the owning part's
+    relationships; an internal one carries only a w:anchor naming a bookmark,
+    with no relationship at all.
+    """
+    anchor = node.get(f"{{{W_NS}}}anchor")
+    rel_id = node.get(f"{{{_R_NS}}}id")
+    target = None
+    if rel_id and package is not None:
+        try:
+            relationship = package.relationships(_OWNER_PART.get()).get(rel_id)
+        except Exception:
+            relationship = None
+        if relationship is not None:
+            target = relationship.target
+    return {
+        "target": target,
+        "anchor": anchor,
+        "tooltip": node.get(f"{{{W_NS}}}tooltip"),
+    }
 
 
 def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage | None = None) -> Paragraph:
@@ -294,7 +555,7 @@ def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage
     borders = {}
     if borders_node is not None:
         for border in borders_node:
-            local = border.tag.rsplit("}", 1)[-1]
+            local = local_name(border)
             borders[local] = _compact({"val": _attr(border, "val"), "sz": _attr(border, "sz"), "space": _attr(border, "space"), "color": _attr(border, "color")})
     shading = p_pr.find("w:shd", namespaces=NS) if p_pr is not None else None
     properties = _compact(
@@ -322,8 +583,27 @@ def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage
     runs: list[Run] = []
     inline_markers: list[dict[str, Any]] = []
     r_index = 0
+    # Content a paragraph holds beside its runs rather than inside one. An
+    # equation is the case that matters: m:oMath sits directly in w:p, matched
+    # none of the branches below, and was dropped -- and since the renderer
+    # builds the paragraph from the model, dropped meant gone.
+    #
+    # Only children outside the w: namespace are carried, the same line drawn
+    # for run properties: an unmodelled w: element is a question about the
+    # model's coverage, and copying one in beside content the renderer also
+    # writes risks emitting it twice. Each fragment records how many runs came
+    # before it, so it goes back where it was.
+    paragraph_extensions: list[dict[str, Any]] = []
+
     for child_index, child in enumerate(node):
-        local = child.tag.rsplit("}", 1)[-1]
+        local = local_name(child)
+        if isinstance(child.tag, str) and not child.tag.startswith(f"{{{W_NS}}}"):
+            from lxml import etree as _etree
+
+            paragraph_extensions.append(
+                {"after_run": r_index, "value": _etree.tostring(child, encoding="unicode")}
+            )
+            continue
         if local == "bookmarkStart":
             name = _attr(child, "name")
             if name and name != "_GoBack":
@@ -331,22 +611,67 @@ def parse_paragraph(node, ids: ElementIdFactory, path: str, package: DocxPackage
         elif local == "bookmarkEnd":
             inline_markers.append({"kind": "bookmark_end", "run_index": r_index, "bookmark_id": _attr(child, "id")})
         elif local == "r":
-            runs.append(parse_run(child, ids, f"{path}/run/{r_index}"))
+            runs.append(parse_run(child, ids, f"{path}/run/{r_index}", package))
             r_index += 1
-        elif local in {"ins", "moveTo", "fldSimple"}:
-            for nested_index, nested_run in enumerate(child.findall(".//w:r", namespaces=NS)):
-                runs.append(
-                    parse_run(
-                        nested_run,
-                        ids,
-                        f"{path}/{local}/{child_index}/run/{nested_index}",
-                    )
+        elif local in {"ins", "moveTo", "fldSimple", "hyperlink", "sdt"}:
+            # Unwrapping reaches the runs inside, which is what the model
+            # represents -- but a hyperlink is more than the words it wraps.
+            # Without recording it here the link text survives and the link
+            # does not, and G0 sees nothing wrong because the text is exactly
+            # what does survive.
+            link = _hyperlink_properties(child, package) if local == "hyperlink" else None
+            # fldSimple is OOXML's shorthand for a field that never nests
+            # another field inside it - functionally identical to the
+            # fldChar-begin/instrText/fldChar-separate/.../fldChar-end
+            # sequence _parse_run tokenizes elsewhere, just spelled as one
+            # element with its instruction on an attribute. Word chooses
+            # freely between the two forms when it saves (confirmed: a field
+            # this renderer creates via Fields.Add comes back from SaveAs2 as
+            # fldSimple even though the source authored it with fldChar) so
+            # without synthesizing the same field_begin/instruction/separate/
+            # end content_tokens here, re-parsing Word's own saved output
+            # would silently see plain text instead of a field.
+            field_instruction = _attr(child, "instr") if local == "fldSimple" else None
+            nested_runs: list[Run] = []
+            # An inline content control matched none of these, so the control
+            # and everything in it was dropped without a trace. Unwrapping is
+            # what already happens to a block-level control, whose paragraphs
+            # the renderer flattens.
+            #
+            # Only w:sdtContent is searched: w:sdtPr describes the control
+            # itself, and a placeholder caption in there is not document text.
+            search = "./w:sdtContent//w:r" if local == "sdt" else ".//w:r"
+            for nested_index, nested_run in enumerate(child.findall(search, namespaces=NS)):
+                run = parse_run(
+                    nested_run,
+                    ids,
+                    f"{path}/{local}/{child_index}/run/{nested_index}",
+                    package,
                 )
+                if link is not None:
+                    run.properties["hyperlink"] = {**link, "group": child_index}
+                nested_runs.append(run)
+                runs.append(run)
                 r_index += 1
+            if field_instruction is not None and nested_runs:
+                first_tokens = list(nested_runs[0].properties.get("content_tokens") or ())
+                nested_runs[0].properties["content_tokens"] = [
+                    {"kind": "field_begin"},
+                    {"kind": "field_instruction", "value": field_instruction},
+                    {"kind": "field_separate"},
+                    *first_tokens,
+                ]
+                last_tokens = list(nested_runs[-1].properties.get("content_tokens") or ())
+                nested_runs[-1].properties["content_tokens"] = [
+                    *last_tokens,
+                    {"kind": "field_end"},
+                ]
         # Deleted/move-from revision text is preserved as evidence but never
         # promoted into visible-final Run.text.
     if inline_markers:
         properties["inline_markers"] = inline_markers
+    if paragraph_extensions:
+        properties["paragraph_extensions"] = paragraph_extensions
     return Paragraph(
         ids.make("paragraph", path),
         runs=runs,
@@ -393,16 +718,119 @@ def parse_section(node, ids: ElementIdFactory, path: str) -> Section:
     return Section(ids.make("section", path), properties=properties)
 
 
-def parse_blocks(parent, ids: ElementIdFactory, source_path: str, package: DocxPackage) -> list[object]:
+_MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+# Parts reached from inside the document body. Capturing them lets a caller
+# report what was lost; restoring them without the body reference would only
+# produce an orphan.
+_BODY_REFERENCED_PREFIXES = ("word/charts/", "word/embeddings/", "word/diagrams/")
+
+# Document-level attachments, keyed by relationship type. Nothing else in the
+# model represents what these hold, so they survive verbatim or they are gone.
+#
+# This is an allow-list on purpose. "Anything with a document-level
+# relationship" would also match styles.xml, settings.xml, numbering.xml,
+# fontTable.xml and theme1.xml -- parts the renderer builds itself, which
+# restoring verbatim would silently overwrite.
+_RENDERER_AUTHORED_PARTS = frozenset({
+    "word/document.xml",
+    "word/styles.xml",
+    "word/numbering.xml",
+    "word/settings.xml",
+})
+_ATTACHMENT_RELATIONSHIP_TYPES = frozenset({
+    "customXml",
+    "customXmlProps",
+    "bibliography",
+    "people",
+    "commentsExtended",
+    "commentsIds",
+    "commentsExtensible",
+    "glossaryDocument",
+    "font",
+    # The renderer writes styles, numbering and settings itself, but never
+    # these. Left out, every rebuild silently ships the shell template's
+    # theme, font table and web settings instead of the source's.
+    "stylesWithEffects",
+    "webSettings",
+    "fontTable",
+    "theme",
+    # word/customizations.xml -- the key map and toolbar customisations saved
+    # with the document. A part with a relationship like any other; it was lost
+    # only because this list is a list and the type was not on it.
+    "keyMapCustomizations",
+})
+
+
+def _sidecars(package: DocxPackage, part_name: str) -> list[tuple[str, str]]:
+    """(target, rels-part) for every internal relationship an attachment owns."""
+    parent, _, name = part_name.rpartition("/")
+    rels_part = f"{parent}/_rels/{name}.rels" if parent else f"_rels/{name}.rels"
+    if rels_part not in package.parts:
+        return []
+    found: list[tuple[str, str]] = []
+    for rel in package.relationships(part_name).values():
+        if rel.target_mode == "External":
+            continue
+        target = rel.target.lstrip("/") if rel.target.startswith("/") else f"{parent}/{rel.target}"
+        found.append((target, rels_part))
+    return found
+
+
+def _resolve_document_target(target: str) -> str:
+    """Resolve a word/document.xml.rels target to a package part name."""
+    from pathlib import PurePosixPath
+
+    if target.startswith("/"):
+        candidate = target.lstrip("/")
+    else:
+        candidate = str(PurePosixPath("word", target))
+    resolved: list[str] = []
+    for piece in PurePosixPath(candidate).parts:
+        if piece == "..":
+            if resolved:
+                resolved.pop()
+        elif piece not in (".", ""):
+            resolved.append(piece)
+    return "/".join(resolved)
+
+
+def parse_blocks(parent, ids: ElementIdFactory, source_path: str, package: DocxPackage,
+                 owner_part: str | None = None) -> list[object]:
+    """Parse a story part's blocks.
+
+    ``owner_part`` names the OPC part these blocks came from. It is ambient
+    rather than threaded through every signature because it applies to a whole
+    subtree -- paragraphs, runs, table cells and their nested blocks alike --
+    and one of those levels lives in another module.
+    """
+    if owner_part is not None:
+        token = _OWNER_PART.set(owner_part)
+        try:
+            return _parse_blocks(parent, ids, source_path, package)
+        finally:
+            _OWNER_PART.reset(token)
+    return _parse_blocks(parent, ids, source_path, package)
+
+
+def _parse_blocks(parent, ids: ElementIdFactory, source_path: str, package: DocxPackage) -> list[object]:
     blocks: list[object] = []
     for index, child in enumerate(parent):
-        local = child.tag.rsplit("}", 1)[-1]
+        local = local_name(child)
         path = f"{source_path}/{index}"
         if local == "p":
             blocks.append(parse_paragraph(child, ids, path, package))
         elif local == "tbl":
             from word_replica.parser.tables import parse_table
             blocks.append(parse_table(child, ids, path, package))
+        elif local == "sdt":
+            # A content control (e.g. Word's automatic Table of Contents,
+            # a rich-text placeholder). Its paragraphs/tables live one level
+            # deeper, in sdtContent — flatten it away so that content is not
+            # silently dropped from the reconstruction.
+            content = child.find("w:sdtContent", namespaces=NS)
+            if content is not None:
+                blocks.extend(parse_blocks(content, ids, path, package))
     return blocks
 
 
@@ -524,9 +952,54 @@ class DocxParser:
             model.extras["theme_font_scheme"] = _parse_theme_font_scheme(model.theme_parts)
             model.body = parse_blocks(body, ids, "body", package)
 
-            for part in package.iter_parts("word/media/"):
+            # Sweeping word/media/ finds what nearly every document does, and
+            # media nothing points at as well. But the folder is a convention,
+            # not a rule: a part is wherever its relationship targets, and a
+            # picture kept at media/ in the package root never became an asset,
+            # so the drawing had nothing to resolve to and the picture was gone.
+            media_parts = list(package.iter_parts("word/media/"))
+            seen_media = set(media_parts)
+            for rels_part in sorted(package.parts):
+                if not rels_part.endswith(".rels"):
+                    continue
+                try:
+                    relationships = package.relationships(_rels_owner(rels_part))
+                except Exception:
+                    continue
+                for rel in relationships.values():
+                    if rel.target_mode == "External":
+                        continue
+                    if rel.rel_type.rsplit("/", 1)[-1] != "image":
+                        continue
+                    target = resolve_relationship_target(_rels_owner(rels_part) or "x", rel.target)
+                    if target in package.parts and target not in seen_media:
+                        seen_media.add(target)
+                        media_parts.append(target)
+
+            for part in media_parts:
                 asset = extract_asset(package, part)
-                model.assets.setdefault(asset.asset_id, asset)
+                # The id is the content hash, so two parts holding the same
+                # bytes claim the same one and setdefault kept only the first --
+                # the second part never reached the model and the rebuild came
+                # out a part short. In OPC a part's identity is its name, and a
+                # document storing one image under two names is not unusual.
+                #
+                # Colliding ids are disambiguated rather than the scheme being
+                # changed: DrawingRef.asset_id, the interactive preflight and
+                # the asset files written to disk all key on them, so every
+                # document without a collision keeps exactly the ids it had.
+                # iter_parts is sorted, so which part takes the bare id is
+                # stable across runs.
+                asset_id = asset.asset_id
+                suffix = 1
+                while asset_id in model.assets:
+                    if model.assets[asset_id].part_name == part:
+                        break
+                    suffix += 1
+                    asset_id = f"{asset.asset_id}_{suffix}"
+                if asset_id != asset.asset_id:
+                    asset = replace(asset, asset_id=asset_id)
+                model.assets.setdefault(asset_id, asset)
 
             _extract_body_drawings(root, package, ids, model)
 
@@ -539,10 +1012,10 @@ class DocxParser:
 
             for part in package.iter_parts("word/header"):
                 if part.endswith(".xml"):
-                    model.headers[part] = parse_blocks(package.read_xml(part), ids, f"header/{part}", package)
+                    model.headers[part] = parse_blocks(package.read_xml(part), ids, f"header/{part}", package, part)
             for part in package.iter_parts("word/footer"):
                 if part.endswith(".xml"):
-                    model.footers[part] = parse_blocks(package.read_xml(part), ids, f"footer/{part}", package)
+                    model.footers[part] = parse_blocks(package.read_xml(part), ids, f"footer/{part}", package, part)
 
             def parse_notes(part_name: str, note_tag: str, prefix: str) -> dict[str, list[object]]:
                 result: dict[str, list[object]] = {}
@@ -552,7 +1025,7 @@ class DocxParser:
                 for note in note_root.findall(f"w:{note_tag}", namespaces=NS):
                     note_id = note.get(f"{{{W_NS}}}id")
                     if note_id is not None:
-                        result[note_id] = parse_blocks(note, ids, f"{prefix}/{note_id}", package)
+                        result[note_id] = parse_blocks(note, ids, f"{prefix}/{note_id}", package, part_name)
                 return result
 
             model.footnotes = parse_notes("word/footnotes.xml", "footnote", "footnote")
@@ -563,10 +1036,106 @@ class DocxParser:
             model.extras["endnotes"] = model.endnotes
 
             tree = root.getroottree()
+
+            def _paragraph_relative_path(node) -> str:
+                # tree.getpath() positions a node among its parent's direct
+                # children - which shifts every element after a <w:sdt> content
+                # control (e.g. a TOC) whenever the control's contents get
+                # flattened to plain paragraphs (as this renderer does), even
+                # though nothing about the document's actual content changed.
+                # Anchor the path to the enclosing paragraph's position among
+                # ALL <w:p> elements in the document instead, which is stable
+                # across that flattening (confirmed: identical total <w:p>
+                # count between a source with an sdt-wrapped TOC and the
+                # rendered output without one).
+                full_path = tree.getpath(node)
+                ancestor = node
+                while ancestor is not None and local_name(ancestor) != "p":
+                    ancestor = ancestor.getparent()
+                if ancestor is None:
+                    return full_path
+                ancestor_path = tree.getpath(ancestor)
+                if not full_path.startswith(ancestor_path):
+                    return full_path
+                paragraph_index = all_paragraph_positions.get(ancestor_path)
+                if paragraph_index is None:
+                    return full_path
+                return f"//w:p[{paragraph_index}]" + full_path[len(ancestor_path):]
+
+            # lxml Element identity (id()) is not reliable for matching a node
+            # reached via getparent() back to one reached via a fresh xpath()
+            # call - key on the (stable, string) xpath instead.
+            all_paragraph_positions = {
+                tree.getpath(p): position
+                for position, p in enumerate(root.xpath("//w:p", namespaces=NS), start=1)
+            }
+            # _GoBack is Word's volatile "last edit position" mark and is not
+            # modelled, but it is still a sibling in the source. A path indexed
+            # among *all* siblings therefore says [2] for a bookmark whose
+            # rebuild can only ever write [1], and the gate reports a
+            # divergence about a bookmark the model never carried. Index among
+            # the bookmarks that are kept instead, so both sides count the same
+            # things.
+            modelled_ids = {
+                node.get(f"{{{W_NS}}}id")
+                for node in root.xpath("//w:bookmarkStart", namespaces=NS)
+                if node.get(f"{{{W_NS}}}name") not in (None, "_GoBack")
+            }
+
+            # A bookmark need not be inside a paragraph: both marks are allowed
+            # wherever block-level content is, as direct children of w:body or
+            # inside a w:sdtContent. Those had no enclosing paragraph to anchor
+            # to, so they fell back to a raw lxml path carrying no position the
+            # renderer could use, and every one was dumped into the first
+            # paragraph.
+            #
+            # The anchor is the nearest paragraph, and the side matters: a start
+            # standing before paragraph N opens the bookmark there, an end
+            # standing after paragraph N closes it there. Either way it covers
+            # the text it covered before, which is all a cross-reference sees.
+            #
+            # One walk in document order does both jobs -- it finds each mark's
+            # paragraph and fixes the order marks share one.
+            paragraph_total = len(all_paragraph_positions)
+            anchors: dict[object, int] = {}
+            grouped: dict[tuple[int, str], list[object]] = {}
+            seen_paragraphs = 0
+            for node in root.iter():
+                if not isinstance(node.tag, str):
+                    continue
+                tag = local_name(node)
+                if tag == "p":
+                    seen_paragraphs += 1
+                    continue
+                if tag not in ("bookmarkStart", "bookmarkEnd"):
+                    continue
+                if node.get(f"{{{W_NS}}}id") not in modelled_ids:
+                    continue
+                enclosing = node.getparent()
+                while enclosing is not None and local_name(enclosing) != "p":
+                    enclosing = enclosing.getparent()
+                if enclosing is not None or tag == "bookmarkEnd":
+                    target = seen_paragraphs
+                else:
+                    target = seen_paragraphs + 1
+                target = min(max(target, 1), paragraph_total) if paragraph_total else 0
+                anchors[node] = target
+                grouped.setdefault((target, tag), []).append(node)
+
+            def _anchored_path(node, tag: str) -> str:
+                target = anchors.get(node)
+                if not target:
+                    return _paragraph_relative_path(node)
+                siblings = grouped.get((target, tag), [])
+                if len(siblings) < 2:
+                    # lxml omits the index for an only child; match that.
+                    return f"//w:p[{target}]/w:{tag}"
+                return f"//w:p[{target}]/w:{tag}[{siblings.index(node) + 1}]"
+
             end_paths = {
-                node.get(f"{{{W_NS}}}id"): tree.getpath(node)
+                node.get(f"{{{W_NS}}}id"): _anchored_path(node, "bookmarkEnd")
                 for node in root.xpath("//w:bookmarkEnd", namespaces=NS)
-                if node.get(f"{{{W_NS}}}id") is not None
+                if node.get(f"{{{W_NS}}}id") in modelled_ids
             }
             for node in root.xpath("//w:bookmarkStart", namespaces=NS):
                 bookmark_id = node.get(f"{{{W_NS}}}id")
@@ -576,7 +1145,7 @@ class DocxParser:
                         Bookmark(
                             bookmark_id,
                             name,
-                            tree.getpath(node),
+                            _anchored_path(node, "bookmarkStart"),
                             end_paths.get(bookmark_id),
                         )
                     )
@@ -588,7 +1157,7 @@ class DocxParser:
                 "moveTo": "move_to",
             }
             for node in root.xpath("//w:ins | //w:del | //w:moveFrom | //w:moveTo", namespaces=NS):
-                local = node.tag.rsplit("}", 1)[-1]
+                local = local_name(node)
                 pieces = node.xpath(".//w:t/text() | .//w:delText/text()", namespaces=NS)
                 path_text = tree.getpath(node)
                 model.revisions.append(
@@ -602,18 +1171,7 @@ class DocxParser:
                     )
                 )
 
-            instruction_nodes = root.xpath("//w:instrText", namespaces=NS)
-            if instruction_nodes:
-                instruction = "".join(node.text or "" for node in instruction_nodes).strip()
-                first_path = tree.getpath(instruction_nodes[0])
-                model.fields.append(
-                    Field(
-                        ids.make("field", first_path),
-                        instruction,
-                        "",
-                        False,
-                    )
-                )
+            model.fields = _extract_fields(model, ids)
 
             if "word/comments.xml" in package.parts:
                 comments_root = package.read_xml("word/comments.xml")
@@ -621,29 +1179,149 @@ class DocxParser:
                     comment_id = comment_node.get(f"{{{W_NS}}}id")
                     if comment_id is None:
                         continue
-                    model.comments[comment_id] = Comment(
+                    comment = Comment(
                         comment_id,
                         comment_node.get(f"{{{W_NS}}}author"),
                         comment_node.get(f"{{{W_NS}}}date"),
-                        parse_blocks(comment_node, ids, f"comment/{comment_id}", package),
+                        parse_blocks(comment_node, ids, f"comment/{comment_id}", package, "word/comments.xml"),
                     )
+                    initials = comment_node.get(f"{{{W_NS}}}initials")
+                    if initials:
+                        model.extras.setdefault("comment_initials", {})[comment_id] = initials
+                    model.comments[comment_id] = comment
 
             tracked_changes = False
             if "word/settings.xml" in package.parts:
                 settings_root = package.read_xml("word/settings.xml")
                 tracked_changes = settings_root.find("w:trackRevisions", namespaces=NS) is not None
 
+            def _preserve(
+                part: str,
+                relationship_type: str | None,
+                *,
+                sidecar: bool = False,
+                owner_rels: str = "word/_rels/document.xml.rels",
+            ) -> None:
+                if part in model.preserved_parts or part not in package.parts:
+                    return
+                data = package.read_bytes(part)
+                model.preserved_parts[part] = PreservedPart(
+                    part,
+                    content_type_for(package, part),
+                    relationship_type,
+                    sha256_file_bytes(data),
+                    data,
+                    sidecar,
+                    owner_rels,
+                )
+
             for part in sorted(package.parts):
-                if part.startswith(("word/charts/", "word/embeddings/", "word/diagrams/")) and not part.endswith(".rels"):
-                    data = package.read_bytes(part)
-                    digest = sha256_file_bytes(data)
-                    model.preserved_parts[part] = PreservedPart(
-                        part,
-                        content_type_for(package, part),
-                        None,
-                        digest,
-                        data,
-                    )
+                if not part.startswith(_BODY_REFERENCED_PREFIXES) or part.endswith(".rels"):
+                    continue
+                # A chart or diagram is not self-contained: its own .rels points
+                # at the style, colour-style and embedded workbook Word renders
+                # it from. Restoring the part without them leaves those in the
+                # package with nothing pointing at them.
+                _preserve(part, None)
+                for _target, sidecar_rels in _sidecars(package, part):
+                    _preserve(sidecar_rels, None, sidecar=True)
+
+            # Which relationship reached each part in the source. A package
+            # routinely relates a part that no element points at -- an image
+            # left behind by editing, or a SmartArt drawing, reached from
+            # document.xml.rels while dgm:relIds names only the data, layout,
+            # colours and quick-style parts. The rebuild kept such a part and
+            # dropped its relationship, turning it into an orphan; with this the
+            # renderer can put the relationship back and leave the package as it
+            # found it.
+            part_relationships: dict[str, tuple[str, str]] = {}
+            for rels_part in sorted(package.parts):
+                if not rels_part.endswith(".rels"):
+                    continue
+                owner = _rels_owner(rels_part)
+                try:
+                    relationships = package.relationships(owner)
+                except Exception:
+                    continue
+                for rel in relationships.values():
+                    if rel.target_mode == "External":
+                        continue
+                    # Relative to the owning part's directory, not the _rels
+                    # directory the file happens to live in.
+                    target = resolve_relationship_target(owner or "x", rel.target)
+                    if target and target not in part_relationships:
+                        part_relationships[target] = (rels_part, rel.rel_type)
+            model.extras["source_part_relationships"] = part_relationships
+
+            # The same idea for relationships that leave the package. Editing a
+            # document strips the link text and leaves the relationship behind,
+            # and an external one has no part to travel with it, so nothing
+            # noticed it was gone. settings.xml already had this fix for its own
+            # external relationships; this is the same rule everywhere else.
+            external_relationships: list[tuple[str, str, str]] = []
+            for rels_part in sorted(package.parts):
+                if not rels_part.endswith(".rels"):
+                    continue
+                try:
+                    relationships = package.relationships(_rels_owner(rels_part))
+                except Exception:
+                    continue
+                for rel in relationships.values():
+                    if rel.target_mode != "External":
+                        continue
+                    external_relationships.append((rels_part, rel.rel_type, rel.target))
+            model.extras["source_external_relationships"] = sorted(set(external_relationships))
+
+            # And parts no relationship reaches at all. Every mechanism above
+            # starts from a relationship, so a package holding an unreachable
+            # part -- LibreOffice leaves word/webSettings.xml and
+            # word/stylesWithEffects.xml behind this way -- lost it silently.
+            #
+            # Word does not read a part it cannot reach, which is the argument
+            # for carrying it rather than against: tidying away bytes the source
+            # shipped is a change to the package, just one whose harmlessness we
+            # would be asserting instead of checking.
+            source_unreachable_parts: list[str] = []
+            for part in sorted(package.parts):
+                if part.endswith((".rels", "/")) or part == "[Content_Types].xml":
+                    continue
+                if part in part_relationships or part in model.preserved_parts:
+                    continue
+                # The renderer authors these itself; restoring a source copy
+                # would overwrite what it wrote.
+                if part in _RENDERER_AUTHORED_PARTS or part.startswith("docProps/"):
+                    continue
+                source_unreachable_parts.append(part)
+                _preserve(part, None, sidecar=True)
+            model.extras["source_unreachable_parts"] = source_unreachable_parts
+
+            for rel in package.relationships("word/document.xml").values():
+                if rel.target_mode == "External":
+                    continue
+                if rel.rel_type.rsplit("/", 1)[-1] not in _ATTACHMENT_RELATIONSHIP_TYPES:
+                    continue
+                anchor = _resolve_document_target(rel.target)
+                _preserve(anchor, rel.rel_type)
+                # An attachment can own a sidecar: a customXml item points at
+                # its properties part through its own .rels. Restoring the item
+                # without them would leave that reference dangling.
+                for sidecar, sidecar_rels in _sidecars(package, anchor):
+                    _preserve(sidecar, None, sidecar=True)
+                    _preserve(sidecar_rels, None, sidecar=True)
+
+            # The package thumbnail hangs off _rels/.rels rather than the
+            # document, so it needs its own pass. It is the file preview
+            # Explorer shows -- shipping the shell template's is user-visible.
+            for rel in package.relationships("").values():
+                if rel.target_mode == "External":
+                    continue
+                if rel.rel_type.rsplit("/", 1)[-1] != "thumbnail":
+                    continue
+                _preserve(
+                    rel.target.lstrip("/"),
+                    rel.rel_type,
+                    owner_rels="_rels/.rels",
+                )
 
             model.extras["comments"] = model.comments
             model.extras["revisions"] = model.revisions
@@ -651,11 +1329,51 @@ class DocxParser:
             model.extras["fields"] = model.fields
             model.extras["preserved_parts"] = model.preserved_parts
             model.extras["tracked_changes_enabled"] = tracked_changes
+            # word/_rels/settings.xml.rels carries the attached template the
+            # document was authored from -- usually the author's Normal.dotm.
+            # The renderer writes settings.xml but never its .rels, so that
+            # relationship was simply disappearing.
+            #
+            # Only external relationships are carried: an external target needs
+            # no part in the package, so restoring it cannot leave anything
+            # dangling, while an internal one would need its part to travel too.
+            settings_relationships = []
+            if "word/_rels/settings.xml.rels" in package.parts:
+                for rel in package.relationships("word/settings.xml").values():
+                    if rel.target_mode == "External":
+                        settings_relationships.append((rel.rel_type, rel.target))
+            model.extras["settings_relationships"] = sorted(settings_relationships)
+            # styles.xml and numbering.xml are written back byte for byte, so
+            # any r:id inside them survives the rebuild and has to keep meaning
+            # what it meant. Dropping their .rels leaves the preserved bytes
+            # pointing at a relationship that no longer exists -- a picture
+            # bullet's image becomes an orphaned part and Word repairs the
+            # document on open, which is worse than losing the bullet.
+            #
+            # The ids are carried verbatim rather than reallocated for the same
+            # reason: the bytes that use them are verbatim too.
+            verbatim_relationships: dict[str, list[tuple[str, str, str, str | None]]] = {}
+            for part in ("word/styles.xml", "word/numbering.xml"):
+                if f"word/_rels/{part.rsplit('/', 1)[-1]}.rels" not in package.parts:
+                    continue
+                entries = [
+                    (rel_id, rel.rel_type, rel.target, rel.target_mode)
+                    for rel_id, rel in package.relationships(part).items()
+                ]
+                if entries:
+                    verbatim_relationships[part] = sorted(entries)
+            model.extras["verbatim_part_relationships"] = verbatim_relationships
+            # mc:Ignorable on the document root declares which namespace
+            # prefixes a reader may skip. The pure-docx shell template carries
+            # its own, so without recording the source's, every rebuild
+            # silently adopts the template's declaration -- a difference no
+            # model gate can see.
+            model.extras["document_ignorable"] = root.get(f"{{{_MC_NS}}}Ignorable")
 
             section_index = 0
             block_index = 0
             for child_index, child in enumerate(body):
-                local = child.tag.rsplit("}", 1)[-1]
+                local = local_name(child)
                 sect_pr = None
                 current_block_index: int | None = None
                 if local in {"p", "tbl"}:

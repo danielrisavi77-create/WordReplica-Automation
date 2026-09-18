@@ -1,4 +1,5 @@
 from pathlib import Path
+from hashlib import sha256
 from zipfile import ZipFile
 
 from scripts.persistent_harness.build_bootstrap import BOOTSTRAP_VERSION, build_bootstrap
@@ -69,4 +70,37 @@ def test_update_builder_embeds_valid_remote_source_manifest(tmp_path):
     payload = extracted / "payload"
     assert (payload / "REMOTE_HARNESS_SOURCE_SHA256.txt").is_file()
     ok, errors = _default_manifest_probe(payload)
+    assert ok, errors
+
+
+def test_payload_file_iterator_excludes_app_build_virtual_environment(tmp_path):
+    from scripts.persistent_harness.build_update import iter_payload_files
+
+    source = tmp_path / "source"
+    (source / "src").mkdir(parents=True)
+    (source / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    app_build = source / ".venv_appbuild" / "Lib" / "site-packages"
+    app_build.mkdir(parents=True)
+    (app_build / "native.pyd").write_bytes(b"binary")
+
+    relative_paths = {rel.as_posix() for _path, rel in iter_payload_files(source)}
+
+    assert relative_paths == {"src/app.py"}
+
+
+def test_manifest_probe_preserves_leading_dot_in_directory_name(tmp_path):
+    from scripts.remote_harness.prerequisites import _default_manifest_probe
+
+    root = tmp_path / "root"
+    hidden_file = root / ".config" / "settings.json"
+    hidden_file.parent.mkdir(parents=True)
+    payload = b"{}"
+    hidden_file.write_bytes(payload)
+    (root / "REMOTE_HARNESS_SOURCE_SHA256.txt").write_text(
+        f"{sha256(payload).hexdigest()}  .config/settings.json\n",
+        encoding="utf-8",
+    )
+
+    ok, errors = _default_manifest_probe(root)
+
     assert ok, errors

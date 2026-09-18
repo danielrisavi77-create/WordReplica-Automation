@@ -16,7 +16,10 @@ def iter_payload_files(source_root: Path):
     source_root = Path(source_root).resolve()
     for path in sorted(p for p in source_root.rglob("*") if p.is_file()):
         rel = path.relative_to(source_root)
-        if any(part in EXCLUDED_DIR_NAMES for part in rel.parts[:-1]):
+        if any(
+            part in EXCLUDED_DIR_NAMES or part.startswith(".venv")
+            for part in rel.parts[:-1]
+        ):
             continue
         if path.suffix.lower() in EXCLUDED_SUFFIXES:
             continue

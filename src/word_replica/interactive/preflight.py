@@ -75,7 +75,17 @@ def analyze_preflight(
     # unless there is a concrete preservation path in the executor. Today these
     # parts are not re-injected into the newly-authored Word document, so classify
     # them honestly as unsupported rather than silently dropping them.
-    for part_name in sorted(model.preserved_parts):
+    #
+    # Scoped to body-referenced parts -- charts, embedded objects, diagrams.
+    # The parser also captures document-level attachments (custom XML, theme,
+    # font table, thumbnail) so the pure-docx renderer can carry them through;
+    # those are a transfer path, not a blocking gap, and flagging them here
+    # would block interactive runs that have always proceeded. Whether the
+    # interactive executor should also restore them is a separate question,
+    # deliberately not answered by widening this classification.
+    for part_name, part in sorted(model.preserved_parts.items()):
+        if part.relationship_type or part.sidecar:
+            continue
         capability_items.append(CapabilityDecision(
             CapabilityClass.UNSUPPORTED,
             f"Complex OOXML part is not yet reconstructable or preservable in Interactive mode: {part_name}",

@@ -1,6 +1,7 @@
 param(
     [string]$LocalRoot = "C:\WordReplica-Automation",
-    [switch]$VisibleWord
+    [switch]$VisibleWord,
+    [string]$Golden = "golden_1"
 )
 $ErrorActionPreference = "Stop"
 $Repo = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -10,7 +11,7 @@ if (-not (Test-Path $VenvPython)) {
 }
 Push-Location $Repo
 try {
-    $args = @("-m", "scripts.codex_automation.cli", "--config", (Join-Path $Repo "codex_automation.json"), "--local-root", $LocalRoot)
+    $args = @("-m", "scripts.codex_automation.cli", "--config", (Join-Path $Repo "codex_automation.json"), "--local-root", $LocalRoot, "--golden", $Golden)
     if ($VisibleWord) { $args += "--visible-word" }
     & $VenvPython @args
     exit $LASTEXITCODE

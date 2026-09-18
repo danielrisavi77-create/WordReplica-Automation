@@ -1,0 +1,64 @@
+name: Word Replica Landing
+
+on:
+  push:
+    branches:
+      - main
+      - "release/**"
+    paths:
+      - "landing/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: word-replica-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate static landing
+        run: |
+          test -f landing/index.html
+          grep -q '<title>Word Replica</title>' landing/index.html
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          html = Path("landing/index.html").read_text(encoding="utf-8")
+          lowered = html.lower()
+          has_file_input = any(token in lowered for token in ('type="file"', "type='file'", 'type=file'))
+          has_upload_form = bool(re.search(r"<form\b[^>]*(?:upload|file)", lowered))
+          if has_file_input or has_upload_form:
+              raise SystemExit("Landing must remain documentation/download only; generic DOCX upload UI is not allowed.")
+          PY
+
+      - name: Upload static site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: landing
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          token: ${{ secrets.WORDREPLICA_PAGES_TOKEN != '' && secrets.WORDREPLICA_PAGES_TOKEN || github.token }}
+          enablement: ${{ secrets.WORDREPLICA_PAGES_TOKEN != '' }}
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
