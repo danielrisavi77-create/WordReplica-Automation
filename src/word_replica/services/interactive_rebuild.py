@@ -1128,8 +1128,6 @@ class InteractiveRebuildService:
             reference_id = reference.get(relationship_id)
             if reference_id in story_relationships[kind]:
                 return reference_id
-            if kind == "header":
-                return None
             source_relationship = source_relationships.get(reference_id)
             if source_relationship is None or not (source_relationship.get("Type") or "").endswith(f"/{kind}"):
                 return None
