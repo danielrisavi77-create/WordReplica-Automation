@@ -18,6 +18,8 @@ def test_gitignore_allows_versioned_docx_test_fixtures_only():
 def test_gitignore_excludes_local_build_and_generated_golden_artifacts():
     local_only_paths = (
         ".venv_appbuild/Scripts/python.exe",
+        ".venv_gate/Scripts/python.exe",
+        "src/word_replica.egg-info/PKG-INFO",
         "_g0_dump.txt",
         "_golden2_run.log",
         "_p46_events.pkl",
@@ -33,3 +35,28 @@ def test_gitignore_excludes_local_build_and_generated_golden_artifacts():
             check=False,
         )
         assert result.returncode == 0, f"local artifact is not ignored: {relative_path}"
+
+
+def test_generated_environments_and_package_metadata_are_not_tracked():
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout.decode("utf-8").split("\0")
+
+    forbidden_prefixes = (
+        ".venv/",
+        ".venv_harness/",
+        ".venv_appbuild/",
+        ".venv_gate/",
+        "build/",
+        "dist/",
+        "src/word_replica.egg-info/",
+    )
+    offenders = [
+        path
+        for path in tracked
+        if path and any(path.startswith(prefix) for prefix in forbidden_prefixes)
+    ]
+    assert offenders == [], f"generated files are tracked: {offenders[:20]}"
