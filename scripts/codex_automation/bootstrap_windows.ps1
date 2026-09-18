@@ -118,7 +118,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Failed to create Python virtual environment." }
     }
     & $VenvPython -m pip install -e ".[test]"
-    if ($LASTEXITCODE -ne 0) { throw "pip install -e \".[test]\" failed." }
+    if ($LASTEXITCODE -ne 0) { throw 'pip install -e ".[test]" failed.' }
 
     if (-not $MainAlreadySeeded) {
         Write-Step "Verifying stable baseline before pushing main"
