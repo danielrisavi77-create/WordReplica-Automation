@@ -53,6 +53,7 @@ jobs:
             ) | Out-Null
             if ($errors.Count -gt 0) {
               $failed = $true
+              Write-Host "PowerShell parse failed: $($_.FullName)"
               Write-Host "::error file=$($_.FullName)::PowerShell parse failed"
               $errors | ForEach-Object { Write-Host $_.Message }
             }
