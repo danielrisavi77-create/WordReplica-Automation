@@ -19,6 +19,8 @@ from word_replica.runner.secure_retry import (
 )
 
 
+pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows DPAPI only")
+
 JOB_ID = "33333333-3333-4333-8333-333333333333"
 SOURCE_HASH = "a" * 64
 CONTRACT_HASH = "b" * 64
