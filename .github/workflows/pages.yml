@@ -2,7 +2,9 @@ name: Word Replica Landing
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - "release/**"
     paths:
       - "landing/**"
       - ".github/workflows/pages.yml"
