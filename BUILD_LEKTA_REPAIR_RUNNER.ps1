@@ -104,9 +104,16 @@ $engineVersion = (& $RunnerPythonPath -c $engineVersionCode $PSScriptRoot).Trim(
 if ($LASTEXITCODE -ne 0) {
     throw 'WordReplica engine version nije moguce procitati.'
 }
-$expectedEngineVersion = '0.1.0'
-if ($engineVersion -ne $expectedEngineVersion) {
-    throw "WordReplica engine version mora biti $expectedEngineVersion."
+$packageVersionCode = @'
+from word_replica import __version__
+print(__version__)
+'@
+$packageVersion = (& $RunnerPythonPath -c $packageVersionCode).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw 'WordReplica package version nije moguce procitati.'
+}
+if ($engineVersion -ne $packageVersion) {
+    throw "WordReplica version drift: pyproject=$engineVersion package=$packageVersion"
 }
 
 if ([string]::IsNullOrWhiteSpace($TimestampServer)) {
