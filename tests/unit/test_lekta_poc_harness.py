@@ -7,6 +7,9 @@ import pytest
 from scripts.run_lekta_poc import HarnessPreflightError, preflight, run_harness
 
 
+ROOT = Path(__file__).resolve().parents[2]
+
+
 class FakeCompletedProcess:
     def __init__(self, *, stdout="", returncode=0):
         self.stdout = stdout
@@ -135,7 +138,7 @@ def test_run_harness_never_calls_the_cli_when_preflight_fails(tmp_path):
 
 
 def test_powershell_wrapper_runs_in_the_foreground_and_never_kills_word_broadly():
-    script = Path(r"C:\WordReplica-Automation\repo\RUN_LEKTA_POC.ps1").read_text(encoding="utf-8")
+    script = (ROOT / "RUN_LEKTA_POC.ps1").read_text(encoding="utf-8")
     assert "Start-Process" not in script
     assert "taskkill" not in script.lower()
     assert "Stop-Process" not in script
