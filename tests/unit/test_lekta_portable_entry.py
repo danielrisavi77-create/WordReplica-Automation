@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -129,6 +130,7 @@ def test_portable_entry_failure_keeps_exe_for_same_device_retry(tmp_path):
 
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell cleanup only")
 def test_self_cleanup_uses_hidden_ps51_compatible_exact_target(tmp_path, monkeypatch):
     executable = tmp_path / EXE_NAME
     executable.write_bytes(b"signed-runner")

@@ -45,6 +45,7 @@ def test_interactive_controller_records_and_clears_owned_word(monkeypatch):
     calls = []
     monkeypatch.setattr(interactive_word, "record_owned_word", lambda app, role, **kwargs: calls.append(("record", role)) or 777, raising=False)
     monkeypatch.setattr(interactive_word, "clear_owned_word", lambda pid: calls.append(("clear", pid)), raising=False)
+    monkeypatch.setattr(interactive_word, "word_process_pids", lambda: set())
 
     controller = interactive_word.InteractiveWordController()
     controller.open_blank()
@@ -292,6 +293,7 @@ def test_interactive_controller_honors_background_visibility(monkeypatch):
     monkeypatch.setitem(sys.modules, "win32com.client", fake_client)
     monkeypatch.setattr(interactive_word, "record_owned_word", lambda *args, **kwargs: 777)
     monkeypatch.setattr(interactive_word, "clear_owned_word", lambda _pid: None)
+    monkeypatch.setattr(interactive_word, "word_process_pids", lambda: set())
 
     controller = interactive_word.InteractiveWordController(visible=False)
     controller.open_blank()

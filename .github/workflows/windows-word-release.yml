@@ -1,0 +1,33 @@
+name: Windows Word Release Gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: word-replica-real-word-release
+  cancel-in-progress: false
+
+jobs:
+  real-word:
+    name: Real Microsoft Word gate
+    runs-on: [self-hosted, windows, word-replica]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify clean source
+        shell: powershell
+        run: |
+          if (git status --porcelain) {
+            throw "Repository is not clean before the Word release gate."
+          }
+
+      - name: Run Windows + Microsoft Word gate
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\RUN_WINDOWS_RELEASE_GATE.ps1

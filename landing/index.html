@@ -467,6 +467,7 @@
     <nav class="links">
       <a class="textlink" href="#kako-radi">Kako radi</a>
       <a class="textlink" href="#integritet">Integritet</a>
+      <a class="textlink" href="#integracije">Integracije</a>
       <a class="textlink" href="https://github.com/danielrisavi77-create/WordReplica-Automation" target="_blank" rel="noopener">Izvorni kod</a>
       <a class="btn btn-primary btn-small" href="#preuzimanje">Preuzmi</a>
     </nav>
@@ -527,7 +528,7 @@
         <div class="step">
           <div class="num">01</div>
           <h3>Odabir izvora</h3>
-          <p>SHA-256 izvora se zabilježi prije početka. Originalni fajl ostaje read-only tokom cijelog procesa.</p>
+          <p>SHA-256 izvora se zabilježi prije početka. Originalna datoteka ostaje read-only tijekom cijelog procesa.</p>
         </div>
         <div class="step">
           <div class="num">02</div>
@@ -557,7 +558,7 @@
       </div>
       <div class="modes">
         <div class="mode-row">
-          <div class="mode-opt left"><span class="label">Vidljivo</span><span class="sub">Word prozor se vidi tokom rada</span></div>
+          <div class="mode-opt left"><span class="label">Vidljivo</span><span class="sub">Word prozor se vidi tijekom rada</span></div>
           <span class="switch">VIDLJIVOST</span>
           <div class="mode-opt right"><span class="label">U pozadini</span><span class="sub">Rekonstrukcija bez prikaza prozora</span></div>
         </div>
@@ -589,11 +590,35 @@
         </div>
         <div class="step">
           <h3>Bez izmišljene provenijencije</h3>
-          <p>Ne fabricira vrijeme uređivanja, broj revizija ni historiju spašavanja — samo stvarno zabilježene evente.</p>
+          <p>Ne fabricira vrijeme uređivanja, broj revizija ni povijest spremanja — samo stvarno zabilježene evente.</p>
         </div>
         <div class="step">
           <h3>Bez skrivenih ograničenja</h3>
           <p>Kad vizualna vjernost nije tehnički provjerljiva, izvještaj to kaže — nikad ne izmišlja PASS.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block reveal" id="integracije">
+    <div class="wrap">
+      <div class="head">
+        <p class="eyebrow">Academic Suite</p>
+        <h2>Izvršni sloj, ne još jedan sustav pravila</h2>
+        <p>Word Replica ne odlučuje što je akademski ispravno. Prima verificirani cilj, izvršava ga lokalno i vraća dokaz o tehničkoj vjernosti artefakta.</p>
+      </div>
+      <div class="steps" style="grid-template-columns: repeat(3, 1fr);">
+        <div class="step">
+          <h3>Lekta</h3>
+          <p>Analizira stvarni DOCX, bira dopuštene popravke i izdaje potpisani Repair Contract. Word Replica izvršava samo verificirani paket.</p>
+        </div>
+        <div class="step">
+          <h3>Katedra</h3>
+          <p>Vodi pisanje i proces rada. Word/COM logika ostaje izvan Katedre; završni dokument ide kroz Lekta → Word Replica put.</p>
+        </div>
+        <div class="step">
+          <h3>Academic Completion</h3>
+          <p>Prima strukturirani status provjere i hash artefakta za stanje projekta, bez potrebe da pohranjuje sirovi tekst rada.</p>
         </div>
       </div>
     </div>
@@ -617,7 +642,7 @@
           </div>
         </div>
         <div class="release-box">
-          <div class="row"><span class="k">verzija</span><span class="v">2.0.4</span></div>
+          <div class="row"><span class="k">verzija</span><span class="v pending">još nije objavljena</span></div>
           <div class="row"><span class="k">veličina</span><span class="v pending">u pripremi</span></div>
           <div class="row"><span class="k">sha-256</span><span class="v pending">u pripremi</span></div>
           <div class="row"><span class="k">renderer</span><span class="v">word · pure-docx</span></div>

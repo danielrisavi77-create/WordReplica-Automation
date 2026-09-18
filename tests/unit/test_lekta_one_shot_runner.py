@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,8 @@ from word_replica.runner.lekta_claim import LaunchTicket
 from word_replica.runner.one_shot import OneShotRunner, OneShotRunnerConfig
 from word_replica.runner.secure_retry import SecureRetryStore
 
+
+pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows one-shot runner uses DPAPI")
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "repair_contract_v1"
 SOURCE_BYTES = b"PK-public-repair-contract-v1"

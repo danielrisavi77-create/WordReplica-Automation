@@ -64,3 +64,13 @@ def test_build_script_invokes_dual_release_gate_before_pyinstaller():
     gate_index=text.index('RUN_WINDOWS_RELEASE_GATE.ps1')
     build_index=text.index('PyInstaller')
     assert gate_index < build_index
+
+
+def test_build_script_emits_verifiable_artifact_manifest():
+    text = (ROOT / 'BUILD_WINDOWS_APP.ps1').read_text(encoding='utf-8', errors='replace')
+    assert 'word-replica-build-manifest.json' in text
+    assert 'version = $version' in text
+    assert 'sha256 = $hash' in text
+    assert 'sizeBytes = $exeFile.Length' in text
+    assert 'sourceCommit = $sourceCommit' in text
+    assert 'from word_replica import __version__' in text
