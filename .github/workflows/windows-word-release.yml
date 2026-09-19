@@ -11,18 +11,25 @@ permissions:
   contents: read
 
 concurrency:
-  group: word-replica-real-word-release-${{ github.ref }}
-  cancel-in-progress: true
+  group: word-replica-real-word
+  cancel-in-progress: false
 
 jobs:
   real-word:
     name: Real Microsoft Word gate
     runs-on: [self-hosted, windows, word-replica]
-    timeout-minutes: 90
+    timeout-minutes: 720
+    permissions:
+      contents: write
+      statuses: write
+    outputs:
+      repaired_sha: ${{ steps.publish.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Verify clean source
         shell: powershell
@@ -50,11 +57,102 @@ jobs:
           "python_version=$pythonVersion" >> $env:GITHUB_OUTPUT
           "word_version=$wordVersion" >> $env:GITHUB_OUTPUT
 
-      - name: Run Windows + Microsoft Word gate
-        id: word_gate
+      - name: Inspect local autofix prerequisites
+        if: github.ref == 'refs/heads/automation-dev'
         shell: powershell
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\RUN_WINDOWS_RELEASE_GATE.ps1
+          $codex = Get-Command codex -ErrorAction SilentlyContinue
+          $codexPath = if ($codex) { $codex.Source } else { Join-Path $env:APPDATA 'npm\codex.cmd' }
+          if (Test-Path -LiteralPath $codexPath) {
+            & $codexPath --version
+            & $codexPath login status
+            if ($LASTEXITCODE -ne 0) { Write-Warning 'Autofix requires Codex login under the runner account.' }
+          } else {
+            Write-Warning 'Autofix requires Codex CLI under the runner account.'
+          }
+          $root = 'C:\WordReplica-Automation'
+          $config = Get-Content .\codex_automation.json -Raw | ConvertFrom-Json
+          $names = @($config.golden_filename) + @($config.additional_golden_filenames)
+          foreach ($name in $names) {
+            $path = Join-Path (Join-Path $root 'golden') $name
+            if (-not (Test-Path -LiteralPath $path)) { Write-Warning "Autofix missing Golden source: $path" }
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $root '.venv\Scripts\python.exe'))) {
+            Write-Warning 'Autofix missing Golden environment: run INSTALL_CODEX_AUTOMATION.cmd.'
+          }
+          $reports = @(Get-ChildItem (Join-Path $root 'diagnostics') -Filter golden_report.json -Recurse -ErrorAction SilentlyContinue)
+          Write-Host "Local Golden report count: $($reports.Count)"
+          # Advisory only; the supervisor enforces prerequisites before any agent edits.
+          exit 0
+
+      - name: Run Windows + Microsoft Word gate
+        id: word_gate
+        timeout-minutes: 90
+        shell: powershell
+        run: |
+          $runRoot = Join-Path 'C:\WordReplica-Automation\autofix' "github-${{ github.run_id }}-${{ github.run_attempt }}"
+          New-Item -ItemType Directory -Force -Path $runRoot | Out-Null
+          $log = Join-Path $runRoot 'word-gate.log'
+          "run_dir=$runRoot" >> $env:GITHUB_OUTPUT
+          "failure_log=$log" >> $env:GITHUB_OUTPUT
+          $ErrorActionPreference = 'Continue'
+          & powershell -NoProfile -ExecutionPolicy Bypass -File .\RUN_WINDOWS_RELEASE_GATE.ps1 2>&1 | Out-File -FilePath $log -Encoding utf8
+          $gateExit = $LASTEXITCODE
+          Get-Content -LiteralPath $log | Write-Host
+          exit $gateExit
+
+      - name: Diagnose and verify bounded repair with local Codex
+        id: repair
+        if: ${{ failure() && steps.word_gate.outcome == 'failure' && github.ref == 'refs/heads/automation-dev' }}
+        shell: powershell
+        env:
+          REPAIR_RUN_DIR: ${{ steps.word_gate.outputs.run_dir }}
+          REPAIR_FAILURE_LOG: ${{ steps.word_gate.outputs.failure_log }}
+        run: |
+          & .\.venv_gate\Scripts\python.exe -m scripts.codex_automation.word_gate_autofix --run-dir $env:REPAIR_RUN_DIR --failure-log $env:REPAIR_FAILURE_LOG
+          exit $LASTEXITCODE
+
+      - name: Publish verified repair
+        id: publish
+        if: ${{ failure() && steps.repair.outcome == 'success' && steps.repair.outputs.commit != '' }}
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPAIR_COMMIT: ${{ steps.repair.outputs.commit }}
+          REPAIR_CANDIDATE: ${{ steps.repair.outputs.candidate }}
+          BASE_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repoUrl = 'https://github.com/${{ github.repository }}.git'
+          $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$env:GH_TOKEN"))
+          Write-Host "::add-mask::$basic"
+          $auth = "http.extraheader=AUTHORIZATION: basic $basic"
+          $remoteLine = git -c $auth ls-remote $repoUrl refs/heads/automation-dev
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify current automation-dev head.' }
+          $remoteSha = ($remoteLine -split '\s+')[0]
+          if ($remoteSha -ne $env:BASE_SHA) { throw 'Branch moved; candidate retained locally for review.' }
+          git -C $env:REPAIR_CANDIDATE -c $auth push $repoUrl 'HEAD:refs/heads/automation-dev'
+          if ($LASTEXITCODE -ne 0) { throw 'Non-force checkpoint push failed.' }
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+          "commit=$env:REPAIR_COMMIT" >> $env:GITHUB_OUTPUT
+          foreach ($context in @('WordReplica autofix / Non-Word', 'WordReplica autofix / Real Word')) {
+            $body = @{ state = 'pending'; context = $context; description = 'Exact-commit verification queued'; target_url = 'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}' } | ConvertTo-Json
+            Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/${{ github.repository }}/statuses/$env:REPAIR_COMMIT" -Headers $headers -ContentType 'application/json' -Body $body | Out-Null
+          }
+          "Verified repair pushed: $env:REPAIR_COMMIT. Follow-up jobs verify this exact commit. Original failure is retained." >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Record local repair status
+        if: ${{ always() && steps.repair.outcome != 'skipped' && steps.word_gate.outputs.run_dir != '' }}
+        shell: powershell
+        env:
+          REPAIR_RUN_DIR: ${{ steps.word_gate.outputs.run_dir }}
+        run: |
+          $status = Join-Path $env:REPAIR_RUN_DIR 'status.json'
+          if (Test-Path -LiteralPath $status) {
+            Get-Content -LiteralPath $status | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          } else {
+            'Autofix did not produce a status report; inspect the repair step and runner prerequisites.' >> $env:GITHUB_STEP_SUMMARY
+          }
 
       - name: Write release evidence
         if: always()
@@ -91,3 +189,74 @@ jobs:
           path: release-evidence/windows-word-release-evidence.json
           if-no-files-found: error
           retention-days: 30
+
+  repaired-non-word:
+    name: Repaired commit / Non-Word / ${{ matrix.os }}
+    needs: real-word
+    if: ${{ always() && needs.real-word.outputs.repaired_sha != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.real-word.outputs.repaired_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install and check
+        shell: bash
+        run: |
+          python -m pip install -e ".[test]"
+          python -m pip check
+          python -m compileall -q src tests scripts
+      - name: Non-Word regression suite
+        run: python -m pytest -q -m "not word"
+
+  repaired-word:
+    name: Repaired commit / Real Microsoft Word gate
+    needs: real-word
+    if: ${{ always() && needs.real-word.outputs.repaired_sha != '' }}
+    runs-on: [self-hosted, windows, word-replica]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.real-word.outputs.repaired_sha }}
+          persist-credentials: false
+      - name: Verify clean source and repeat Word gate
+        shell: powershell
+        run: |
+          if (git status --porcelain) { throw 'Repaired checkout is not clean.' }
+          & powershell -NoProfile -ExecutionPolicy Bypass -File .\RUN_WINDOWS_RELEASE_GATE.ps1
+          exit $LASTEXITCODE
+
+  repaired-status:
+    name: Record checks on repaired commit
+    needs: [real-word, repaired-non-word, repaired-word]
+    if: ${{ always() && needs.real-word.outputs.repaired_sha != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          REPAIRED_SHA: ${{ needs.real-word.outputs.repaired_sha }}
+          NON_WORD_RESULT: ${{ needs.repaired-non-word.result }}
+          WORD_RESULT: ${{ needs.repaired-word.result }}
+        with:
+          script: |
+            for (const [name, result] of [
+              ['WordReplica autofix / Non-Word', process.env.NON_WORD_RESULT],
+              ['WordReplica autofix / Real Word', process.env.WORD_RESULT]
+            ]) {
+              await github.rest.repos.createCommitStatus({
+                ...context.repo, sha: process.env.REPAIRED_SHA,
+                context: name, state: result === 'success' ? 'success' : 'failure',
+                description: `Exact-commit verification: ${result}`,
+                target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+              });
+            }
