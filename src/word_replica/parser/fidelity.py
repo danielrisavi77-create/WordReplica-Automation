@@ -17,4 +17,10 @@ def project_fidelity(model: DocumentModel, mode: FidelityMode) -> DocumentModel:
 
     for paragraph in projected.iter_paragraphs():
         paragraph.runs[:] = [run for run in paragraph.runs if not run.hidden]
+        for run in paragraph.runs:
+            if "content_tokens" in run.properties:
+                run.properties["content_tokens"] = [
+                    token for token in run.properties["content_tokens"]
+                    if token.get("kind") != "comment_ref"
+                ]
     return projected
