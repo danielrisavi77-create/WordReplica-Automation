@@ -34,3 +34,13 @@ An uncertain diagnosis, changed regression, unsupported file change, full-suite 
 Candidate files and agent logs remain in the local per-run directory for review and are never uploaded automatically. They are not pruned automatically; after reviewing a stopped run, its retained candidate/log directory can be removed manually. Keep the small state records to preserve retry limits.
 
 Codex requests use the existing ChatGPT login and its usage limits. A quota or authentication error stops the chain. This is bounded agent assistance, not a guarantee that arbitrary failures can be repaired unattended.
+
+## Checking an old field-loss report
+
+The workflow first runs `Replay retained Golden field restoration` on automation-dev.
+It applies the existing `_restore_source_cross_paragraph_field_shells` helper to a
+temporary copy of the latest retained golden_2 output, then compares G0-G7 and field
+counts. It prints no document text, does not launch Word, and never changes the
+Golden state or retained documents. A separate completed job exposes this result
+without waiting for the full Word gate. Replay success is not a new Golden pass or
+permission to reset a stop condition; fresh reconstruction and G8-G9 remain necessary.

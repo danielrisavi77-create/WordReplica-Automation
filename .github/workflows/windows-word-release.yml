@@ -15,7 +15,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  field-diagnostics:
+    name: Replay retained Golden field restoration
+    if: github.ref == 'refs/heads/automation-dev'
+    runs-on: [self-hosted, windows, word-replica]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Compare current restoration with retained golden_2 output
+        shell: powershell
+        run: |
+          $env:PYTHONPATH = "$PWD\src;$PWD"
+          $python = 'C:\WordReplica-Automation\.venv\Scripts\python.exe'
+          if (-not (Test-Path -LiteralPath $python)) { throw 'Golden Python environment is missing.' }
+          & $python -m scripts.codex_automation.replay_field_restoration --golden golden_2
+          exit $LASTEXITCODE
+
   real-word:
+    needs: field-diagnostics
+    if: ${{ !cancelled() }}
     name: Real Microsoft Word gate
     runs-on: [self-hosted, windows, word-replica]
     timeout-minutes: 720
